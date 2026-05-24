@@ -4,7 +4,7 @@ on:
   push:
     branches:
       - "development"
-      - "main" # 💡 顺便帮你兼容了主分支，不管在哪个分支提交都能触发
+      - "main"
   pull_request:
     branches:
       - "development"
@@ -15,8 +15,8 @@ permissions:
   packages: write
 
 env:
-  # 【修改点 1】废除原作者的 Docker Hub，并将 GHCR 路径动态指向你自己的 GitHub 账户
-  GHCR_SLUG: ghcr.io/${{ github.repository }}
+  # 💡 直接手工在这里把末尾固定写死成小写的 maintainerr，避开变量中的大写 M
+  GHCR_SLUG: ghcr.io/${{ github.repository_owner }}/maintainerr
 
 jobs:
   guard_manual_run:
@@ -57,6 +57,8 @@ jobs:
         with:
           images: |
             ${{ env.GHCR_SLUG }}
+          flavor: |
+            lower=true
 
       - name: Log in to GitHub Container registry
         if: github.event_name != 'pull_request'
@@ -64,9 +66,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }} # 自动继承你的权限，免配置
-
-      # 【修改点 2】删除了针对 Docker Hub 的登录步骤，防止因没有账号密码导致报错
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: >-
           ${{
@@ -125,8 +125,6 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 【修改点 3】删除了 merge 阶段的 Docker Hub 登录步骤
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -139,11 +137,12 @@ jobs:
           tags: |
             type=raw,value=development
           labels: org.opencontainers.image.revision=${{ github.sha }}
+          flavor: |
+            lower=true
 
       - name: Create manifest list and push
         working-directory: ${{ runner.temp }}/digests
         run: |
-          # 【修改点 4】移除了对 Docker Hub 变量的处理逻辑，仅保留纯净的 GHCR 自动生成和推送
           docker buildx imagetools create \
             $(jq -cr '.tags | map(select(startswith("${{ env.GHCR_SLUG }}")) | "--tag " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.GHCR_SLUG }}@sha256:%s ' *)
