@@ -5,13 +5,13 @@ on:
     inputs:
       tag:
         type: string
-        description: 'Optional fixed tag (e.g. "blahblah-dev"). Leave blank to use the branch name.'
+        description: '可选固定标签（例如 "blahblah-dev"）。留空则默认使用分支名。'
         required: false
         default: ""
 
 env:
-  DOCKERHUB_SLUG: maintainerr/maintainerr
-  GHCR_SLUG: ghcr.io/maintainerr/maintainerr
+  # 【修改点 1】废除原作者的 Docker Hub，仅保留你自己的 GHCR（自动获取你的用户名/仓库名）
+  GHCR_SLUG: ghcr.io/${{ github.repository }}
 
 jobs:
   build-docker-image:
@@ -50,7 +50,7 @@ jobs:
             raw="${GITHUB_REF_NAME}"
           fi
 
-          # Sanitize for Docker tag rules
+          # 转换为符合 Docker 标签规范的小写及符号
           tag="$(echo "$raw" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_.-]+/-/g')"
 
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
@@ -64,13 +64,9 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }} # 自动继承你的权限，免配置
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v4
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      # 【修改点 2】删除了原来的 Log in to Docker Hub 步骤，防止因没有密码报错
 
       - name: Build & push by digest
         id: build
@@ -79,8 +75,8 @@ jobs:
           context: .
           platforms: ${{ matrix.platform }}
           push: true
-          # Push by digest; tags get applied in the merge job
-          outputs: type=image,"name=${{ env.DOCKERHUB_SLUG }},${{ env.GHCR_SLUG }}",push-by-digest=true,name-canonical=true,push=true
+          # 【修改点 3】移除了镜像输出里的 DOCKERHUB_SLUG，仅保留 GHCR 输出
+          outputs: type=image,"name=${{ env.GHCR_SLUG }}",push-by-digest=true,name-canonical=true,push=true
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.ref.name=${{ github.ref_name }}
@@ -133,11 +129,7 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v4
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME  }}
-          password: ${{ secrets.DOCKERHUB_TOKEN  }}
+      # 【修改点 4】删除了 merge 里的 Login to Docker Hub 步骤
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -150,10 +142,7 @@ jobs:
         run: |
           echo "Pushing multi-arch dev tag: $TAG"
 
-          docker buildx imagetools create \
-            --tag "${{ env.DOCKERHUB_SLUG }}:${TAG}" \
-            $(printf '${{ env.DOCKERHUB_SLUG }}@sha256:%s ' *)
-
+          # 【修改点 5】删除了针对 Docker Hub 的 imagetools create 操作，仅保留 GHCR
           docker buildx imagetools create \
             --tag "${{ env.GHCR_SLUG }}:${TAG}" \
             $(printf '${{ env.GHCR_SLUG }}@sha256:%s ' *)
