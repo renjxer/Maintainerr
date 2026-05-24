@@ -143,6 +143,9 @@ jobs:
       - name: Create manifest list and push
         working-directory: ${{ runner.temp }}/digests
         run: |
+          echo "正在生成多架构开发版标签..."
+          
+          # 直接指定标签为 development，简单粗暴，绝对不会因为找不到变量而报错
           docker buildx imagetools create \
-            $(jq -cr '.tags | map(select(startswith("${{ env.GHCR_SLUG }}")) | "--tag " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            --tag "${{ env.GHCR_SLUG }}:development" \
             $(printf '${{ env.GHCR_SLUG }}@sha256:%s ' *)
