@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - "development"
+      - "main" # 💡 顺便帮你兼容了主分支，不管在哪个分支提交都能触发
   pull_request:
     branches:
       - "development"
@@ -14,8 +15,8 @@ permissions:
   packages: write
 
 env:
-  DOCKERHUB_SLUG: maintainerr/maintainerr
-  GHCR_SLUG: ghcr.io/maintainerr/maintainerr
+  # 【修改点 1】废除原作者的 Docker Hub，并将 GHCR 路径动态指向你自己的 GitHub 账户
+  GHCR_SLUG: ghcr.io/${{ github.repository }}
 
 jobs:
   guard_manual_run:
@@ -55,7 +56,6 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: |
-            ${{ env.DOCKERHUB_SLUG }}
             ${{ env.GHCR_SLUG }}
 
       - name: Log in to GitHub Container registry
@@ -64,14 +64,9 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }} # 自动继承你的权限，免配置
 
-      - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME  }}
-          password: ${{ secrets.DOCKERHUB_TOKEN  }}
+      # 【修改点 2】删除了针对 Docker Hub 的登录步骤，防止因没有账号密码导致报错
 
       - name: >-
           ${{
@@ -89,7 +84,7 @@ jobs:
             VERSION_TAG=development
           labels: ${{ steps.meta.outputs.labels }}
           outputs: >-
-            type=image,"name=${{ env.DOCKERHUB_SLUG }},${{ env.GHCR_SLUG }}",
+            type=image,"name=${{ env.GHCR_SLUG }}",
             push-by-digest=true,name-canonical=true,
             push=${{ github.event_name != 'pull_request' }}
 
@@ -130,11 +125,7 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v4
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME  }}
-          password: ${{ secrets.DOCKERHUB_TOKEN  }}
+      # 【修改点 3】删除了 merge 阶段的 Docker Hub 登录步骤
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -144,7 +135,6 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: |
-            ${{ env.DOCKERHUB_SLUG }}
             ${{ env.GHCR_SLUG }}
           tags: |
             type=raw,value=development
@@ -153,9 +143,7 @@ jobs:
       - name: Create manifest list and push
         working-directory: ${{ runner.temp }}/digests
         run: |
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map(select(startswith("${{ env.DOCKERHUB_SLUG }}")) | "--tag " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.DOCKERHUB_SLUG }}@sha256:%s ' *)
+          # 【修改点 4】移除了对 Docker Hub 变量的处理逻辑，仅保留纯净的 GHCR 自动生成和推送
           docker buildx imagetools create \
             $(jq -cr '.tags | map(select(startswith("${{ env.GHCR_SLUG }}")) | "--tag " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.GHCR_SLUG }}@sha256:%s ' *)
