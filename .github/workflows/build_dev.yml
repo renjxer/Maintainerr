@@ -14,6 +14,10 @@ permissions:
   contents: read
   packages: write
 
+env:
+  # 💡 此时这个变量会自动解析为纯小写，完美无瑕
+  GHCR_SLUG: ghcr.io/${{ github.repository }}
+
 jobs:
   guard_manual_run:
     uses: ./.github/workflows/guard-manual.yml
@@ -47,13 +51,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      # 【绝杀点 1】让 Docker meta 只负责生成版本标签(Labels)，不再让它碰镜像名称(images)
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@v6
         with:
-          tags: |
-            type=raw,value=development
+          images: |
+            ${{ env.GHCR_SLUG }}
 
       - name: Log in to GitHub Container registry
         if: github.event_name != 'pull_request'
@@ -78,9 +81,8 @@ jobs:
             GIT_SHA=${{ github.sha }}
             VERSION_TAG=development
           labels: ${{ steps.meta.outputs.labels }}
-          # 【绝杀点 2】直接在这里用全小写死写你的镜像目标，天王老子来也变不回大写！
           outputs: >-
-            type=image,"name=ghcr.io/renjxer/maintainerr",
+            type=image,"name=${{ env.GHCR_SLUG }}",
             push-by-digest=true,name-canonical=true,
             push=${{ github.event_name != 'pull_request' }}
 
@@ -124,12 +126,19 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: |
+            ${{ env.GHCR_SLUG }}
+          tags: |
+            type=raw,value=development
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+
       - name: Create manifest list and push
         working-directory: ${{ runner.temp }}/digests
         run: |
-          echo "正在强行归并多架构纯小写官方镜像标签..."
-          
-          # 【绝杀点 3】最后的合并动作也全部死写成硬编码纯小写，杜绝一切由于变量带来的不确定性
           docker buildx imagetools create \
-            --tag "ghcr.io/renjxer/maintainerr:development" \
-            $(printf 'ghcr.io/renjxer/maintainerr@sha256:%s ' *)
+            $(jq -cr '.tags | map(select(startswith("${{ env.GHCR_SLUG }}")) | "--tag " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.GHCR_SLUG }}@sha256:%s ' *)
