@@ -1,3 +1,4 @@
+import { Trans, useLingui } from '@lingui/react/macro'
 import {
   DocumentAddIcon,
   PlusCircleIcon,
@@ -16,12 +17,11 @@ import CreateNotificationModal, {
 } from './CreateNotificationModal'
 
 const NotificationSettings = () => {
+  const { t } = useLingui()
   const [addModalActive, setAddModalActive] = useState(false)
   const [configurations, setConfigurations] = useState<AgentConfiguration[]>()
   const [editConfig, setEditConfig] = useState<AgentConfiguration>()
-  const { feedback, showSuccess } = useSettingsFeedback('Notification settings')
-
-  const basePath = import.meta.env.VITE_BASE_PATH ?? ''
+  const { feedback, showSuccess } = useSettingsFeedback()
 
   useEffect(() => {
     GetApiHandler<AgentConfiguration[]>('/notifications/configurations').then(
@@ -51,20 +51,15 @@ const NotificationSettings = () => {
 
   return (
     <>
-      <title>Notification settings - Maintainerr</title>
+      <title>{t`Notification settings - Maintainerr`}</title>
       <div className="h-full w-full">
         <div className="section h-full w-full">
-          <h3 className="heading flex items-center gap-2">
-            Notification Settings
-            <img
-              className="h-[1em] w-[2.5em]"
-              width={'0'}
-              height={'0'}
-              src={`${basePath}/beta.svg`}
-              alt="BETA"
-            />
+          <h3 className="heading">
+            <Trans>Notification Settings</Trans>
           </h3>
-          <p className="description">Notification Agent configuration</p>
+          <p className="description">
+            <Trans>Notification Agent configuration</Trans>
+          </p>
         </div>
 
         <SettingsFeedbackAlert feedback={feedback} />
@@ -82,7 +77,7 @@ const NotificationSettings = () => {
                   </div>
                   {!config.enabled && (
                     <div className="rounded-sm bg-maintainerr-600 px-2 py-0.5 text-xs text-zinc-200 shadow-md">
-                      Disabled
+                      <Trans>Disabled</Trans>
                     </div>
                   )}
                 </div>
@@ -102,7 +97,9 @@ const NotificationSettings = () => {
                     }}
                   >
                     {<DocumentAddIcon className="m-auto" />}{' '}
-                    <p className="m-auto font-semibold">Edit</p>
+                    <p className="m-auto font-semibold">
+                      <Trans>Edit</Trans>
+                    </p>
                   </Button>
                   <DeleteButton
                     onDeleteRequested={() => confirmedDelete(config.id)}
@@ -114,11 +111,13 @@ const NotificationSettings = () => {
             <li className="flex h-full items-center justify-center rounded-xl border-2 border-dashed border-gray-400 bg-zinc-800 p-4 text-zinc-400 shadow-sm">
               <button
                 type="button"
-                className="add-button m-auto flex h-9 rounded-sm bg-maintainerr-600 px-4 text-zinc-200 shadow-md hover:bg-maintainerr"
+                className="add-button m-auto flex h-9 rounded-md bg-maintainerr-600 px-4 text-zinc-200 shadow-md hover:bg-maintainerr"
                 onClick={() => updateAddModalActive(!addModalActive)}
               >
                 {<PlusCircleIcon className="m-auto h-5" />}
-                <p className="m-auto ml-1 font-semibold">Add Agent</p>
+                <p className="m-auto ml-1 font-semibold">
+                  <Trans>Add Agent</Trans>
+                </p>
               </button>
             </li>
           </ul>
@@ -133,7 +132,7 @@ const NotificationSettings = () => {
             onSave={() => {
               updateAddModalActive(!addModalActive)
               setEditConfig(undefined)
-              showSuccess('Notification agent saved')
+              showSuccess(t`Notification agent saved`)
             }}
             onTest={() => {}}
             {...(editConfig
@@ -179,7 +178,7 @@ const DeleteButton = ({
     >
       {<TrashIcon className="m-auto" />}{' '}
       <p className="m-auto font-semibold">
-        {showSureDelete ? <>Are you sure?</> : <>Delete</>}
+        {showSureDelete ? <Trans>Are you sure?</Trans> : <Trans>Delete</Trans>}
       </p>
     </Button>
   )

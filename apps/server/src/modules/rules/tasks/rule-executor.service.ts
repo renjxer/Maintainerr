@@ -1,8 +1,10 @@
 import {
+  ApplicationNames,
   IComparisonStatistics,
   MaintainerrEvent,
   MediaItem,
   MediaItemType,
+  MediaServerFeature,
   MediaServerType,
   RuleHandlerFinishedEventDto,
   RuleHandlerStartedEventDto,
@@ -12,6 +14,7 @@ import { EventEmitter2 } from '@nestjs/event-emitter';
 import cacheManager from '../../api/lib/cache';
 import { MediaServerFactory } from '../../api/media-server/media-server.factory';
 import { IMediaServerService } from '../../api/media-server/media-server.interface';
+import { TracearrApiService } from '../../api/tracearr-api/tracearr-api.service';
 import { CollectionsService } from '../../collections/collections.service';
 import { Collection } from '../../collections/entities/collection.entities';
 import {
@@ -26,10 +29,12 @@ import {
   CollectionMediaRemovedDto,
   RuleHandlerFailedDto,
 } from '../../events/events.dto';
+import { ServarrTagService } from '../../actions/servarr-tag.service';
 import { MaintainerrLogger } from '../../logging/logs.service';
 import { SettingsDataService } from '../../settings/settings-data.service';
-import { RuleConstants } from '../constants/rules.constants';
-import { RulesDto } from '../dtos/rules.dto';
+import { Application, RuleConstants } from '../constants/rules.constants';
+import { RuleDto } from '../dtos/rule.dto';
+import { RuleGroupDto } from '../dtos/ruleGroup.dto';
 import { RuleGroup } from '../entities/rule-group.entities';
 import {
   buildExclusionCascadeSets,
@@ -108,6 +113,8 @@ export class RuleExecutorService {
     private readonly progressManager: RuleExecutorProgressService,
     private readonly logger: MaintainerrLogger,
     private readonly recentlyHandledMedia: RecentlyHandledMediaService,
+    private readonly servarrTagService: ServarrTagService,
+    private readonly tracearrApi: TracearrApiService,
   ) {
     logger.setContext(RuleExecutorService.name);
     this.ruleConstants = new RuleConstants();
@@ -116,6 +123,41 @@ export class RuleExecutorService {
 
   private async getMediaServer(): Promise<IMediaServerService> {
     return this.mediaServerFactory.getService();
+  }
+
+  private usesTracearr(ruleGroup: RuleGroupDto): boolean {
+    return ruleGroup.rules.some((rule) => {
+      const parsedRule = (
+        'ruleJson' in rule ? JSON.parse(rule.ruleJson) : rule
+      ) as RuleDto;
+      return (
+        parsedRule.firstVal[0] === Application.TRACEARR ||
+        parsedRule.lastVal?.[0] === Application.TRACEARR
+      );
+    });
+  }
+
+  /** Both sides of a rule count: a Seerr date compared against a Tautulli one needs both. */
+  private async findUnavailableApplications(
+    ruleGroup: RuleGroupDto,
+  ): Promise<string[]> {
+    const referenced = new Set<Application>();
+    for (const rule of ruleGroup.rules) {
+      const parsedRule = (
+        'ruleJson' in rule ? JSON.parse(rule.ruleJson) : rule
+      ) as RuleDto;
+      referenced.add(parsedRule.firstVal[0]);
+      if (parsedRule.lastVal) {
+        referenced.add(parsedRule.lastVal[0]);
+      }
+    }
+
+    const unavailable = await this.rulesService.getUnavailableApplications();
+    return unavailable
+      .filter((application) => referenced.has(application))
+      .map(
+        (application) => ApplicationNames[application] ?? `app ${application}`,
+      );
   }
 
   private buildRuleHandlerFailedDto(
@@ -186,6 +228,17 @@ export class RuleExecutorService {
         );
       }
 
+      // Absent, not merely unreachable: every property reading it answers the
+      // transient signal for every item, which holds the collection and retries
+      // next run. That part is by design; being silent about it is not.
+      const missing = await this.findUnavailableApplications(ruleGroup);
+      if (missing.length > 0) {
+        this.logger.warn(
+          `Rule group '${ruleGroup.name}' reads ${missing.join(', ')}, not available for this server. ` +
+            `Its collection is held until you configure it or remove those rules.`,
+        );
+      }
+
       // Verify the only hard dependency for rule execution: the media server.
       // Ancillary services (Radarr/Sonarr/Seerr/Tautulli) are exercised at the
       // call site by the rules that actually use them, so a transient blip in
@@ -227,6 +280,34 @@ export class RuleExecutorService {
         removedMediaServerIds: new Set<string>(),
       };
 
+      // Snapshot whether this collection was already linked to a media server
+      // collection BEFORE this run. handleCollection below can link a freshly
+      // created automatic collection to a pre-existing, same-named server
+      // collection; the post-handle state would then look "already linked" and
+      // make the sync below import that collection's existing contents as
+      // manual. Capturing the pre-run state lets the run that *establishes* the
+      // link skip that import - the membership-provenance guard (#2663)
+      // otherwise reads the link state too late (after handleCollection has
+      // already linked it) and never skips.
+      //
+      // Be honest about the scope: this only suppresses the import on the run
+      // that adopts the collection. On the NEXT run the collection is already
+      // linked (collectionLinkedBeforeRun === true), so the import runs and the
+      // pre-existing, rule-unselected items get tracked as manual then. We can't
+      // distinguish "was on the BoxSet at adoption time" from "the user added it
+      // to the BoxSet afterwards" without persisted provenance, so the guard
+      // only removes the noisy first-run flood - a long-lived adopted collection
+      // still absorbs its foreign items as manual on a later run.
+      const collectionLinkedBeforeRun = ruleGroup.collection?.id
+        ? Boolean(
+            (
+              await this.collectionService.getCollection(
+                ruleGroup.collection.id,
+              )
+            )?.mediaServerId,
+          )
+        : false;
+
       if (ruleGroup.useRules) {
         this.logger.log(`Executing rules for '${ruleGroup.name}'`);
         this.startTime = new Date();
@@ -235,6 +316,28 @@ export class RuleExecutorService {
         await this.rulesService.resetCacheIfGroupUsesRuleThatRequiresIt(
           ruleGroup,
         );
+
+        // Prefetch watch history so per-item getWatchHistory calls during
+        // evaluation are served from an in-memory snapshot instead of
+        // individual HTTP requests. Scoped to this group's library, since that
+        // is the only library it evaluates. Reused across rule groups within a
+        // scheduler batch; rebuilt here when the reset above flushed it. Gated
+        // on the server being able to answer watch history in bulk - Plex from
+        // one central endpoint, Jellyfin from one sweep per user; Emby cannot
+        // and keeps its per-item path. Abort-checked first so a cancellation
+        // that lands just before evaluation doesn't kick off a long sweep.
+        abortSignal.throwIfAborted();
+        if (
+          mediaServer.supportsFeature(MediaServerFeature.CENTRAL_WATCH_HISTORY)
+        ) {
+          await mediaServer.prefetchWatchHistory({
+            libraryId: ruleGroup.libraryId,
+            abortSignal,
+          });
+        }
+        if (this.usesTracearr(ruleGroup)) {
+          await this.tracearrApi.prefetchHistory();
+        }
 
         // prepare
         this.workerData = [];
@@ -268,12 +371,13 @@ export class RuleExecutorService {
             arrLookupCache,
           );
 
-          if (ruleResult) {
-            this.statisticsData.push(...ruleResult.stats);
-            this.resultData.push(...ruleResult.data);
-            for (const id of ruleResult.transientFailureMediaIds) {
-              this.transientFailureMediaIds.add(id);
-            }
+          // executeRulesWithData throws on evaluation failure; a silently
+          // skipped chunk would be removed from the collection as
+          // "no longer matching" (#3307).
+          this.statisticsData.push(...ruleResult.stats);
+          this.resultData.push(...ruleResult.data);
+          for (const id of ruleResult.transientFailureMediaIds) {
+            this.transientFailureMediaIds.add(id);
           }
         }
 
@@ -290,6 +394,7 @@ export class RuleExecutorService {
       await this.syncManualMediaServerToCollectionDB(
         await this.rulesService.getRuleGroupById(ruleGroup.id), // refetch to get latest changes
         collectionSyncChanges,
+        collectionLinkedBeforeRun,
       );
     } catch (error) {
       const executionBeingAborted =
@@ -339,9 +444,13 @@ export class RuleExecutorService {
   private async syncManualMediaServerToCollectionDB(
     rulegroup: RuleGroup,
     collectionSyncChanges: CollectionMembershipSyncChanges,
+    collectionLinkedBeforeRun?: boolean,
   ) {
     if (rulegroup && rulegroup.collectionId) {
-      const syncContext = await this.getCollectionForMediaServerSync(rulegroup);
+      const syncContext = await this.getCollectionForMediaServerSync(
+        rulegroup,
+        collectionLinkedBeforeRun,
+      );
       const collection = syncContext.collection;
 
       if (collection) {
@@ -378,6 +487,13 @@ export class RuleExecutorService {
           return;
         }
 
+        // An empty child list is a trustworthy "empty" snapshot for Plex, but
+        // Jellyfin/Emby can transiently return [] during sync delays, so their
+        // empty result is treated as ambiguous (see the removal sweep below).
+        const isJellyfin =
+          this.settings.media_server_type === MediaServerType.JELLYFIN;
+        const isEmby = this.settings.media_server_type === MediaServerType.EMBY;
+
         // Handle manually added
         if (syncContext.skipManualChildImport) {
           this.logger.debug(
@@ -386,7 +502,7 @@ export class RuleExecutorService {
         } else if (children && children.length > 0) {
           // When two automatic rule groups share a title they end up linked
           // to the same media server collection. Items rule-owned by a
-          // sibling collection must not be imported here as manual — that
+          // sibling collection must not be imported here as manual - that
           // would subject them to this rule's deleteAfterDays. If we cannot
           // determine sibling ownership (DB error), refuse to import: a
           // silent fallback to "no siblings" would re-introduce the
@@ -404,7 +520,55 @@ export class RuleExecutorService {
             this.logger.debug(error);
           }
 
-          if (siblingRuleOwnedIds !== undefined) {
+          // Members a sibling collection holds under any membership type. The
+          // rule-owned set above drives reconcile; this wider one guards
+          // adoption, because a sibling's manual-only member is still theirs.
+          // Unknown membership refuses the import for the same reason unknown
+          // ownership does.
+          let siblingMemberIds: Set<string> | undefined;
+          try {
+            siblingMemberIds =
+              await this.collectionService.getSiblingMemberMediaServerIds(
+                collection,
+              );
+          } catch (error) {
+            this.logger.warn(
+              `Could not determine sibling membership for '${collection.title}'. Skipping manual child import to avoid cross-rule contamination.`,
+            );
+            this.logger.debug(error);
+          }
+
+          if (
+            siblingRuleOwnedIds !== undefined &&
+            siblingMemberIds !== undefined
+          ) {
+            // Heal items a rule removed that the media server never dropped: an
+            // active marker means the item is our orphan, not a user's manual
+            // add, so remove it from the server rather than re-adopt it below.
+            // Sibling-owned ids are excluded so a shared collection's items are
+            // never removed out from under the rule group that still owns them.
+            // Best-effort, like the sibling lookup above: a DB error here must
+            // not fail an otherwise-successful rule run. On failure we skip the
+            // manual adoption below (rather than adopt a possibly-unremoved
+            // orphan as a permanent manual member) and retry next run.
+            let orphanIds = new Set<string>();
+            let reconciled = true;
+            try {
+              orphanIds =
+                await this.collectionService.reconcileRuleRemovedOrphans(
+                  collection,
+                  children,
+                  siblingRuleOwnedIds,
+                  true, // a non-empty child read is a trustworthy snapshot
+                );
+            } catch (error) {
+              reconciled = false;
+              this.logger.warn(
+                `Could not reconcile rule-removed orphans for '${collection.title}'; skipping manual import this run.`,
+              );
+              this.logger.debug(error);
+            }
+
             // Fetch exclusions to avoid re-adding excluded items as manual
             const exclusions = await this.rulesService.getExclusions(
               rulegroup.id,
@@ -418,6 +582,7 @@ export class RuleExecutorService {
             );
             const exclusionCascade = buildExclusionCascadeSets(exclusions);
             const missingManualChildren: CollectionMediaChange[] = [];
+            const adoptedChildLabels: string[] = [];
 
             for (const child of children) {
               if (child && child.id) {
@@ -432,12 +597,41 @@ export class RuleExecutorService {
                   continue;
                 }
 
+                // A media server collection can hold any item type (a user
+                // can drop a movie into a seasons BoxSet, and Jellyfin's
+                // recursive child fallback can surface episodes). Only adopt
+                // children of the rule's own media type.
+                if (
+                  rulegroup.dataType &&
+                  child.type &&
+                  child.type !== rulegroup.dataType
+                ) {
+                  this.logger.debug(
+                    `Not importing '${this.describeMediaItemForLog(child)}' from the media server collection for '${collection.title}' - it is a ${child.type} while the rule manages ${rulegroup.dataType} items.`,
+                  );
+                  continue;
+                }
+
                 // Skip items that are excluded
                 if (isMediaItemExcluded(exclusionCascade, child)) {
                   continue;
                 }
 
                 if (siblingRuleOwnedIds.has(childId)) {
+                  continue;
+                }
+
+                // A sibling's manual member is the sibling's, not ours. The
+                // self-heal stopped removing these from the shared collection,
+                // so without this they fall through and get adopted here -
+                // becoming arrAction-eligible under OUR deleteAfterDays.
+                if (siblingMemberIds.has(childId)) {
+                  continue;
+                }
+
+                // A rule-removal orphan the media server retained: it is being
+                // self-healed above, so never re-adopt it as a manual member.
+                if (orphanIds.has(childId)) {
                   continue;
                 }
 
@@ -449,17 +643,51 @@ export class RuleExecutorService {
                       type: 'media_added_manually',
                     },
                   });
+                  adoptedChildLabels.push(
+                    `'${this.describeMediaItemForLog(child)}' (${childId})`,
+                  );
                 }
               }
             }
 
-            if (missingManualChildren.length > 0) {
+            if (reconciled && missingManualChildren.length > 0) {
+              // Name the adopted items: a member that appears with the
+              // "manual" tag without the user having added it is otherwise
+              // undiagnosable from the logs.
+              const maxNamedChildren = 10;
+              const overflowCount =
+                adoptedChildLabels.length - maxNamedChildren;
+              this.logger.log(
+                `Importing ${missingManualChildren.length} item(s) present in the media server collection for '${collection.title}' but not owned by its rule as manual member(s): ${adoptedChildLabels
+                  .slice(0, maxNamedChildren)
+                  .join(
+                    ', ',
+                  )}${overflowCount > 0 ? ` and ${overflowCount} more` : ''}`,
+              );
               await this.collectionService.syncMediaServerChildrenToCollection(
                 collection,
                 missingManualChildren,
                 CollectionMediaManualMembershipSource.LOCAL,
               );
             }
+          }
+        } else {
+          // Empty child snapshot: still reconcile so a propagated removal's
+          // marker clears and the table stays bounded. Nothing is present, so
+          // there is no self-heal or sibling concern; an empty read is only a
+          // trustworthy "gone" signal for Plex, not Jellyfin/Emby.
+          try {
+            await this.collectionService.reconcileRuleRemovedOrphans(
+              collection,
+              children ?? [],
+              new Set(),
+              !(isJellyfin || isEmby),
+            );
+          } catch (error) {
+            this.logger.warn(
+              `Could not reconcile rule-removed orphans for '${collection.title}'.`,
+            );
+            this.logger.debug(error);
           }
         }
 
@@ -470,9 +698,6 @@ export class RuleExecutorService {
         // positives where valid items would be incorrectly flagged as "manually
         // removed". This workaround can be removed if the upstream improves
         // collection sync consistency.
-        const isJellyfin =
-          this.settings.media_server_type === MediaServerType.JELLYFIN;
-        const isEmby = this.settings.media_server_type === MediaServerType.EMBY;
         const shouldCheckRemovals =
           isJellyfin || isEmby ? children && children.length > 0 : true;
 
@@ -481,6 +706,9 @@ export class RuleExecutorService {
           collectionMedia.length > 0 &&
           shouldCheckRemovals
         ) {
+          // Members the media server collection no longer lists.
+          const droppedByMediaServer: CollectionMediaChange[] = [];
+
           for (const mediaItem of collectionMedia) {
             if (!mediaItem?.mediaServerId) {
               continue;
@@ -501,19 +729,23 @@ export class RuleExecutorService {
               !children ||
               !children.find((e) => mediaItem.mediaServerId === e.id.toString())
             ) {
-              await this.collectionService.removeFromCollection(
-                collection.id,
-                [
-                  {
-                    mediaServerId: mediaItem.mediaServerId,
-                    reason: {
-                      type: 'media_removed_manually',
-                    },
-                  },
-                ] satisfies CollectionMediaChange[],
-                'manual',
-              );
+              droppedByMediaServer.push({
+                mediaServerId: mediaItem.mediaServerId,
+                reason: {
+                  type: 'media_removed_manually',
+                },
+              });
             }
+          }
+
+          // One call for the whole set, so emptying a collection by hand costs
+          // one media-server request and one notification, not N of each.
+          if (droppedByMediaServer.length > 0) {
+            await this.collectionService.removeFromCollection(
+              collection.id,
+              droppedByMediaServer,
+              'manual',
+            );
           }
         }
 
@@ -530,6 +762,7 @@ export class RuleExecutorService {
 
   private async getCollectionForMediaServerSync(
     rulegroup: RuleGroup,
+    collectionLinkedBeforeRun?: boolean,
   ): Promise<MediaServerSyncContext> {
     const collection = await this.collectionService.getCollection(
       rulegroup.collectionId,
@@ -560,14 +793,21 @@ export class RuleExecutorService {
         : { collection: relinkedCollection };
     }
 
-    const wasLinkedBeforeSync = Boolean(collection.mediaServerId);
+    // Prefer the link state captured BEFORE this run (handleCollection may have
+    // linked a freshly created collection to a pre-existing server collection
+    // in the meantime). A collection linked only during this run must skip the
+    // manual child import so it does not absorb that server collection's
+    // existing contents as manual members. Falls back to the collection's
+    // current link state when the caller didn't capture the pre-run snapshot.
+    const wasLinkedBeforeSync =
+      collectionLinkedBeforeRun ?? Boolean(collection.mediaServerId);
 
     const linkedCollection =
       await this.collectionService.checkAutomaticMediaServerLink(collection);
 
     if (!linkedCollection.mediaServerId) {
       this.logger.debug(
-        `Skipping media server sync for '${linkedCollection.title}' — no media server collection exists because no items currently match the rule.`,
+        `Skipping media server sync for '${linkedCollection.title}' - no media server collection exists because no items currently match the rule.`,
       );
       return {};
     }
@@ -610,6 +850,16 @@ export class RuleExecutorService {
     }
   }
 
+  private describeMediaItemForLog(item: MediaItem): string {
+    if (item.type === 'season' && item.parentTitle) {
+      return `${item.parentTitle} - ${item.title}`;
+    }
+    if (item.type === 'episode' && item.grandparentTitle) {
+      return `${item.grandparentTitle} - ${item.title}`;
+    }
+    return item.title || item.id;
+  }
+
   private async handleCollection(
     rulegroup: RuleGroup,
     abortSignal?: AbortSignal,
@@ -632,7 +882,7 @@ export class RuleExecutorService {
 
       // Filter exclusions out of results. Cascade is keyed off the show/season
       // exclusion's own mediaServerId (via type), so a single-episode exclusion
-      // only skips that episode — not its siblings (issue #2858).
+      // only skips that episode - not its siblings (issue #2858).
       const desiredMediaServerIds = new Set<string>();
 
       for (const item of this.resultData ?? []) {
@@ -698,7 +948,7 @@ export class RuleExecutorService {
         // Conditions like "watched" / "lastViewedAt before N days" stay true
         // after the handler action, so without this guard the user gets a
         // `Media Removed` event immediately followed by `Media Added` for
-        // the same title — confusing and noisy via email/Discord.
+        // the same title - confusing and noisy via email/Discord.
         //
         // The marks are consumed here: this pass blocks the immediate echo,
         // and any subsequent pass treats the items normally. If the rule
@@ -866,12 +1116,30 @@ export class RuleExecutorService {
         }
 
         // Determine which items were actually added/removed by comparing DB state
+        const updatedMedia =
+          (await this.collectionService.getCollectionMedia(collection?.id)) ??
+          [];
         const updatedMediaServerIds = new Set(
-          (
-            (await this.collectionService.getCollectionMedia(collection?.id)) ??
-            []
-          ).map((e) => e.mediaServerId),
+          updatedMedia.map((e) => e.mediaServerId),
         );
+
+        // Cached provider ids per item, so *arr tag resolution has a tmdb/tvdb
+        // fallback even when the media-server item omits them. collMediaData
+        // covers removed/existing rows; updatedMedia covers freshly added ones.
+        const providerIdsByMediaServerId = new Map<
+          string,
+          { tmdbId?: number | null; tvdbId?: number | null }
+        >();
+        for (const m of [...collMediaData, ...updatedMedia]) {
+          providerIdsByMediaServerId.set(m.mediaServerId, {
+            tmdbId: m.tmdbId,
+            tvdbId: m.tvdbId,
+          });
+        }
+        const toArrTagItem = (m: CollectionMediaChange) => ({
+          mediaServerId: m.mediaServerId,
+          ...providerIdsByMediaServerId.get(m.mediaServerId),
+        });
 
         const addedToCollection = dataToAdd.filter(
           (m) =>
@@ -913,6 +1181,16 @@ export class RuleExecutorService {
           );
         }
 
+        // Reconcile Radarr/Sonarr membership tags off the just-applied deltas.
+        // Best-effort and self-guarded (no-ops unless the collection opted in):
+        // it never throws, alters membership, or raises eval concurrency, so a
+        // tagging failure can't affect the run.
+        await this.servarrTagService.syncMembershipTags(
+          collection,
+          addedToCollection.map(toArrTagItem),
+          removedFromCollection.map(toArrTagItem),
+        );
+
         // add the run duration to the collection
         await this.AddCollectionRunDuration(collection);
 
@@ -949,7 +1227,7 @@ export class RuleExecutorService {
     }
   }
 
-  private async getAllActiveRuleGroups(): Promise<RulesDto[]> {
+  private async getAllActiveRuleGroups(): Promise<RuleGroupDto[]> {
     return await this.rulesService.getRuleGroups(true);
   }
 

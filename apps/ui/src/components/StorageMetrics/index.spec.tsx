@@ -1,6 +1,6 @@
 import type { StorageMetricsResponse } from '@maintainerr/contracts'
 import { MediaServerType } from '@maintainerr/contracts'
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { render, screen, waitFor, within } from '../../test-utils/render'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import GetApiHandler from '../../utils/ApiHandler'
@@ -197,7 +197,7 @@ describe('StorageMetrics', () => {
 
       expect(
         screen.getByText(
-          '2 of 3 reclaimable collections sized — duplicates not yet deduplicated, refreshes after next collection run',
+          '2 of 3 reclaimable collections sized - duplicates not yet deduplicated, refreshes after next collection run',
         ),
       ).toBeTruthy()
       expect(

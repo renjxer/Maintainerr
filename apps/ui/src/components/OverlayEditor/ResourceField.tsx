@@ -1,3 +1,4 @@
+import { Trans, useLingui } from '@lingui/react/macro'
 import { useRef } from 'react'
 import { Select } from '../Forms/Select'
 import Button from '../Common/Button'
@@ -20,13 +21,13 @@ interface ResourceFieldProps {
 
 /**
  * Compact `[label] [Select] [Upload]` row used for editor-level resources
- * that live as files on disk and are picked into element fields by name —
+ * that live as files on disk and are picked into element fields by name -
  * fonts and image assets. The dropdown shows server-listed files, and the
  * upload button posts a new file and selects it on success.
  *
  * If `value` is not in `options`, the Select is rendered with an empty
  * value (showing the placeholder) instead of synthesising a "missing"
- * option — a stale reference is just an unselected state, not an error.
+ * option - a stale reference is just an unselected state, not an error.
  */
 export function ResourceField({
   label,
@@ -36,9 +37,13 @@ export function ResourceField({
   onUpload,
   accept,
   uploadTitle,
-  placeholder = 'Select...',
+  placeholder,
 }: ResourceFieldProps) {
+  const { t } = useLingui()
   const fileRef = useRef<HTMLInputElement>(null)
+  // Resolved in the body rather than as a default parameter, which would run
+  // before useLingui().
+  const emptyLabel = placeholder ?? t`Select...`
   const known = options.some((opt) => opt.name === value)
 
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -51,14 +56,14 @@ export function ResourceField({
 
   return (
     <label className="flex items-center gap-1.5">
-      <span className="w-12 shrink-0 text-zinc-400">{label}</span>
+      <span className="min-w-12 shrink-0 text-zinc-400">{label}</span>
       <Select
         name={`resource-${label}`}
         value={known ? value : ''}
         onChange={(e) => onSelect(e.target.value)}
       >
         <option value="" disabled={known}>
-          {placeholder}
+          {emptyLabel}
         </option>
         {options.map((opt) => (
           <option key={opt.path} value={opt.name}>
@@ -74,7 +79,7 @@ export function ResourceField({
         onClick={() => fileRef.current?.click()}
         title={uploadTitle}
       >
-        Upload
+        <Trans>Upload</Trans>
       </Button>
       <input
         ref={fileRef}

@@ -1,7 +1,17 @@
-import { MaintainerrEvent, MediaServerType } from '@maintainerr/contracts';
+import {
+  Application,
+  MaintainerrEvent,
+  MediaServerFeature,
+  MediaServerType,
+  supportsFeature as serverSupportsFeature,
+} from '@maintainerr/contracts';
 import { EventEmitter2 } from '@nestjs/event-emitter';
-import { createMockLogger } from '../../../../test/utils/data';
+import {
+  createMockLogger,
+  createMockServarrTagService,
+} from '../../../../test/utils/data';
 import { MediaServerFactory } from '../../api/media-server/media-server.factory';
+import { TracearrApiService } from '../../api/tracearr-api/tracearr-api.service';
 import { CollectionsService } from '../../collections/collections.service';
 import { CollectionMediaManualMembershipSource } from '../../collections/entities/collection_media.entities';
 import { RecentlyHandledMediaService } from '../../collections/recently-handled-media.service';
@@ -16,6 +26,7 @@ describe('RuleExecutorService', () => {
     const rulesService = {
       getRuleGroup: jest.fn(),
       getRuleGroupById: jest.fn(),
+      getUnavailableApplications: jest.fn().mockResolvedValue([]),
       resetCacheIfGroupUsesRuleThatRequiresIt: jest.fn(),
       getExclusions: jest.fn().mockResolvedValue([]),
     } as unknown as jest.Mocked<RulesService>;
@@ -27,6 +38,12 @@ describe('RuleExecutorService', () => {
         items: [],
         totalSize: 0,
       }),
+      supportsFeature: jest.fn((feature: MediaServerFeature) =>
+        serverSupportsFeature(mediaServerType, feature),
+      ),
+      // Both Plex and Jellyfin support the bulk prefetch, so the default mock
+      // has to answer it; individual tests override to assert on the calls.
+      prefetchWatchHistory: jest.fn().mockResolvedValue(undefined),
     };
 
     const mediaServerFactory = {
@@ -45,6 +62,12 @@ describe('RuleExecutorService', () => {
       getSiblingRuleOwnedMediaServerIds: jest
         .fn()
         .mockResolvedValue(new Set<string>()),
+      getSiblingMemberMediaServerIds: jest
+        .fn()
+        .mockResolvedValue(new Set<string>()),
+      reconcileRuleRemovedOrphans: jest
+        .fn()
+        .mockResolvedValue(new Set<string>()),
       reconcileSharedManualCollectionState: jest
         .fn()
         .mockResolvedValue(undefined),
@@ -60,7 +83,7 @@ describe('RuleExecutorService', () => {
       setCollectionMediaRuleEvaluationFailed: jest
         .fn()
         .mockResolvedValue(undefined),
-      addToCollection: jest.fn().mockImplementation(async (_id, items) => {
+      addToCollection: jest.fn().mockImplementation(async (id, items) => {
         return {
           id: 1,
           mediaServerId: 'coll-1',
@@ -70,7 +93,7 @@ describe('RuleExecutorService', () => {
       }),
       addToCollectionWithResolvedLink: jest
         .fn()
-        .mockImplementation(async (_collection, items) => {
+        .mockImplementation(async (collection, items) => {
           return {
             id: 1,
             mediaServerId: 'coll-1',
@@ -80,7 +103,7 @@ describe('RuleExecutorService', () => {
         }),
       syncMediaServerChildrenToCollection: jest
         .fn()
-        .mockImplementation(async (_collection, items) => {
+        .mockImplementation(async (collection, items) => {
           return {
             id: 1,
             mediaServerId: 'coll-1',
@@ -126,6 +149,9 @@ describe('RuleExecutorService', () => {
     const logger = createMockLogger();
 
     const recentlyHandledMedia = new RecentlyHandledMediaService();
+    const tracearrApi = {
+      prefetchHistory: jest.fn().mockResolvedValue(undefined),
+    } as unknown as jest.Mocked<TracearrApiService>;
 
     const service = new RuleExecutorService(
       rulesService,
@@ -137,6 +163,8 @@ describe('RuleExecutorService', () => {
       progressManager,
       logger,
       recentlyHandledMedia,
+      createMockServarrTagService(),
+      tracearrApi,
     );
 
     return {
@@ -150,6 +178,7 @@ describe('RuleExecutorService', () => {
       progressManager,
       logger,
       recentlyHandledMedia,
+      tracearrApi,
     };
   };
 
@@ -186,6 +215,70 @@ describe('RuleExecutorService', () => {
     expect(collectionService.removeFromCollection).not.toHaveBeenCalled();
   });
 
+  it('reconciles rule-removed markers even when the collection enumerates empty (Plex: trustworthy)', async () => {
+    const { service, mediaServer, collectionService } = createService(
+      MediaServerType.PLEX,
+    );
+    mediaServer.getCollectionChildren.mockResolvedValue([]); // empty snapshot
+    collectionService.getCollectionMedia.mockResolvedValue([]);
+
+    await (
+      service as unknown as {
+        syncManualMediaServerToCollectionDB: (
+          ruleGroup: { id: number; collectionId: number },
+          collectionSyncChanges: {
+            addedMediaServerIds: Set<string>;
+            removedMediaServerIds: Set<string>;
+          },
+        ) => Promise<void>;
+      }
+    ).syncManualMediaServerToCollectionDB(
+      { id: 10, collectionId: 1 },
+      { addedMediaServerIds: new Set(), removedMediaServerIds: new Set() },
+    );
+
+    // A propagated removal's marker must still be reconcilable on an empty
+    // child list; for Plex an empty read is a trustworthy "gone" signal.
+    expect(collectionService.reconcileRuleRemovedOrphans).toHaveBeenCalledTimes(
+      1,
+    );
+    const [, childrenArg, , trustworthy] =
+      collectionService.reconcileRuleRemovedOrphans.mock.calls[0];
+    expect(childrenArg).toEqual([]);
+    expect(trustworthy).toBe(true);
+  });
+
+  it('reconciles on empty children but marks the read untrustworthy for Jellyfin', async () => {
+    const { service, mediaServer, collectionService } = createService(
+      MediaServerType.JELLYFIN,
+    );
+    mediaServer.getCollectionChildren.mockResolvedValue([]);
+    collectionService.getCollectionMedia.mockResolvedValue([]);
+
+    await (
+      service as unknown as {
+        syncManualMediaServerToCollectionDB: (
+          ruleGroup: { id: number; collectionId: number },
+          collectionSyncChanges: {
+            addedMediaServerIds: Set<string>;
+            removedMediaServerIds: Set<string>;
+          },
+        ) => Promise<void>;
+      }
+    ).syncManualMediaServerToCollectionDB(
+      { id: 10, collectionId: 1 },
+      { addedMediaServerIds: new Set(), removedMediaServerIds: new Set() },
+    );
+
+    expect(collectionService.reconcileRuleRemovedOrphans).toHaveBeenCalledTimes(
+      1,
+    );
+    // Jellyfin's transient empty read must not be trusted to clear markers.
+    expect(collectionService.reconcileRuleRemovedOrphans.mock.calls[0][3]).toBe(
+      false,
+    );
+  });
+
   it('does not emit a failed rule notification when a rule group finishes successfully', async () => {
     const { service, rulesService, eventEmitter } = createService(
       MediaServerType.JELLYFIN,
@@ -219,6 +312,40 @@ describe('RuleExecutorService', () => {
         message: "Finished execution of rule 'Filmer'",
       }),
     );
+  });
+
+  it('prefetches Tracearr history once for a rule group that uses Tracearr', async () => {
+    const { service, rulesService, tracearrApi } = createService(
+      MediaServerType.JELLYFIN,
+    );
+    const ruleGroup = {
+      id: 12,
+      name: 'Tracearr history group',
+      isActive: true,
+      libraryId: 'library-1',
+      useRules: true,
+      rules: [
+        {
+          ruleJson: JSON.stringify({
+            firstVal: [Application.TRACEARR, 3],
+            action: 0,
+            operator: null,
+            section: 0,
+          }),
+          section: 0,
+        },
+      ],
+      collectionId: 1,
+      collection: { title: 'Test Collection' },
+    };
+    rulesService.getRuleGroup.mockResolvedValue(ruleGroup as any);
+    rulesService.getRuleGroupById.mockResolvedValue(ruleGroup as any);
+
+    await expect(
+      service.executeForRuleGroups(12, new AbortController().signal),
+    ).resolves.toEqual({ status: 'success' });
+
+    expect(tracearrApi.prefetchHistory).toHaveBeenCalledTimes(1);
   });
 
   it('emits a single failed rule notification when collection handling fails', async () => {
@@ -307,7 +434,7 @@ describe('RuleExecutorService', () => {
     expect(collectionService.addToCollection).not.toHaveBeenCalled();
     expect(collectionService.removeFromCollection).not.toHaveBeenCalled();
     expect(logger.debug).toHaveBeenCalledWith(
-      "Skipping media server sync for 'Test Collection' — no media server collection exists because no items currently match the rule.",
+      "Skipping media server sync for 'Test Collection' - no media server collection exists because no items currently match the rule.",
     );
   });
 
@@ -356,6 +483,58 @@ describe('RuleExecutorService', () => {
       collectionService.syncMediaServerChildrenToCollection,
     ).not.toHaveBeenCalled();
     expect(collectionService.addToCollection).not.toHaveBeenCalled();
+    expect(logger.debug).toHaveBeenCalledWith(
+      "Skipping manual child import for newly linked automatic collection 'Test Collection' to avoid marking existing collection contents as manual.",
+    );
+  });
+
+  it('skips manual import using the pre-run link snapshot even when the collection now reports as linked', async () => {
+    const { service, mediaServer, collectionService, logger } = createService(
+      MediaServerType.JELLYFIN,
+    );
+
+    // Mirrors production: by sync time the collection already has a
+    // mediaServerId because handleCollection linked it to a pre-existing,
+    // same-named BoxSet earlier in this run. The pre-run snapshot (false) must
+    // still win so the BoxSet's existing contents are NOT absorbed as manual.
+    collectionService.getCollection.mockResolvedValue({
+      id: 1,
+      title: 'Test Collection',
+      mediaServerId: 'coll-1',
+      manualCollection: false,
+    } as any);
+    collectionService.checkAutomaticMediaServerLink.mockResolvedValue({
+      id: 1,
+      title: 'Test Collection',
+      mediaServerId: 'coll-1',
+      manualCollection: false,
+    } as any);
+    collectionService.getCollectionMedia.mockResolvedValue([]);
+    mediaServer.getCollectionChildren.mockResolvedValue([{ id: 'm-existing' }]);
+
+    await (
+      service as unknown as {
+        syncManualMediaServerToCollectionDB: (
+          ruleGroup: { id: number; collectionId: number },
+          collectionSyncChanges: {
+            addedMediaServerIds: Set<string>;
+            removedMediaServerIds: Set<string>;
+          },
+          collectionLinkedBeforeRun: boolean,
+        ) => Promise<void>;
+      }
+    ).syncManualMediaServerToCollectionDB(
+      { id: 10, collectionId: 1 },
+      {
+        addedMediaServerIds: new Set(),
+        removedMediaServerIds: new Set(),
+      },
+      false,
+    );
+
+    expect(
+      collectionService.syncMediaServerChildrenToCollection,
+    ).not.toHaveBeenCalled();
     expect(logger.debug).toHaveBeenCalledWith(
       "Skipping manual child import for newly linked automatic collection 'Test Collection' to avoid marking existing collection contents as manual.",
     );
@@ -469,6 +648,110 @@ describe('RuleExecutorService', () => {
     ).not.toHaveBeenCalled();
     expect(logger.warn).toHaveBeenCalledWith(
       expect.stringContaining('Could not determine sibling rule ownership'),
+    );
+  });
+
+  it('skips importing items a sibling collection holds as manual members', async () => {
+    const { service, mediaServer, collectionService } = createService(
+      MediaServerType.PLEX,
+    );
+
+    collectionService.getCollection.mockResolvedValue({
+      id: 1,
+      title: 'Shared Title',
+      mediaServerId: 'coll-1',
+      manualCollection: false,
+    } as any);
+    collectionService.checkAutomaticMediaServerLink.mockResolvedValue({
+      id: 1,
+      title: 'Shared Title',
+      mediaServerId: 'coll-1',
+      manualCollection: false,
+    } as any);
+    collectionService.getCollectionMedia.mockResolvedValue([]);
+    collectionService.getSiblingMemberMediaServerIds.mockResolvedValue(
+      new Set(['m-sibling-manual']),
+    );
+    mediaServer.getCollectionChildren.mockResolvedValue([
+      { id: 'm-sibling-manual' },
+      { id: 'm-truly-manual' },
+    ]);
+
+    await (
+      service as unknown as {
+        syncManualMediaServerToCollectionDB: (
+          ruleGroup: { id: number; collectionId: number },
+          collectionSyncChanges: {
+            addedMediaServerIds: Set<string>;
+            removedMediaServerIds: Set<string>;
+          },
+        ) => Promise<void>;
+      }
+    ).syncManualMediaServerToCollectionDB(
+      { id: 10, collectionId: 1 },
+      {
+        addedMediaServerIds: new Set(),
+        removedMediaServerIds: new Set(),
+      },
+    );
+
+    expect(
+      collectionService.syncMediaServerChildrenToCollection,
+    ).toHaveBeenCalledWith(
+      expect.anything(),
+      [expect.objectContaining({ mediaServerId: 'm-truly-manual' })],
+      'local',
+    );
+  });
+
+  it('skips manual child import when sibling membership lookup fails', async () => {
+    const { service, mediaServer, collectionService, logger } = createService(
+      MediaServerType.PLEX,
+    );
+
+    collectionService.getCollection.mockResolvedValue({
+      id: 1,
+      title: 'Shared Title',
+      mediaServerId: 'coll-1',
+      manualCollection: false,
+    } as any);
+    collectionService.checkAutomaticMediaServerLink.mockResolvedValue({
+      id: 1,
+      title: 'Shared Title',
+      mediaServerId: 'coll-1',
+      manualCollection: false,
+    } as any);
+    collectionService.getCollectionMedia.mockResolvedValue([]);
+    collectionService.getSiblingMemberMediaServerIds.mockRejectedValue(
+      new Error('db down'),
+    );
+    mediaServer.getCollectionChildren.mockResolvedValue([
+      { id: 'm-truly-manual' },
+    ]);
+
+    await (
+      service as unknown as {
+        syncManualMediaServerToCollectionDB: (
+          ruleGroup: { id: number; collectionId: number },
+          collectionSyncChanges: {
+            addedMediaServerIds: Set<string>;
+            removedMediaServerIds: Set<string>;
+          },
+        ) => Promise<void>;
+      }
+    ).syncManualMediaServerToCollectionDB(
+      { id: 10, collectionId: 1 },
+      {
+        addedMediaServerIds: new Set(),
+        removedMediaServerIds: new Set(),
+      },
+    );
+
+    expect(
+      collectionService.syncMediaServerChildrenToCollection,
+    ).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('Could not determine sibling membership'),
     );
   });
 
@@ -785,6 +1068,150 @@ describe('RuleExecutorService', () => {
     expect(collectionService.addToCollection).not.toHaveBeenCalled();
   });
 
+  it('does not re-adopt a confirmed rule-removal orphan as a manual member (cross-run marker)', async () => {
+    const { service, mediaServer, collectionService } = createService(
+      MediaServerType.JELLYFIN,
+    );
+
+    // The media server still lists the item and the DB no longer has it, but a
+    // persisted marker (surfaced by reconcileRuleRemovedOrphans) proves this
+    // instance's rule removed it - so it must not be adopted as manual.
+    mediaServer.getCollectionChildren.mockResolvedValue([{ id: 'm-orphan' }]);
+    collectionService.getCollectionMedia.mockResolvedValue([]);
+    collectionService.reconcileRuleRemovedOrphans.mockResolvedValue(
+      new Set(['m-orphan']),
+    );
+
+    await (
+      service as unknown as {
+        syncManualMediaServerToCollectionDB: (
+          ruleGroup: { id: number; collectionId: number },
+          collectionSyncChanges: {
+            addedMediaServerIds: Set<string>;
+            removedMediaServerIds: Set<string>;
+          },
+        ) => Promise<void>;
+      }
+    ).syncManualMediaServerToCollectionDB(
+      { id: 10, collectionId: 1 },
+      { addedMediaServerIds: new Set(), removedMediaServerIds: new Set() },
+    );
+
+    expect(collectionService.reconcileRuleRemovedOrphans).toHaveBeenCalledTimes(
+      1,
+    );
+    expect(
+      collectionService.syncMediaServerChildrenToCollection,
+    ).not.toHaveBeenCalled();
+  });
+
+  it('leaves existing members untouched when child enumeration fails on Plex', async () => {
+    const { service, mediaServer, collectionService } = createService(
+      MediaServerType.PLEX,
+    );
+
+    // A pure-manual member. Plex has no empty-children removal guard, so a
+    // failed read collapsing to [] would flag it as "removed manually".
+    collectionService.getCollectionMedia.mockResolvedValue([
+      {
+        mediaServerId: 'm-manual',
+        includedByRule: false,
+        manualMembershipSource: 'local',
+      },
+    ] as any);
+    mediaServer.getCollectionChildren.mockRejectedValue(new Error('boom'));
+
+    await (
+      service as unknown as {
+        syncManualMediaServerToCollectionDB: (
+          ruleGroup: {
+            id: number;
+            collectionId: number;
+          },
+          collectionSyncChanges: {
+            addedMediaServerIds: Set<string>;
+            removedMediaServerIds: Set<string>;
+          },
+        ) => Promise<void>;
+      }
+    ).syncManualMediaServerToCollectionDB(
+      { id: 10, collectionId: 1 },
+      {
+        addedMediaServerIds: new Set(),
+        removedMediaServerIds: new Set(),
+      },
+    );
+
+    expect(collectionService.removeFromCollection).not.toHaveBeenCalled();
+    expect(
+      collectionService.syncMediaServerChildrenToCollection,
+    ).not.toHaveBeenCalled();
+  });
+
+  it('adopts only children matching the rule media type as manual members', async () => {
+    const { service, mediaServer, collectionService, logger } = createService(
+      MediaServerType.JELLYFIN,
+    );
+
+    collectionService.getCollectionMedia.mockResolvedValue([]);
+    mediaServer.getCollectionChildren.mockResolvedValue([
+      {
+        id: 'm-season',
+        type: 'season',
+        title: 'Season 2',
+        parentTitle: 'Sample Series',
+      },
+      {
+        id: 'm-episode',
+        type: 'episode',
+        title: 'Sample Episode',
+        grandparentTitle: 'Sample Series',
+      },
+      { id: 'm-series', type: 'show', title: 'Sample Series' },
+    ]);
+
+    await (
+      service as unknown as {
+        syncManualMediaServerToCollectionDB: (
+          ruleGroup: {
+            id: number;
+            collectionId: number;
+            dataType: string;
+          },
+          collectionSyncChanges: {
+            addedMediaServerIds: Set<string>;
+            removedMediaServerIds: Set<string>;
+          },
+        ) => Promise<void>;
+      }
+    ).syncManualMediaServerToCollectionDB(
+      { id: 10, collectionId: 1, dataType: 'season' },
+      {
+        addedMediaServerIds: new Set(),
+        removedMediaServerIds: new Set(),
+      },
+    );
+
+    expect(
+      collectionService.syncMediaServerChildrenToCollection,
+    ).toHaveBeenCalledTimes(1);
+    expect(
+      collectionService.syncMediaServerChildrenToCollection,
+    ).toHaveBeenCalledWith(
+      expect.anything(),
+      [expect.objectContaining({ mediaServerId: 'm-season' })],
+      'local',
+    );
+    expect(logger.log).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Importing 1 item(s) present in the media server collection for 'Test Collection'",
+      ),
+    );
+    expect(logger.log).toHaveBeenCalledWith(
+      expect.stringContaining("'Sample Series - Season 2' (m-season)"),
+    );
+  });
+
   it('does not re-run addToCollection with no additions after resyncing a stale link', async () => {
     const { service, collectionService } = createService(
       MediaServerType.JELLYFIN,
@@ -988,6 +1415,46 @@ describe('RuleExecutorService', () => {
       MaintainerrEvent.RuleHandler_Failed,
       expect.anything(),
     );
+  });
+
+  // The per-item transient path already holds the collection and retries; the
+  // only thing missing was telling the user which integration is absent.
+  it('warns which integration is unavailable, and still runs', async () => {
+    const { service, rulesService, mediaServerFactory, logger } = createService(
+      MediaServerType.PLEX,
+    );
+
+    rulesService.getRuleGroup.mockResolvedValue({
+      id: 56,
+      name: 'Unwatched in Tautulli',
+      isActive: true,
+      libraryId: 'library-1',
+      useRules: true,
+      collection: { id: 2, title: 'Movies' },
+      rules: [
+        {
+          ruleJson: JSON.stringify({
+            operator: null,
+            action: 0,
+            section: 0,
+            firstVal: [Application.TAUTULLI, 3],
+            customVal: { ruleTypeId: 0, value: '0' },
+          }),
+        },
+      ],
+    } as any);
+    rulesService.getUnavailableApplications.mockResolvedValue([
+      Application.TAUTULLI,
+    ]);
+    mediaServerFactory.verifyConnection.mockRejectedValue(new Error('stop'));
+
+    await service.executeForRuleGroups(56, new AbortController().signal);
+
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('Tautulli'),
+    );
+    // The run itself is untouched: the getters still decide per item.
+    expect(mediaServerFactory.verifyConnection).toHaveBeenCalledTimes(1);
   });
 
   it('does not emit started and still cleans up when execution was already aborted before starting', async () => {
@@ -1267,7 +1734,7 @@ describe('RuleExecutorService', () => {
     collectionService.getCollectionMedia.mockResolvedValue([] as any);
     rulesService.getExclusions.mockResolvedValue([
       // parent=showId mirrors what setExclusion writes when the AddModal is
-      // opened from a show overview — the regression hinges on this shape.
+      // opened from a show overview - the regression hinges on this shape.
       { mediaServerId: 'ep-1', parent: 'show-1', type: 'episode' },
     ] as any);
 
@@ -1611,5 +2078,94 @@ describe('RuleExecutorService', () => {
       MaintainerrEvent.CollectionMedia_Removed,
       expect.anything(),
     );
+  });
+
+  describe('prefetchWatchHistory', () => {
+    const ruleGroup = {
+      id: 10,
+      name: 'Test Rule',
+      isActive: true,
+      libraryId: 'library-1',
+      useRules: true,
+      rules: [],
+      collectionId: 1,
+      collection: { title: 'Test Collection' },
+    };
+
+    it('calls prefetchWatchHistory when the server supports central watch history (Plex)', async () => {
+      const { service, rulesService, mediaServer } = createService(
+        MediaServerType.PLEX,
+      );
+      rulesService.getRuleGroup.mockResolvedValue(ruleGroup as any);
+      rulesService.getRuleGroupById.mockResolvedValue(ruleGroup as any);
+      (mediaServer as any).prefetchWatchHistory = jest
+        .fn()
+        .mockResolvedValue(undefined);
+
+      await service.executeForRuleGroups(10, new AbortController().signal);
+
+      expect((mediaServer as any).prefetchWatchHistory).toHaveBeenCalledTimes(
+        1,
+      );
+    });
+
+    it('prefetches on Jellyfin, which sweeps watch state per user', async () => {
+      const { service, rulesService, mediaServer } = createService(
+        MediaServerType.JELLYFIN,
+      );
+      rulesService.getRuleGroup.mockResolvedValue(ruleGroup as any);
+      rulesService.getRuleGroupById.mockResolvedValue(ruleGroup as any);
+      (mediaServer as any).prefetchWatchHistory = jest
+        .fn()
+        .mockResolvedValue(undefined);
+
+      await expect(
+        service.executeForRuleGroups(10, new AbortController().signal),
+      ).resolves.toEqual({ status: 'success' });
+      expect((mediaServer as any).prefetchWatchHistory).toHaveBeenCalledTimes(
+        1,
+      );
+    });
+
+    it('does not prefetch when the server lacks bulk watch history (e.g. Emby)', async () => {
+      const { service, rulesService, mediaServer } = createService(
+        MediaServerType.EMBY,
+      );
+      rulesService.getRuleGroup.mockResolvedValue(ruleGroup as any);
+      rulesService.getRuleGroupById.mockResolvedValue(ruleGroup as any);
+      (mediaServer as any).prefetchWatchHistory = jest.fn();
+
+      await expect(
+        service.executeForRuleGroups(10, new AbortController().signal),
+      ).resolves.toEqual({ status: 'success' });
+      expect((mediaServer as any).prefetchWatchHistory).not.toHaveBeenCalled();
+    });
+
+    it('does not start the prefetch when aborted just before evaluation', async () => {
+      const { service, rulesService, mediaServer } = createService(
+        MediaServerType.PLEX,
+      );
+      rulesService.getRuleGroup.mockResolvedValue(ruleGroup as any);
+      rulesService.getRuleGroupById.mockResolvedValue(ruleGroup as any);
+      (mediaServer as any).prefetchWatchHistory = jest
+        .fn()
+        .mockResolvedValue(undefined);
+
+      // Abort during the pre-evaluation cache reset, i.e. after the top-level
+      // abort check but before the prefetch - so only the pre-prefetch check
+      // can stop the sweep.
+      const abortController = new AbortController();
+      rulesService.resetCacheIfGroupUsesRuleThatRequiresIt.mockImplementation(
+        async () => {
+          abortController.abort();
+          return false;
+        },
+      );
+
+      await expect(
+        service.executeForRuleGroups(10, abortController.signal),
+      ).resolves.toEqual({ status: 'aborted' });
+      expect((mediaServer as any).prefetchWatchHistory).not.toHaveBeenCalled();
+    });
   });
 });

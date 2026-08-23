@@ -87,8 +87,20 @@ describe('compareMediaItemsBySort tiebreakers', () => {
     expect(sortBy(views, 'watchCount', 'asc')).toEqual(['A', 'B', 'C']);
   });
 
+  it('sorts by the first studio with title tiebreakers and missing values last', () => {
+    const items: MediaItem[] = [
+      item({ title: 'C', studios: ['B Studio'] }),
+      item({ title: 'A', studios: ['A Studio'] }),
+      item({ title: 'B', studios: ['A Studio'] }),
+      item({ title: 'Z' }),
+    ];
+
+    expect(sortBy(items, 'studio', 'asc')).toEqual(['A', 'B', 'C', 'Z']);
+    expect(sortBy(items, 'studio', 'desc')).toEqual(['C', 'A', 'B', 'Z']);
+  });
+
   it('does not apply a title tiebreaker to status sorts (manual/excluded)', () => {
-    // Status sorts intentionally only partition — incoming order must be
+    // Status sorts intentionally only partition - incoming order must be
     // preserved within each partition for stable filter UX.
     const items: MediaItem[] = [
       item({ title: 'C', maintainerrIsManual: true }),
@@ -120,7 +132,7 @@ describe('compareMediaItemsBySort show-aware title ordering', () => {
 
   it('groups episodes from the same show together when sorting by title', () => {
     // Episode titles are deliberately interleaved across shows so that an
-    // episode-title-only sort would yield Aurora, Bravo, Comet, Delta —
+    // episode-title-only sort would yield Aurora, Bravo, Comet, Delta -
     // which interleaves Show Alpha and Show Beta episodes. The show-aware
     // comparator must instead group all of Show Alpha first.
     const items: MediaItem[] = [
@@ -424,7 +436,7 @@ describe('compareMediaItemsBySort missing values', () => {
 
   it('treats viewCount === 0 as a real value, only undefined trails to the end', () => {
     // Distinguishes "watched zero times" (a real data point) from
-    // "watch count not reported" — pre-fix both collapsed to 0.
+    // "watch count not reported" - pre-fix both collapsed to 0.
     const items: MediaItem[] = [
       item({ title: 'Unknown', viewCount: undefined }),
       item({ title: 'Watched', viewCount: 3 }),

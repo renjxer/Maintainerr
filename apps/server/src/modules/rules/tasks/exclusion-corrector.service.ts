@@ -2,6 +2,7 @@ import { MediaItemType } from '@maintainerr/contracts';
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
+import { readItemPresence } from '../../api/media-server/item-presence.util';
 import { MediaServerFactory } from '../../api/media-server/media-server.factory';
 import { Collection } from '../../collections/entities/collection.entities';
 import { MaintainerrLogger } from '../../logging/logs.service';
@@ -138,25 +139,33 @@ export class ExclusionTypeCorrectorService implements OnModuleInit {
     }
 
     this.logger.log(
-      `Backfilling type for ${exclusionsWithoutType.length} exclusion(s) from media server metadata — this may take a moment on first run`,
+      `Backfilling type for ${exclusionsWithoutType.length} exclusion(s) from media server metadata - this may take a moment on first run`,
     );
 
     const mediaServer = await this.mediaServerFactory.getService();
 
-    // correct the type
+    // Neither typed nor confirmed gone: the row stays untyped and the next
+    // startup retries it.
+    const { found, missing } = await readItemPresence(
+      mediaServer,
+      exclusionsWithoutType.map((el) => el.mediaServerId),
+      (error) => this.logger.debug(error),
+    );
+
+    const corrected: typeof exclusionsWithoutType = [];
     for (const el of exclusionsWithoutType) {
-      const metaData = await mediaServer.getMetadata(el.mediaServerId);
-      if (!metaData) {
-        // remove record if not in media server
+      const metaData = found.get(el.mediaServerId);
+      if (metaData) {
+        el.type = metaData.type;
+        corrected.push(el);
+      } else if (missing.has(el.mediaServerId)) {
         await this.rulesService.removeExclusion(el.id);
-      } else {
-        // Assign MediaItemType string directly
-        el.type = metaData?.type;
       }
     }
 
-    // save edited data
-    await this.exclusionRepo.save(exclusionsWithoutType);
+    // Save only the rows that received a type: saving the full list would
+    // re-insert the exclusions removed above.
+    await this.exclusionRepo.save(corrected);
 
     this.logger.log('Exclusion type backfill complete');
   }

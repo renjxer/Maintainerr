@@ -1,5 +1,6 @@
 import {
   IComparisonStatistics,
+  MediaServerType,
   IRuleComparisonResult,
   MediaItem,
   MediaItemType,
@@ -16,7 +17,7 @@ import {
 } from '../constants/rules.constants';
 import { RuleDto } from '../dtos/rule.dto';
 import { RuleDbDto } from '../dtos/ruleDb.dto';
-import { RulesDto } from '../dtos/rules.dto';
+import { RuleGroupDto } from '../dtos/ruleGroup.dto';
 import { ValueGetterService } from '../getter/getter.service';
 import { ArrLookupCache } from './arr-lookup-cache';
 
@@ -58,6 +59,9 @@ export class RuleComparatorService {
   private statsById: Map<string, IComparisonStatistics>;
   private transientFailureIds: Set<string>;
   private arrLookupCache?: ArrLookupCache;
+  // Resolved once per run: names every value after the server it was read
+  // from, rather than the one the rule was authored against.
+  private configuredServerType?: MediaServerType | null;
 
   private static readonly UNARY_RULE_ACTIONS = new Set<RulePossibility>([
     RulePossibility.EXISTS,
@@ -73,7 +77,7 @@ export class RuleComparatorService {
   }
 
   public async executeRulesWithData(
-    rulegroup: RulesDto,
+    rulegroup: RuleGroupDto,
     plexData: MediaItem[],
     onRuleProgress?: (processingRule: number) => void,
     abortSignal?: AbortSignal,
@@ -94,6 +98,8 @@ export class RuleComparatorService {
       this.resultIds = new Set<string>();
       this.statsById = new Map<string, IComparisonStatistics>();
       this.transientFailureIds = new Set<string>();
+      this.configuredServerType =
+        await this.valueGetter.getConfiguredServerType();
 
       // run rules
       let currentSection = 0;
@@ -126,7 +132,19 @@ export class RuleComparatorService {
           this.handleSectionAction(sectionActionAnd);
 
           // save new section action
-          sectionActionAnd = +parsedRule.operator === 0;
+          // Null-guarded coercion. The section operator lives on the first
+          // condition of the new section and is persisted as a string
+          // ("0"/"1"), or null when unset. +null === 0 is true in JS, so the
+          // bare `+operator === 0` check coerced an unset operator to AND.
+          // Guard against null first, then coerce - mirroring the
+          // within-section idiom (`operator != null && +operator === ...`)
+          // used elsewhere in this service - so an unset operator falls
+          // through to OR while an explicit AND ("0") is still honoured.
+          // Persisted rules are normalised to an explicit operator by
+          // migration, so null should not reach here in practice.
+          sectionActionAnd =
+            parsedRule.operator != null &&
+            +parsedRule.operator === RuleOperators.AND;
           // reset first operator of new section
           parsedRule.operator = null;
           // add new section to stats
@@ -166,6 +184,11 @@ export class RuleComparatorService {
         `Something went wrong while running rule ${rulegroup.name}`,
         error,
       );
+      // Swallowing here returned `undefined` for the whole chunk: the
+      // executor then saw none of these items as matching or transiently
+      // failed and removed them from the collection. Fail the run instead
+      // (#3307).
+      throw error;
     }
   }
 
@@ -197,26 +220,29 @@ export class RuleComparatorService {
     });
   }
 
-  private async executeRule(rule: RuleDto, ruleGroup: RulesDto) {
+  private async executeRule(rule: RuleDto, ruleGroup: RuleGroupDto) {
     let data: MediaItem[];
     let firstVal: RuleValueType;
     let secondVal: RuleValueType;
 
     if (rule.operator === null || +rule.operator === +RuleOperators.OR) {
-      data = this.plexData;
+      data = this.plexData.filter(
+        (mediaItem) => !this.workerIds.has(mediaItem.id),
+      );
     } else {
       data = this.workerData;
     }
 
     // Value resolution (firstVal/secondVal) is the slow part: each item may
-    // trigger an external lookup with no bulk equivalent — most expensively a
-    // Plex watch-history round-trip (no bulk endpoint, see feature #2936).
-    // Those getters are pure reads and touch no comparator state, so we resolve
-    // them up front in bounded parallel batches — the same chunk + Promise.all
-    // idiom used for Plex collection writes. Batching lives only here, so the
-    // total in-flight lookups never exceed RULE_EVALUATION_CONCURRENCY. The
-    // mutation pass below then stays strictly sequential and in the original
-    // backward order, preserving the index-based splice semantics exactly.
+    // trigger an external lookup. Plex leaf watch history is prefetched for the
+    // rule batch, but show/season rollups and other integrations can still make
+    // per-item calls. These getters are pure reads and touch no comparator
+    // state, so we resolve them up front in bounded parallel batches - the same
+    // chunk + Promise.all idiom used for Plex collection writes. Batching lives
+    // only here, so the total in-flight lookups never exceed
+    // RULE_EVALUATION_CONCURRENCY. The mutation pass below then stays strictly
+    // sequential and in the original backward order, preserving the index-based
+    // splice semantics exactly.
     const firstVals: RuleValueType[] = new Array(data.length);
     const secondVals: RuleValueType[] = new Array(data.length);
     for (
@@ -341,14 +367,21 @@ export class RuleComparatorService {
   ): { firstValueReason?: string; secondValueReason?: string } {
     const reasons: { firstValueReason?: string; secondValueReason?: string } =
       {};
+    // `undefined` is the transport-failure signal, `null` a confirmed absence -
+    // keep them apart here so the Test Media output stops reporting a failed
+    // lookup as "no entries for this item".
     if (firstVal == null) {
       reasons.firstValueReason = this.ruleConstanstService.getValueNullReason(
         rule.firstVal,
+        this.configuredServerType,
+        { lookupFailed: firstVal === undefined },
       );
     }
     if (secondVal == null && rule.lastVal) {
       reasons.secondValueReason = this.ruleConstanstService.getValueNullReason(
         rule.lastVal,
+        this.configuredServerType,
+        { lookupFailed: secondVal === undefined },
       );
     }
     return reasons;
@@ -361,7 +394,7 @@ export class RuleComparatorService {
   private async getSecondValue(
     rule: RuleDto,
     data: MediaItem,
-    rulegroup: RulesDto,
+    rulegroup: RuleGroupDto,
     firstVal: RuleValueType,
   ): Promise<RuleValueType> {
     let secondVal: RuleValueType;
@@ -390,7 +423,7 @@ export class RuleComparatorService {
       // Key conversion off the first-value slot's *declared* type, not the
       // runtime value. This preserves the previous behavior for every action
       // (before/after/in_last/in_next plus equals/not_equals) while still
-      // converting custom_days when firstVal is null — see issue #2582.
+      // converting custom_days when firstVal is null - see issue #2582.
       const firstValProperty = this.ruleConstanstService
         .getRuleConstants()
         .applications.find((app) => app.id === rule.firstVal[0])
@@ -480,6 +513,7 @@ export class RuleComparatorService {
       action: RulePossibility[rule.action].toLowerCase(),
       firstValueName: this.ruleConstanstService.getValueHumanName(
         rule.firstVal,
+        this.configuredServerType,
       ),
       firstValue: firstVal,
       ...(reasons?.firstValueReason
@@ -492,13 +526,14 @@ export class RuleComparatorService {
 
   private logMissingOperand(
     rule: RuleDto,
-    ruleGroup: RulesDto,
+    ruleGroup: RuleGroupDto,
     mediaId: string,
     firstVal: RuleValueType,
     secondVal: RuleValueType,
   ): void {
     const firstValueName = this.ruleConstanstService.getValueHumanName(
       rule.firstVal,
+      this.configuredServerType,
     );
 
     this.logger.debug(
@@ -511,9 +546,20 @@ export class RuleComparatorService {
   }
 
   private getSecondValueName(rule: RuleDto): string {
-    return rule.lastVal
-      ? this.ruleConstanstService.getValueHumanName(rule.lastVal)
-      : this.ruleConstanstService.getCustomValueIdentifier(rule.customVal).type;
+    if (rule.lastVal) {
+      return this.ruleConstanstService.getValueHumanName(
+        rule.lastVal,
+        this.configuredServerType,
+      );
+    }
+    // Unary actions (EXISTS / NOT_EXISTS) have neither a second value nor a
+    // custom value. Guard against it so this diagnostic-only helper never
+    // throws while logging a skipped comparison (which would abort the run).
+    if (rule.customVal) {
+      return this.ruleConstanstService.getCustomValueIdentifier(rule.customVal)
+        .type;
+    }
+    return 'none';
   }
 
   private handleSectionAction(sectionActionAnd: boolean) {
@@ -641,7 +687,7 @@ export class RuleComparatorService {
             return false;
           }
         }
-      } catch (_err) {
+      } catch {
         return null;
       }
     }
@@ -681,7 +727,7 @@ export class RuleComparatorService {
             return false;
           }
         }
-      } catch (_err) {
+      } catch {
         return null;
       }
     }
@@ -699,7 +745,7 @@ export class RuleComparatorService {
             return false;
           }
         }
-      } catch (_err) {
+      } catch {
         return null;
       }
     }

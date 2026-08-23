@@ -1,5 +1,5 @@
 import type { OverlayElement } from '@maintainerr/contracts'
-import { cleanup, render, waitFor } from '@testing-library/react'
+import { render, waitFor } from '../../test-utils/render'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { OverlayCanvas } from './OverlayCanvas'
 
@@ -65,35 +65,37 @@ vi.mock('react-konva', async () => {
       )
     }
 
-  const Stage = React.forwardRef<StageHandle, KonvaNodeProps>(
-    function MockStage({ children, ...props }, ref) {
-      React.useImperativeHandle(ref, () => ({
-        batchDraw: () => undefined,
-        findOne: () => null,
-      }))
+  const Stage = ({
+    children,
+    ref,
+    ...props
+  }: KonvaNodeProps & { ref?: React.Ref<StageHandle> }) => {
+    React.useImperativeHandle(ref, () => ({
+      batchDraw: () => undefined,
+      findOne: () => null,
+    }))
 
-      return React.createElement(
-        'div',
-        {
-          'data-konva': 'Stage',
-          'data-width': numericAttribute(props.width),
-          'data-height': numericAttribute(props.height),
-        },
-        children,
-      )
-    },
-  )
+    return React.createElement(
+      'div',
+      {
+        'data-konva': 'Stage',
+        'data-width': numericAttribute(props.width),
+        'data-height': numericAttribute(props.height),
+      },
+      children,
+    )
+  }
 
-  const Transformer = React.forwardRef<TransformerHandle, KonvaNodeProps>(
-    function MockTransformer(_props, ref) {
-      React.useImperativeHandle(ref, () => ({
-        getLayer: () => ({ batchDraw: () => undefined }),
-        nodes: () => undefined,
-      }))
+  const Transformer = ({
+    ref,
+  }: KonvaNodeProps & { ref?: React.Ref<TransformerHandle> }) => {
+    React.useImperativeHandle(ref, () => ({
+      getLayer: () => ({ batchDraw: () => undefined }),
+      nodes: () => undefined,
+    }))
 
-      return React.createElement('div', { 'data-konva': 'Transformer' })
-    },
-  )
+    return React.createElement('div', { 'data-konva': 'Transformer' })
+  }
 
   return {
     Ellipse: node('Ellipse'),
@@ -200,7 +202,6 @@ describe('OverlayCanvas', () => {
   })
 
   afterEach(() => {
-    cleanup()
     Object.defineProperty(window, 'Image', {
       configurable: true,
       value: originalImage,
@@ -390,7 +391,7 @@ describe('OverlayCanvas', () => {
       expect(buildOverlayImageUrlMock).toHaveBeenCalledTimes(1)
     })
 
-    // Hide the image — its filename is still referenced in the document,
+    // Hide the image - its filename is still referenced in the document,
     // so the cached bitmap must not be evicted.
     rerender(
       <OverlayCanvas
@@ -403,7 +404,7 @@ describe('OverlayCanvas', () => {
       />,
     )
 
-    // Show it again. No new fetch should happen — we re-use the cached
+    // Show it again. No new fetch should happen - we re-use the cached
     // bitmap rather than briefly rendering a placeholder.
     rerender(
       <OverlayCanvas

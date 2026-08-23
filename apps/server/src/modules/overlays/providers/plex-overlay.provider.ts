@@ -9,7 +9,7 @@ import { IOverlayProvider } from './overlay-provider.interface';
 /**
  * Plex implementation of IOverlayProvider.
  *
- * Pure delegation over existing PlexApiService helpers — every Plex-specific
+ * Pure delegation over existing PlexApiService helpers - every Plex-specific
  * concept (`thumb` URL, `upload://posters/` URI scheme, X-Plex-Token,
  * type=4 episode filter, content-addressed dedup, eventual-consistency
  * retry loop) stays inside PlexApiService. This class adds no Plex logic.
@@ -59,9 +59,5 @@ export class PlexOverlayProvider implements IOverlayProvider {
     contentType: string,
   ): Promise<void> {
     await this.plex.setThumb(itemId, buffer, contentType);
-  }
-
-  async itemExists(itemId: string): Promise<boolean> {
-    return this.plex.itemExists(itemId);
   }
 }

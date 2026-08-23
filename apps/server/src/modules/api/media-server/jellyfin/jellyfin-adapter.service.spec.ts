@@ -5,12 +5,17 @@ import {
   MediaServerType,
 } from '@maintainerr/contracts';
 import { Mocked, TestBed } from '@suites/unit';
-import { AxiosError } from 'axios';
+import type { AxiosError } from 'axios';
 import { delay } from '../../../../utils/delay';
 import { MaintainerrLogger } from '../../../logging/logs.service';
 import { SettingsDataService } from '../../../settings/settings-data.service';
+import {
+  JELLYFIN_WATCH_SNAPSHOT_MAX_RECORDS,
+  jellyfinWatchSnapshotCacheKey,
+} from './jellyfin.constants';
+import { batchIdsByRequestCost } from '../metadata-batch.util';
 import { JellyfinAdapterService } from './jellyfin-adapter.service';
-import { JELLYFIN_BATCH_SIZE } from './jellyfin.constants';
+import { JELLYFIN_BATCH_SIZE, JELLYFIN_CACHE_TTL } from './jellyfin.constants';
 
 const jellyfinApiMocks = {
   getPublicSystemInfo: jest.fn(),
@@ -28,6 +33,8 @@ const jellyfinApiMocks = {
   refreshItem: jest.fn(),
   getItemImage: jest.fn(),
   setItemImage: jest.fn(),
+  getSessions: jest.fn(),
+  getSeasons: jest.fn(),
 };
 
 const collectionApiMocks = {
@@ -55,6 +62,14 @@ jest.mock('@jellyfin/sdk', () => ({
     createApi: jest.fn().mockReturnValue({
       accessToken: '',
       configuration: {},
+      // axios-retry attaches interceptors to this instance during
+      // createApiClient; stub them so the real attach call is a no-op in tests.
+      axiosInstance: {
+        interceptors: {
+          request: { use: jest.fn() },
+          response: { use: jest.fn() },
+        },
+      },
     }),
   })),
 }));
@@ -80,6 +95,7 @@ jest.mock('@jellyfin/sdk/lib/generated-client/models', () => ({
     Overview: 'Overview',
     ParentId: 'ParentId',
     People: 'People',
+    Studios: 'Studios',
   },
   LocationType: {
     FileSystem: 'FileSystem',
@@ -94,6 +110,10 @@ jest.mock('@jellyfin/sdk/lib/generated-client/models', () => ({
     SortName: 'SortName',
     DateCreated: 'DateCreated',
     Random: 'Random',
+    PremiereDate: 'PremiereDate',
+    CommunityRating: 'CommunityRating',
+    PlayCount: 'PlayCount',
+    Studio: 'Studio',
   },
   SortOrder: {
     Ascending: 'Ascending',
@@ -127,6 +147,9 @@ jest.mock('@jellyfin/sdk/lib/utils/api/index.js', () => ({
     getItems: (...args: unknown[]) => jellyfinApiMocks.getItems(...args),
     getItemUserData: (...args: unknown[]) =>
       jellyfinApiMocks.getItemUserData(...args),
+  })),
+  getTvShowsApi: jest.fn().mockImplementation(() => ({
+    getSeasons: (...args: unknown[]) => jellyfinApiMocks.getSeasons(...args),
   })),
   getLibraryApi: jest.fn().mockImplementation(() => ({
     getMediaFolders: (...args: unknown[]) =>
@@ -162,6 +185,9 @@ jest.mock('@jellyfin/sdk/lib/utils/api/index.js', () => ({
     setItemImage: (...args: unknown[]) =>
       jellyfinApiMocks.setItemImage(...args),
   })),
+  getSessionApi: jest.fn().mockImplementation(() => ({
+    getSessions: (...args: unknown[]) => jellyfinApiMocks.getSessions(...args),
+  })),
   getSearchApi: jest.fn(),
   getPlaylistsApi: jest.fn(),
   getUserViewsApi: jest.fn(),
@@ -172,22 +198,45 @@ jest.mock('../../../../utils/delay', () => ({
   delay: jest.fn().mockResolvedValue(undefined),
 }));
 
+// The watch snapshot is a real store: the prefetch writes a value and later
+// reads it back, which a bare jest.fn() cannot model. Every other cache keeps
+// the assertable mock.
+const mockSnapshotStore = new Map<string, unknown>();
+
 // Mock the cacheManager module
 jest.mock('../../lib/cache', () => ({
   __esModule: true,
   default: {
-    getCache: jest.fn().mockImplementation(() => ({
-      flush: (...args: unknown[]) => jellyfinCacheMocks.flush(...args),
-      data: {
-        has: (...args: unknown[]) => jellyfinCacheMocks.data.has(...args),
-        get: (...args: unknown[]) => jellyfinCacheMocks.data.get(...args),
-        set: (...args: unknown[]) => jellyfinCacheMocks.data.set(...args),
-        del: (...args: unknown[]) => jellyfinCacheMocks.data.del(...args),
-        flushAll: (...args: unknown[]) =>
-          jellyfinCacheMocks.data.flushAll(...args),
-        keys: (...args: unknown[]) => jellyfinCacheMocks.data.keys(...args),
-      },
-    })),
+    getCache: jest.fn().mockImplementation((id: string) =>
+      id === 'jellyfinwatchhistory'
+        ? {
+            flush: () => mockSnapshotStore.clear(),
+            data: {
+              has: (key: string) => mockSnapshotStore.has(key),
+              get: (key: string) => mockSnapshotStore.get(key),
+              set: (key: string, value: unknown) => {
+                mockSnapshotStore.set(key, value);
+                return true;
+              },
+              del: (key: string) => mockSnapshotStore.delete(key),
+              flushAll: () => mockSnapshotStore.clear(),
+              keys: () => [...mockSnapshotStore.keys()],
+            },
+          }
+        : {
+            flush: (...args: unknown[]) => jellyfinCacheMocks.flush(...args),
+            data: {
+              has: (...args: unknown[]) => jellyfinCacheMocks.data.has(...args),
+              get: (...args: unknown[]) => jellyfinCacheMocks.data.get(...args),
+              set: (...args: unknown[]) => jellyfinCacheMocks.data.set(...args),
+              del: (...args: unknown[]) => jellyfinCacheMocks.data.del(...args),
+              flushAll: (...args: unknown[]) =>
+                jellyfinCacheMocks.data.flushAll(...args),
+              keys: (...args: unknown[]) =>
+                jellyfinCacheMocks.data.keys(...args),
+            },
+          },
+    ),
   },
 }));
 
@@ -251,15 +300,29 @@ describe('JellyfinAdapterService', () => {
     logger = unitRef.get(MaintainerrLogger);
   });
 
-  const createRetryableError = (code: string): AxiosError => {
-    const error = new AxiosError(`temporary failure (${code})`);
-    error.code = code;
-    return error;
-  };
+  // Model what @jellyfin/sdk actually throws. The SDK is ESM-only and carries
+  // its own axios build, so its AxiosError is a different class from the one
+  // this CommonJS test imports - only the `isAxiosError` flag survives the
+  // boundary. Constructing a local `new AxiosError()` here would let an
+  // `instanceof AxiosError` check pass in tests while never matching in
+  // production.
+  const createSdkAxiosError = (
+    message: string,
+    extra: Record<string, unknown>,
+  ): AxiosError =>
+    Object.assign(new Error(message), {
+      name: 'AxiosError',
+      isAxiosError: true,
+      toJSON: () => ({}),
+      ...extra,
+    }) as unknown as AxiosError;
 
-  const createResponseError = (status: number): AxiosError => {
-    const error = new AxiosError(`request failed with status ${status}`);
-    Object.assign(error, {
+  const createRetryableError = (code: string): AxiosError =>
+    createSdkAxiosError(`temporary failure (${code})`, { code });
+
+  const createResponseError = (status: number): AxiosError =>
+    createSdkAxiosError(`request failed with status ${status}`, {
+      code: 'ERR_BAD_REQUEST',
       response: {
         status,
         statusText: status === 401 ? 'Unauthorized' : 'Bad Gateway',
@@ -268,8 +331,6 @@ describe('JellyfinAdapterService', () => {
         config: {},
       },
     });
-    return error;
-  };
 
   describe('lifecycle', () => {
     it('should not be setup initially', () => {
@@ -358,7 +419,7 @@ describe('JellyfinAdapterService', () => {
       [MediaServerFeature.PLAYLISTS, true],
       [MediaServerFeature.COLLECTION_VISIBILITY, false],
       [MediaServerFeature.WATCHLIST, false],
-      [MediaServerFeature.CENTRAL_WATCH_HISTORY, false],
+      [MediaServerFeature.CENTRAL_WATCH_HISTORY, true],
       [MediaServerFeature.COLLECTION_SORT, false],
     ])('supportsFeature(%s) is %s', (feature, expected) => {
       expect(service.supportsFeature(feature)).toBe(expected);
@@ -368,6 +429,12 @@ describe('JellyfinAdapterService', () => {
       await expect(
         service.reorderCollectionItems('col1', ['a', 'b']),
       ).rejects.toThrow('Collection sort not supported on Jellyfin');
+    });
+
+    it('prefetchWatchHistory is a no-op when the adapter is not initialised', async () => {
+      await expect(
+        service.prefetchWatchHistory({ libraryId: 'lib-1' }),
+      ).resolves.toBeUndefined();
     });
   });
 
@@ -402,6 +469,47 @@ describe('JellyfinAdapterService', () => {
           startIndex: 0,
           limit: 30,
           fields: ['ProviderIds', 'DateCreated', 'Overview'],
+        }),
+      );
+    });
+
+    it('uses Jellyfin native studio sorting', async () => {
+      jellyfinApiMocks.getItems.mockResolvedValue({
+        data: { Items: [], TotalRecordCount: 0 },
+      });
+
+      await service.getLibraryContents('library-1', {
+        offset: 0,
+        limit: 30,
+        type: 'movie',
+        sort: 'studio',
+        sortOrder: 'desc',
+      });
+
+      expect(jellyfinApiMocks.getItems).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sortBy: ['Studio'],
+          sortOrder: ['Descending'],
+        }),
+      );
+    });
+
+    it('includes studios in global search results for local studio sorting', async () => {
+      jellyfinApiMocks.getItems.mockResolvedValue({
+        data: { Items: [], TotalRecordCount: 0 },
+      });
+
+      await service.searchContent('query');
+
+      expect(jellyfinApiMocks.getItems).toHaveBeenCalledWith(
+        expect.objectContaining({
+          fields: [
+            'ProviderIds',
+            'Path',
+            'DateCreated',
+            'MediaSources',
+            'Studios',
+          ],
         }),
       );
     });
@@ -506,18 +614,41 @@ describe('JellyfinAdapterService', () => {
       });
     });
 
-    it('does not retry non-transient library-content failures', async () => {
+    it('does not retry non-transient library-content failures and rethrows', async () => {
       jellyfinApiMocks.getItems.mockRejectedValueOnce(createResponseError(401));
 
-      const result = await service.getLibraryContents('library-1', {
-        offset: 0,
-        limit: 30,
-        type: 'movie',
-      });
+      await expect(
+        service.getLibraryContents('library-1', {
+          offset: 0,
+          limit: 30,
+          type: 'movie',
+        }),
+      ).rejects.toThrow('request failed with status 401');
 
       expect(delay).not.toHaveBeenCalled();
       expect(jellyfinApiMocks.getItems).toHaveBeenCalledTimes(1);
-      expect(result).toEqual({ items: [], totalSize: 0, offset: 0, limit: 50 });
+    });
+
+    it('rethrows library count read failures instead of reporting zero', async () => {
+      jellyfinApiMocks.getItems.mockRejectedValueOnce(createResponseError(500));
+
+      await expect(
+        service.getLibraryContentCount('library-1', 'movie'),
+      ).rejects.toThrow('request failed with status 500');
+    });
+
+    it('rethrows when the transient retry is exhausted instead of fabricating an empty page', async () => {
+      jellyfinApiMocks.getItems.mockRejectedValue(createResponseError(503));
+
+      await expect(
+        service.getLibraryContents('library-1', {
+          offset: 0,
+          limit: 30,
+          type: 'movie',
+        }),
+      ).rejects.toThrow('request failed with status 503');
+
+      expect(jellyfinApiMocks.getItems).toHaveBeenCalledTimes(2);
     });
   });
 
@@ -585,6 +716,53 @@ describe('JellyfinAdapterService', () => {
       });
       await service.computeLibraryStorageSizes();
       expectCollapseFalse();
+    });
+  });
+
+  // #3550: a library grouping films into collections answered a Movie-typed
+  // listing with BoxSet rows, which the mapper turns into a movie with no
+  // external IDs.
+  describe('listings drop kinds the query did not ask for', () => {
+    beforeEach(async () => {
+      settingsDataService.getSettings.mockResolvedValue({
+        ...mockSettings,
+        jellyfin_user_id: 'user-1',
+      } as unknown as Awaited<ReturnType<SettingsDataService['getSettings']>>);
+      await service.initialize();
+      jellyfinApiMocks.getItems.mockResolvedValue({
+        data: {
+          Items: [
+            { Id: 'movie-1', Type: 'Movie' },
+            { Id: 'boxset-1', Type: 'BoxSet' },
+          ],
+          TotalRecordCount: 2,
+        },
+      });
+    });
+
+    it.each([
+      [
+        'getLibraryContents',
+        async () =>
+          (
+            await service.getLibraryContents('library-1', {
+              offset: 0,
+              limit: 30,
+              type: 'movie' as const,
+            })
+          ).items,
+      ],
+      [
+        'searchLibraryContents',
+        () => service.searchLibraryContents('library-1', 'query', 'movie'),
+      ],
+      [
+        'getRecentlyAdded',
+        () => service.getRecentlyAdded('library-1', { limit: 10 }),
+      ],
+      ['searchContent', () => service.searchContent('query')],
+    ])('%s drops the BoxSet row', async (_method, read) => {
+      expect((await read()).map((item) => item.id)).toEqual(['movie-1']);
     });
   });
 
@@ -754,10 +932,342 @@ describe('JellyfinAdapterService', () => {
 
     it('rejects blank Jellyfin item ids before calling the API', async () => {
       await expect(service.refreshItemMetadata('   ')).rejects.toThrow(
-        'refreshItemMetadata called with empty itemId — aborting metadata refresh request',
+        'refreshItemMetadata called with empty itemId - aborting metadata refresh request',
       );
 
       expect(jellyfinApiMocks.refreshItem).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('getMetadata caching (#3355)', () => {
+    beforeEach(async () => {
+      settingsDataService.getSettings.mockResolvedValue(
+        mockSettings as unknown as Awaited<
+          ReturnType<SettingsDataService['getSettings']>
+        >,
+      );
+      await service.initialize();
+      jellyfinApiMocks.getItems.mockResolvedValue({
+        data: { Items: [{ Id: 'series-1', Type: 'Series', Name: 'A Show' }] },
+      });
+    });
+
+    it('caches a resolved item so repeat conditions do not re-read it', async () => {
+      const item = await service.getMetadata('series-1');
+
+      expect(item?.id).toBe('series-1');
+      expect(jellyfinCacheMocks.data.set).toHaveBeenCalledWith(
+        'jellyfin:metadata:series-1',
+        expect.objectContaining({ id: 'series-1' }),
+        JELLYFIN_CACHE_TTL.METADATA,
+      );
+    });
+
+    it('serves a cached item without touching the API', async () => {
+      jellyfinCacheMocks.data.get.mockReturnValueOnce({ id: 'series-1' });
+
+      await expect(service.getMetadata('series-1')).resolves.toEqual({
+        id: 'series-1',
+      });
+      expect(jellyfinApiMocks.getItems).not.toHaveBeenCalled();
+    });
+
+    it('does not cache a missing item', async () => {
+      jellyfinApiMocks.getItems.mockResolvedValue({ data: { Items: [] } });
+
+      await expect(service.getMetadata('gone')).resolves.toBeUndefined();
+      expect(jellyfinCacheMocks.data.set).not.toHaveBeenCalled();
+    });
+
+    it('rejects a response whose item does not match the requested id', async () => {
+      // Jellyfin ignores an unparseable ids filter and answers with an
+      // unfiltered listing; the first row must never pass as the lookup result.
+      await expect(service.getMetadata('not-a-guid')).resolves.toBeUndefined();
+      expect(jellyfinCacheMocks.data.set).not.toHaveBeenCalled();
+    });
+
+    it('does not cache a failed read', async () => {
+      // undefined means both "missing" and "could not read", so persisting it
+      // would turn a blip into "item is gone" for the whole TTL (#3307).
+      jellyfinApiMocks.getItems.mockRejectedValue(new Error('boom'));
+
+      await expect(service.getMetadata('item-1')).resolves.toBeUndefined();
+      expect(jellyfinCacheMocks.data.set).not.toHaveBeenCalled();
+    });
+
+    it('drops the item entry on resetMetadataCache', async () => {
+      jellyfinCacheMocks.data.keys.mockReturnValue([
+        'jellyfin:metadata:item-1',
+        'jellyfin:metadata:other',
+      ]);
+
+      service.resetMetadataCache('item-1');
+
+      expect(jellyfinCacheMocks.data.del).toHaveBeenCalledWith(
+        'jellyfin:metadata:item-1',
+      );
+      expect(jellyfinCacheMocks.data.del).not.toHaveBeenCalledWith(
+        'jellyfin:metadata:other',
+      );
+    });
+  });
+
+  describe('getChildrenMetadata caching (#3355)', () => {
+    beforeEach(async () => {
+      settingsDataService.getSettings.mockResolvedValue(
+        mockSettings as unknown as Awaited<
+          ReturnType<SettingsDataService['getSettings']>
+        >,
+      );
+      await service.initialize();
+    });
+
+    it('caches episodes and seasons under separate keys', async () => {
+      jellyfinApiMocks.getItems.mockResolvedValue({
+        data: { Items: [{ Id: 'ep-1', Type: 'Episode' }] },
+      });
+      jellyfinApiMocks.getSeasons.mockResolvedValue({
+        data: { Items: [{ Id: 'season-1', Type: 'Season' }] },
+      });
+
+      await service.getChildrenMetadata('show-1', 'episode');
+      await service.getChildrenMetadata('show-1', 'season');
+
+      // Same parent, different child type - one key each, or the season walk
+      // would answer with episodes.
+      expect(jellyfinCacheMocks.data.set).toHaveBeenCalledWith(
+        'jellyfin:children:show-1:episode',
+        [expect.objectContaining({ id: 'ep-1' })],
+        JELLYFIN_CACHE_TTL.METADATA,
+      );
+      expect(jellyfinCacheMocks.data.set).toHaveBeenCalledWith(
+        'jellyfin:children:show-1:season',
+        [expect.objectContaining({ id: 'season-1' })],
+        JELLYFIN_CACHE_TTL.METADATA,
+      );
+    });
+
+    it('serves a cached list without touching the API', async () => {
+      jellyfinCacheMocks.data.get.mockReturnValueOnce([{ id: 'ep-1' }]);
+
+      await expect(
+        service.getChildrenMetadata('season-1', 'episode'),
+      ).resolves.toEqual([{ id: 'ep-1' }]);
+      expect(jellyfinApiMocks.getItems).not.toHaveBeenCalled();
+    });
+
+    it('does not cache a failed read', async () => {
+      // The catch answers [], which is indistinguishable from "no episodes" -
+      // persisting it would read as an empty show for the whole TTL.
+      jellyfinApiMocks.getItems.mockRejectedValue(new Error('boom'));
+
+      await expect(
+        service.getChildrenMetadata('season-1', 'episode'),
+      ).resolves.toEqual([]);
+      expect(jellyfinCacheMocks.data.set).not.toHaveBeenCalled();
+    });
+
+    it('drops the whole children namespace on resetMetadataCache', async () => {
+      // A show's episode lists hang off its season ids, not the id passed in,
+      // so scoping the delete to that id would leave them stale (#3274).
+      jellyfinCacheMocks.data.keys.mockReturnValue([
+        'jellyfin:children:show-1:season',
+        'jellyfin:children:season-9:episode',
+        'jellyfin:users',
+      ]);
+
+      service.resetMetadataCache('show-1');
+
+      expect(jellyfinCacheMocks.data.del).toHaveBeenCalledWith(
+        'jellyfin:children:show-1:season',
+      );
+      expect(jellyfinCacheMocks.data.del).toHaveBeenCalledWith(
+        'jellyfin:children:season-9:episode',
+      );
+      expect(jellyfinCacheMocks.data.del).not.toHaveBeenCalledWith(
+        'jellyfin:users',
+      );
+    });
+  });
+
+  describe('getMetadataBatch', () => {
+    beforeEach(async () => {
+      settingsDataService.getSettings.mockResolvedValue(
+        mockSettings as unknown as Awaited<
+          ReturnType<SettingsDataService['getSettings']>
+        >,
+      );
+      await service.initialize();
+    });
+
+    it('reads a whole id list in one request and caches each item', async () => {
+      jellyfinApiMocks.getItems.mockResolvedValue({
+        data: {
+          Items: [
+            { Id: 'movie-1', Type: 'Movie', Name: 'One' },
+            { Id: 'movie-2', Type: 'Movie', Name: 'Two' },
+          ],
+        },
+      });
+
+      const items = await service.getMetadataBatch(['movie-1', 'movie-2']);
+
+      expect(jellyfinApiMocks.getItems).toHaveBeenCalledTimes(1);
+      expect(jellyfinApiMocks.getItems).toHaveBeenCalledWith(
+        expect.objectContaining({ ids: ['movie-1', 'movie-2'] }),
+      );
+      expect(items.map((item) => item.id)).toEqual(['movie-1', 'movie-2']);
+      expect(jellyfinCacheMocks.data.set).toHaveBeenCalledWith(
+        'jellyfin:metadata:movie-1',
+        expect.objectContaining({ id: 'movie-1' }),
+        JELLYFIN_CACHE_TTL.METADATA,
+      );
+    });
+
+    // The single and the batch read go through the same getItems call with the
+    // same fields, so their shapes can only drift if one of the two is changed
+    // alone. DateCreated is set because the mapper falls back to `new Date()`
+    // without it, which the two reads below would stamp milliseconds apart.
+    it('maps a batch item to the same shape as a single item', async () => {
+      const payload = {
+        Id: 'movie-1',
+        Type: 'Movie',
+        Name: 'One',
+        DateCreated: '2026-01-02T03:04:05.0000000Z',
+        ParentId: '6',
+        ChildCount: 1,
+        PremiereDate: '2008-05-20T00:00:00.0000000Z',
+        CommunityRating: 7.5,
+        OfficialRating: 'PG',
+        ProviderIds: { Tmdb: '10378' },
+      };
+
+      jellyfinApiMocks.getItems.mockResolvedValue({
+        data: { Items: [payload] },
+      });
+      const single = await service.getMetadata('movie-1');
+
+      jellyfinCacheMocks.data.get.mockReturnValue(undefined);
+      const [batched] = await service.getMetadataBatch(['movie-1']);
+
+      expect(batched).toEqual(single);
+      expect(batched.parentId).toBe('6');
+      expect(batched.originallyAvailableAt).toBeInstanceOf(Date);
+      expect(batched.contentRating).toBe('PG');
+    });
+
+    // The ids go in the query string and Jellyfin answers 414 past roughly an
+    // 8KB request line, so a long list cannot be one request.
+    it('splits a long id list', async () => {
+      jellyfinApiMocks.getItems.mockResolvedValue({ data: { Items: [] } });
+      const itemIds = Array.from({ length: 400 }, (unused, index) =>
+        `${index}`.padStart(32, 'i'),
+      );
+
+      await service.getMetadataBatch(itemIds);
+
+      // The shared helper decides the split from the ids themselves.
+      expect(jellyfinApiMocks.getItems).toHaveBeenCalledTimes(
+        batchIdsByRequestCost(itemIds, 5).length,
+      );
+      expect(jellyfinApiMocks.getItems.mock.calls.length).toBeGreaterThan(1);
+    });
+
+    // Jellyfin answers an unfiltered listing when it cannot parse the filter.
+    it('keeps only the ids it was asked for', async () => {
+      jellyfinApiMocks.getItems.mockResolvedValue({
+        data: {
+          Items: [
+            { Id: 'movie-1', Type: 'Movie', Name: 'One' },
+            { Id: 'somebody-else', Type: 'Movie', Name: 'Unrelated' },
+          ],
+        },
+      });
+
+      const items = await service.getMetadataBatch(['movie-1']);
+
+      expect(items.map((item) => item.id)).toEqual(['movie-1']);
+    });
+
+    it('serves cached ids without asking for them again', async () => {
+      jellyfinCacheMocks.data.get.mockImplementation((key: string) =>
+        key === 'jellyfin:metadata:movie-1' ? { id: 'movie-1' } : undefined,
+      );
+      jellyfinApiMocks.getItems.mockResolvedValue({
+        data: { Items: [{ Id: 'movie-2', Type: 'Movie', Name: 'Two' }] },
+      });
+
+      const items = await service.getMetadataBatch(['movie-1', 'movie-2']);
+
+      expect(jellyfinApiMocks.getItems).toHaveBeenCalledWith(
+        expect.objectContaining({ ids: ['movie-2'] }),
+      );
+      expect(items.map((item) => item.id).sort()).toEqual([
+        'movie-1',
+        'movie-2',
+      ]);
+    });
+
+    // Same contract as getMetadata: a failed read leaves its ids out rather
+    // than reporting them as missing items.
+    it('leaves out the ids of a failed read', async () => {
+      jellyfinCacheMocks.data.get.mockReturnValue(undefined);
+      jellyfinApiMocks.getItems.mockRejectedValue(new Error('boom'));
+
+      await expect(service.getMetadataBatch(['movie-1'])).resolves.toEqual([]);
+    });
+  });
+
+  describe('getMetadata in-flight dedupe (#3356)', () => {
+    beforeEach(async () => {
+      settingsDataService.getSettings.mockResolvedValue(
+        mockSettings as unknown as Awaited<
+          ReturnType<SettingsDataService['getSettings']>
+        >,
+      );
+      await service.initialize();
+    });
+
+    it('shares one request between concurrent reads of the same id', async () => {
+      let resolvePage: (value: unknown) => void = () => {};
+      jellyfinApiMocks.getItems.mockReturnValue(
+        new Promise((resolve) => {
+          resolvePage = resolve;
+        }),
+      );
+
+      // Sibling items are evaluated in parallel and each resolves the same
+      // parent, and they all miss the cold cache key together - so without
+      // this the cache cannot stop the first read fanning out per child.
+      const reads = Promise.all([
+        service.getMetadata('series-1'),
+        service.getMetadata('series-1'),
+        service.getMetadata('series-1'),
+      ]);
+      resolvePage({ data: { Items: [{ Id: 'series-1', Type: 'Series' }] } });
+
+      const results = await reads;
+      expect(results.map((item) => item?.id)).toEqual([
+        'series-1',
+        'series-1',
+        'series-1',
+      ]);
+      expect(jellyfinApiMocks.getItems).toHaveBeenCalledTimes(1);
+    });
+
+    it('drops the in-flight entry once the request settles', async () => {
+      jellyfinApiMocks.getItems.mockResolvedValue({
+        data: { Items: [{ Id: 'series-1', Type: 'Series' }] },
+      });
+
+      await service.getMetadata('series-1');
+      await service.getMetadata('series-1');
+
+      // The map only ever holds an unsettled request - a later read is served
+      // by the cache above it, never by a retained promise. The cache is
+      // mocked to always miss here, so the second read reaching the API is
+      // what proves the entry was released.
+      expect(jellyfinApiMocks.getItems).toHaveBeenCalledTimes(2);
     });
   });
 
@@ -768,11 +1278,10 @@ describe('JellyfinAdapterService', () => {
       ['getUsers', [], () => service.getUsers()],
       ['getLibraries', [], () => service.getLibraries()],
       ['getWatchHistory', [], () => service.getWatchHistory('item123')],
-      ['getCollections', [], () => service.getCollections('lib123')],
       ['searchContent', [], () => service.searchContent('test')],
     ] as [string, unknown, () => Promise<unknown>][])(
       '%s returns %j when not initialized',
-      async (_method, expected, call) => {
+      async (method, expected, call) => {
         const result = await call();
         if (expected === undefined) {
           expect(result).toBeUndefined();
@@ -781,6 +1290,73 @@ describe('JellyfinAdapterService', () => {
         }
       },
     );
+
+    // #3344: an uninitialized client is "collections unknown", not "this
+    // library has no collections" - fabricating [] lets the link lookup
+    // create a duplicate.
+    it('getCollections throws when not initialized', async () => {
+      await expect(service.getCollections('lib123')).rejects.toThrow(
+        'Jellyfin not initialized',
+      );
+    });
+
+    // #3344: these guards sit above the try, so they used to answer
+    // "confirmed absent" for "adapter not ready" - which is what callers
+    // unlink and truncate on.
+    it('getCollection honours throwOnError when not initialized', async () => {
+      await expect(service.getCollection('col-1', true)).rejects.toThrow(
+        'Jellyfin not initialized',
+      );
+      await expect(service.getCollection('col-1')).resolves.toBeUndefined();
+    });
+
+    it('getLibraryContents throws when not initialized instead of an empty page', async () => {
+      await expect(service.getLibraryContents('lib123')).rejects.toThrow(
+        'Jellyfin not initialized',
+      );
+    });
+  });
+
+  describe('getActiveSessions', () => {
+    beforeEach(async () => {
+      settingsDataService.getSettings.mockResolvedValue(
+        mockSettings as unknown as Awaited<
+          ReturnType<SettingsDataService['getSettings']>
+        >,
+      );
+      await service.initialize();
+    });
+
+    it('collects the playing item plus its season and series ids', async () => {
+      jellyfinApiMocks.getSessions.mockResolvedValue({
+        data: [
+          { NowPlayingItem: { Id: 'movie1', Type: 'Movie' } },
+          {
+            NowPlayingItem: {
+              Id: 'episode1',
+              SeasonId: 'season1',
+              SeriesId: 'series1',
+              Type: 'Episode',
+            },
+          },
+          // No NowPlayingItem (idle/remote-control session) is skipped.
+          { Id: 'idle-session' },
+        ],
+      });
+
+      const playing = await service.getActiveSessions();
+
+      expect(playing).toEqual(
+        new Set(['movie1', 'episode1', 'season1', 'series1']),
+      );
+    });
+
+    it('returns an empty set when the sessions request fails', async () => {
+      jellyfinApiMocks.getSessions.mockRejectedValue(new Error('boom'));
+      await expect(service.getActiveSessions()).resolves.toEqual(
+        new Set<string>(),
+      );
+    });
   });
 
   describe('getWatchHistory', () => {
@@ -809,6 +1385,7 @@ describe('JellyfinAdapterService', () => {
             data: {
               Items: [
                 {
+                  Id: 'item123',
                   UserData: {
                     Played: false,
                     PlayedPercentage: userId === 'user-1' ? 94 : 95,
@@ -836,7 +1413,7 @@ describe('JellyfinAdapterService', () => {
       expect(jellyfinCacheMocks.data.set).toHaveBeenCalledWith(
         'jellyfin:watch:95:item123',
         history,
-        300000,
+        JELLYFIN_CACHE_TTL.WATCH_HISTORY,
       );
       expect(jellyfinApiMocks.getItems).toHaveBeenCalledWith({
         userId: 'user-1',
@@ -883,6 +1460,7 @@ describe('JellyfinAdapterService', () => {
         data: {
           Items: [
             {
+              Id: 'item123',
               UserData: {
                 Played: false,
                 PlayedPercentage: 95,
@@ -922,6 +1500,7 @@ describe('JellyfinAdapterService', () => {
         data: {
           Items: [
             {
+              Id: 'item123',
               UserData: {
                 Played: true,
                 LastPlayedDate: '2024-06-03T00:00:00.000Z',
@@ -944,7 +1523,518 @@ describe('JellyfinAdapterService', () => {
     });
   });
 
-  describe('getDescendantEpisodeWatchers', () => {
+  describe('getLastPlayedAt', () => {
+    beforeEach(async () => {
+      settingsDataService.getSettings.mockResolvedValue(
+        mockSettings as unknown as Awaited<
+          ReturnType<SettingsDataService['getSettings']>
+        >,
+      );
+      await service.initialize();
+      mockSnapshotStore.clear();
+    });
+
+    afterEach(() => mockSnapshotStore.clear());
+
+    const twoUsers = () =>
+      jellyfinApiMocks.getUsers.mockResolvedValue({
+        data: [
+          { Id: 'user-1', Name: 'Alice' },
+          { Id: 'user-2', Name: 'Bob' },
+        ],
+      });
+
+    it('returns the newest date regardless of the users Played values', async () => {
+      twoUsers();
+      jellyfinApiMocks.getItems.mockImplementation(
+        ({ userId }: { userId: string }) =>
+          Promise.resolve({
+            data: {
+              Items: [
+                {
+                  Id: 'item-1',
+                  UserData: {
+                    Played: userId === 'user-1',
+                    LastPlayedDate:
+                      userId === 'user-1'
+                        ? '2024-06-01T00:00:00.000Z'
+                        : '2024-06-03T00:00:00.000Z',
+                  },
+                },
+              ],
+            },
+          }),
+      );
+
+      await expect(service.getLastPlayedAt('item-1')).resolves.toEqual(
+        new Date('2024-06-03T00:00:00.000Z'),
+      );
+      // The per-item route 404s for users who cannot see the item; the list
+      // form answers 200 with an empty list instead.
+      expect(jellyfinApiMocks.getItems).toHaveBeenCalledWith({
+        userId: 'user-1',
+        ids: ['item-1'],
+        enableUserData: true,
+      });
+      expect(jellyfinApiMocks.getItem).not.toHaveBeenCalled();
+    });
+
+    it('ignores rows Jellyfin returns for an id it did not filter on', async () => {
+      twoUsers();
+      jellyfinApiMocks.getItems.mockResolvedValue({
+        data: {
+          Items: [
+            {
+              Id: 'someone-else',
+              UserData: { LastPlayedDate: '2024-06-09T00:00:00.000Z' },
+            },
+          ],
+        },
+      });
+
+      await expect(service.getLastPlayedAt('item-1')).resolves.toBeNull();
+    });
+
+    // A dropped user can only lower the newest date, which reads as "played
+    // longer ago" and makes a just-started item deletable.
+    it.each([
+      ['a per-user lookup fails', () => Promise.reject(new Error('boom'))],
+      ['a response carries no item list', () => Promise.resolve({ data: {} })],
+      [
+        'only some users answer',
+        (() => {
+          let first = true;
+          return () => {
+            const answer = first
+              ? Promise.resolve({ data: { Items: [{ Id: 'item-1' }] } })
+              : Promise.reject(new Error('boom'));
+            first = false;
+            return answer;
+          };
+        })(),
+      ],
+    ])('rejects when %s', async (_label, impl) => {
+      twoUsers();
+      jellyfinApiMocks.getItems.mockImplementation(impl);
+
+      await expect(service.getLastPlayedAt('item-1')).rejects.toThrow(
+        /covered \d+ of 2 users/,
+      );
+    });
+
+    it('answers a swept item from the snapshot without a per-user fan-out', async () => {
+      twoUsers();
+      jellyfinApiMocks.getItems.mockImplementation(
+        ({ userId }: { userId: string }) =>
+          Promise.resolve({
+            data: {
+              Items: [
+                {
+                  Id: 'ep-1',
+                  Type: 'Episode',
+                  // Never finished by either user, so no watch record - the
+                  // fold must still record the date.
+                  UserData: {
+                    Played: false,
+                    LastPlayedDate:
+                      userId === 'user-1'
+                        ? '2024-06-01T00:00:00.000Z'
+                        : '2024-06-05T00:00:00.000Z',
+                  },
+                },
+                { Id: 'ep-2', Type: 'Episode', UserData: { Played: false } },
+              ],
+              TotalRecordCount: 2,
+            },
+          }),
+      );
+      await service.prefetchWatchHistory({ libraryId: 'lib-1' });
+      jellyfinApiMocks.getItems.mockClear();
+
+      await expect(service.getLastPlayedAt('ep-1', 'lib-1')).resolves.toEqual(
+        new Date('2024-06-05T00:00:00.000Z'),
+      );
+      // Swept but never played is a confirmed null, not a live read.
+      await expect(
+        service.getLastPlayedAt('ep-2', 'lib-1'),
+      ).resolves.toBeNull();
+      expect(jellyfinApiMocks.getItems).not.toHaveBeenCalled();
+    });
+
+    it('falls back to a live read for an item the snapshot never saw', async () => {
+      twoUsers();
+      jellyfinApiMocks.getItems.mockResolvedValue({
+        data: {
+          Items: [
+            {
+              Id: 'added-since',
+              UserData: { LastPlayedDate: '2024-06-07T00:00:00.000Z' },
+            },
+          ],
+          TotalRecordCount: 1,
+        },
+      });
+      await service.prefetchWatchHistory({ libraryId: 'lib-1' });
+      jellyfinApiMocks.getItems.mockClear();
+      jellyfinApiMocks.getItems.mockResolvedValue({
+        data: {
+          Items: [
+            {
+              Id: 'unswept',
+              UserData: { LastPlayedDate: '2024-06-08T00:00:00.000Z' },
+            },
+          ],
+        },
+      });
+
+      await expect(
+        service.getLastPlayedAt('unswept', 'lib-1'),
+      ).resolves.toEqual(new Date('2024-06-08T00:00:00.000Z'));
+      expect(jellyfinApiMocks.getItems).toHaveBeenCalled();
+    });
+  });
+
+  describe('prefetchWatchHistory', () => {
+    beforeEach(async () => {
+      settingsDataService.getSettings.mockResolvedValue(
+        mockSettings as unknown as Awaited<
+          ReturnType<SettingsDataService['getSettings']>
+        >,
+      );
+      await service.initialize();
+      mockSnapshotStore.clear();
+    });
+
+    afterEach(() => {
+      mockSnapshotStore.clear();
+    });
+
+    const snapshot = () =>
+      mockSnapshotStore.get(jellyfinWatchSnapshotCacheKey('lib-1')) as
+        | {
+            watchHistory: Map<string, unknown[]>;
+            descendants: Map<string, string[]>;
+          }
+        | undefined;
+
+    const leafPage = (userId: string) => ({
+      data: {
+        Items: [
+          {
+            Id: 'ep-1',
+            Type: 'Episode',
+            SeriesId: 'show-1',
+            SeasonId: 'season-1',
+            UserData: {
+              Played: true,
+              LastPlayedDate: '2024-06-03T00:00:00.000Z',
+            },
+          },
+          {
+            Id: 'ep-2',
+            Type: 'Episode',
+            SeriesId: 'show-1',
+            SeasonId: 'season-1',
+            UserData: { Played: userId === 'user-1' },
+          },
+          { Id: 'movie-1', Type: 'Movie', UserData: { Played: false } },
+          {
+            Id: 'season-1',
+            Type: 'Season',
+            SeriesId: 'show-1',
+            UserData: { Played: false, IsFavorite: userId === 'user-2' },
+          },
+          {
+            Id: 'show-1',
+            Type: 'Series',
+            UserData: { Played: false, IsFavorite: userId === 'user-1' },
+          },
+        ],
+        TotalRecordCount: 5,
+      },
+    });
+
+    it('indexes watch records and the show/season tree from one sweep per user', async () => {
+      jellyfinApiMocks.getUsers.mockResolvedValue({
+        data: [
+          { Id: 'user-1', Name: 'Alice' },
+          { Id: 'user-2', Name: 'Bob' },
+        ],
+      });
+      jellyfinApiMocks.getItems.mockImplementation(
+        ({ userId }: { userId: string }) => Promise.resolve(leafPage(userId)),
+      );
+
+      await service.prefetchWatchHistory({ libraryId: 'lib-1' });
+
+      const cached = snapshot();
+      expect(cached).toBeDefined();
+      expect([...cached!.watchHistory.keys()].sort()).toEqual([
+        'ep-1',
+        'ep-2',
+        'movie-1',
+        'season-1',
+        'show-1',
+      ]);
+      // Both parents index the same episodes, each exactly once. A season
+      // carries SeriesId too, so it must not land here as an episode.
+      expect(cached!.descendants.get('show-1')).toEqual(['ep-1', 'ep-2']);
+      expect(cached!.descendants.get('season-1')).toEqual(['ep-1', 'ep-2']);
+      // One request per user, not one per item.
+      expect(jellyfinApiMocks.getItems).toHaveBeenCalledTimes(2);
+      expect(jellyfinApiMocks.getItems).toHaveBeenCalledWith(
+        expect.objectContaining({
+          includeItemTypes: ['Movie', 'Episode', 'Series', 'Season'],
+        }),
+      );
+    });
+
+    it('answers container favourites from the snapshot without a per-user fan-out (#3356)', async () => {
+      jellyfinApiMocks.getUsers.mockResolvedValue({
+        data: [
+          { Id: 'user-1', Name: 'Alice' },
+          { Id: 'user-2', Name: 'Bob' },
+        ],
+      });
+      jellyfinApiMocks.getItems.mockImplementation(
+        ({ userId }: { userId: string }) => Promise.resolve(leafPage(userId)),
+      );
+      await service.prefetchWatchHistory({ libraryId: 'lib-1' });
+      jellyfinApiMocks.getItems.mockClear();
+
+      // A season's IsFavorite is independent of its episodes', so this can
+      // only come from the container's own swept UserData.
+      await expect(
+        service.getItemFavoritedBy('season-1', 'lib-1'),
+      ).resolves.toEqual(['user-2']);
+      await expect(
+        service.getItemFavoritedBy('show-1', 'lib-1'),
+      ).resolves.toEqual(['user-1']);
+      // A swept container nobody favourited is a confirmed empty list.
+      await expect(
+        service.getItemFavoritedBy('movie-1', 'lib-1'),
+      ).resolves.toEqual([]);
+      expect(jellyfinApiMocks.getItems).not.toHaveBeenCalled();
+    });
+
+    it('serves getDescendantEpisodeWatchHistory from the snapshot without new requests', async () => {
+      jellyfinApiMocks.getUsers.mockResolvedValue({
+        data: [{ Id: 'user-1', Name: 'Alice' }],
+      });
+      jellyfinApiMocks.getItems.mockImplementation(
+        ({ userId }: { userId: string }) => Promise.resolve(leafPage(userId)),
+      );
+      await service.prefetchWatchHistory({ libraryId: 'lib-1' });
+      jellyfinApiMocks.getItems.mockClear();
+
+      const result = await service.getDescendantEpisodeWatchHistory(
+        'show-1',
+        'lib-1',
+      );
+
+      expect(Object.keys(result).sort()).toEqual(['ep-1', 'ep-2']);
+      expect(result['ep-1'].map((r) => r.userId)).toEqual(['user-1']);
+      expect(jellyfinApiMocks.getItems).not.toHaveBeenCalled();
+    });
+
+    it('falls back to the per-show sweep for a parent the snapshot never saw', async () => {
+      jellyfinApiMocks.getUsers.mockResolvedValue({
+        data: [{ Id: 'user-1', Name: 'Alice' }],
+      });
+      jellyfinApiMocks.getItems.mockImplementation(
+        ({ userId }: { userId: string }) => Promise.resolve(leafPage(userId)),
+      );
+      await service.prefetchWatchHistory({ libraryId: 'lib-1' });
+      jellyfinApiMocks.getItems.mockClear();
+      jellyfinApiMocks.getItems.mockResolvedValue({
+        data: { Items: [{ Id: 'ep-9', UserData: { Played: true } }] },
+      });
+
+      const result = await service.getDescendantEpisodeWatchHistory('show-new');
+
+      expect(Object.keys(result)).toEqual(['ep-9']);
+      expect(jellyfinApiMocks.getItems).toHaveBeenCalled();
+    });
+
+    it('getWatchState bypasses the snapshot so a live watch is never missed', async () => {
+      jellyfinApiMocks.getUsers.mockResolvedValue({
+        data: [{ Id: 'user-1', Name: 'Alice' }],
+      });
+      jellyfinApiMocks.getItems.mockImplementation(
+        ({ userId }: { userId: string }) => Promise.resolve(leafPage(userId)),
+      );
+      await service.prefetchWatchHistory({ libraryId: 'lib-1' });
+      jellyfinApiMocks.getItems.mockClear();
+      // The snapshot says ep-2 is unwatched for this user; Jellyfin now says otherwise.
+      jellyfinApiMocks.getItems.mockResolvedValue({
+        data: { Items: [{ Id: 'ep-2', UserData: { Played: true } }] },
+      });
+
+      await expect(service.getWatchState('ep-2')).resolves.toEqual({
+        viewCount: 1,
+        isWatched: true,
+      });
+      expect(jellyfinApiMocks.getItems).toHaveBeenCalled();
+    });
+
+    it('caches nothing when a user sweep fails, so callers read live', async () => {
+      jellyfinApiMocks.getUsers.mockResolvedValue({
+        data: [
+          { Id: 'user-1', Name: 'Alice' },
+          { Id: 'user-2', Name: 'Bob' },
+        ],
+      });
+      jellyfinApiMocks.getItems.mockImplementation(
+        ({ userId }: { userId: string }) =>
+          userId === 'user-1'
+            ? Promise.reject(new Error('boom'))
+            : Promise.resolve(leafPage(userId)),
+      );
+
+      await expect(
+        service.prefetchWatchHistory({ libraryId: 'lib-1' }),
+      ).resolves.toBeUndefined();
+      expect(snapshot()).toBeUndefined();
+    });
+
+    it('caches nothing when a page is short', async () => {
+      jellyfinApiMocks.getUsers.mockResolvedValue({
+        data: [{ Id: 'user-1', Name: 'Alice' }],
+      });
+      jellyfinApiMocks.getItems.mockResolvedValue({
+        data: {
+          Items: [{ Id: 'ep-1', Type: 'Episode', UserData: { Played: true } }],
+          TotalRecordCount: 99,
+        },
+      });
+
+      await service.prefetchWatchHistory({ libraryId: 'lib-1' });
+      expect(snapshot()).toBeUndefined();
+    });
+
+    it('caches nothing when the item count is missing', async () => {
+      jellyfinApiMocks.getUsers.mockResolvedValue({
+        data: [{ Id: 'user-1', Name: 'Alice' }],
+      });
+      jellyfinApiMocks.getItems.mockResolvedValue({
+        data: { Items: [{ Id: 'ep-1', UserData: { Played: true } }] },
+      });
+
+      await service.prefetchWatchHistory({ libraryId: 'lib-1' });
+      expect(snapshot()).toBeUndefined();
+    });
+
+    it('ignores a snapshot built under a different played threshold', async () => {
+      jellyfinApiMocks.getUsers.mockResolvedValue({
+        data: [{ Id: 'user-1', Name: 'Alice' }],
+      });
+      jellyfinApiMocks.getConfiguration.mockResolvedValue({
+        data: { MaxResumePct: 90 },
+      });
+      jellyfinApiMocks.getItems.mockImplementation(
+        ({ userId }: { userId: string }) => Promise.resolve(leafPage(userId)),
+      );
+      await service.prefetchWatchHistory({ libraryId: 'lib-1' });
+
+      // Server threshold changes; the cached records were decided by the old one.
+      jellyfinCacheMocks.data.has.mockReturnValue(false);
+      jellyfinApiMocks.getConfiguration.mockResolvedValue({
+        data: { MaxResumePct: 50 },
+      });
+      jellyfinApiMocks.getItems.mockClear();
+      jellyfinApiMocks.getItems.mockResolvedValue({
+        data: { Items: [{ Id: 'ep-1', UserData: { Played: true } }] },
+      });
+
+      await service.getDescendantEpisodeWatchHistory('show-1');
+      expect(jellyfinApiMocks.getItems).toHaveBeenCalled();
+    });
+
+    it('abandons the snapshot rather than growing past the record ceiling', async () => {
+      jellyfinApiMocks.getUsers.mockResolvedValue({
+        data: [{ Id: 'user-1', Name: 'Alice' }],
+      });
+      const many = Array.from(
+        { length: JELLYFIN_WATCH_SNAPSHOT_MAX_RECORDS + 10 },
+        (_, i) => ({
+          Id: `ep-${i}`,
+          Type: 'Episode',
+          UserData: { Played: true },
+        }),
+      );
+      jellyfinApiMocks.getItems.mockResolvedValue({
+        data: { Items: many, TotalRecordCount: many.length },
+      });
+
+      await service.prefetchWatchHistory({ libraryId: 'lib-1' });
+
+      // Nothing cached, so every caller reads live rather than trusting a
+      // snapshot that would have kept growing.
+      expect(snapshot()).toBeUndefined();
+    });
+
+    it('includes BoxSet members in the sweep (#2554)', async () => {
+      jellyfinApiMocks.getUsers.mockResolvedValue({
+        data: [{ Id: 'user-1', Name: 'Alice' }],
+      });
+      jellyfinApiMocks.getItems.mockImplementation(
+        ({ userId }: { userId: string }) => Promise.resolve(leafPage(userId)),
+      );
+
+      await service.prefetchWatchHistory({ libraryId: 'lib-1' });
+
+      // Libraries with "Group films into collections" hide BoxSet members by
+      // default, which would silently drop those items from the snapshot.
+      expect(jellyfinApiMocks.getItems).toHaveBeenCalledWith(
+        expect.objectContaining({ collapseBoxSetItems: false }),
+      );
+    });
+
+    it('counts a row repeated across pages only once', async () => {
+      jellyfinApiMocks.getUsers.mockResolvedValue({
+        data: [{ Id: 'user-1', Name: 'Alice' }],
+      });
+      // Paging is not transactional: a library changing under the sweep can
+      // hand back the same row on the next page.
+      const row = {
+        Id: 'ep-1',
+        Type: 'Episode',
+        SeriesId: 'show-1',
+        UserData: { Played: true, PlayCount: 2 },
+      };
+      jellyfinApiMocks.getItems.mockResolvedValue({
+        data: { Items: [row, row], TotalRecordCount: 2 },
+      });
+
+      await service.prefetchWatchHistory({ libraryId: 'lib-1' });
+
+      const cached = snapshot() as unknown as {
+        watchHistory: Map<string, unknown[]>;
+        playCount: Map<string, number>;
+        descendants: Map<string, string[]>;
+      };
+      expect(cached.watchHistory.get('ep-1')).toHaveLength(1);
+      expect(cached.playCount.get('ep-1')).toBe(2);
+      expect(cached.descendants.get('show-1')).toEqual(['ep-1']);
+    });
+
+    it('does not sweep again once a snapshot is cached', async () => {
+      jellyfinApiMocks.getUsers.mockResolvedValue({
+        data: [{ Id: 'user-1', Name: 'Alice' }],
+      });
+      jellyfinApiMocks.getItems.mockImplementation(
+        ({ userId }: { userId: string }) => Promise.resolve(leafPage(userId)),
+      );
+
+      await service.prefetchWatchHistory({ libraryId: 'lib-1' });
+      jellyfinApiMocks.getItems.mockClear();
+      await service.prefetchWatchHistory({ libraryId: 'lib-1' });
+
+      expect(jellyfinApiMocks.getItems).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('getDescendantEpisodeWatchHistory', () => {
     beforeEach(async () => {
       settingsDataService.getSettings.mockResolvedValue(
         mockSettings as unknown as Awaited<
@@ -954,59 +2044,88 @@ describe('JellyfinAdapterService', () => {
       await service.initialize();
     });
 
-    it('returns users who played any episode under a show', async () => {
+    it('keys watch records by episode id and keeps unwatched episodes as empty', async () => {
       jellyfinApiMocks.getUsers.mockResolvedValue({
         data: [
           { Id: 'user-1', Name: 'Alice' },
           { Id: 'user-2', Name: 'Bob' },
-          { Id: 'user-3', Name: 'Carol' },
+        ],
+      });
+      jellyfinApiMocks.getItems.mockImplementation(
+        ({ userId }: { userId: string }) =>
+          Promise.resolve({
+            data: {
+              Items: [
+                {
+                  Id: 'ep-1',
+                  UserData: {
+                    Played: true,
+                    LastPlayedDate: '2024-06-03T00:00:00.000Z',
+                  },
+                },
+                {
+                  Id: 'ep-2',
+                  UserData: { Played: userId === 'user-1' },
+                },
+              ],
+            },
+          }),
+      );
+
+      const result = await service.getDescendantEpisodeWatchHistory('show-1');
+
+      expect(Object.keys(result).sort()).toEqual(['ep-1', 'ep-2']);
+      expect(result['ep-1'].map((r) => r.userId).sort()).toEqual([
+        'user-1',
+        'user-2',
+      ]);
+      expect(result['ep-1'][0].watchedAt).toEqual(
+        new Date('2024-06-03T00:00:00.000Z'),
+      );
+      expect(result['ep-2'].map((r) => r.userId)).toEqual(['user-1']);
+      // One request per user, not one per (episode, user).
+      expect(jellyfinApiMocks.getItems).toHaveBeenCalledTimes(2);
+    });
+
+    it('counts a partial play above the PlayedPercentage threshold as watched', async () => {
+      jellyfinApiMocks.getUsers.mockResolvedValue({
+        data: [
+          { Id: 'user-1', Name: 'Alice' },
+          { Id: 'user-2', Name: 'Bob' },
         ],
       });
       jellyfinApiMocks.getConfiguration.mockResolvedValue({
         data: { MaxResumePct: 90 },
       });
-
-      // Alice finished an episode, Bob only has unplayed episodes, Carol
-      // is above the PlayedPercentage threshold on a partial play.
+      // Alice finished the episode; Bob only crossed the threshold (#2466).
       jellyfinApiMocks.getItems.mockImplementation(
-        ({ userId }: { userId: string }) => {
-          if (userId === 'user-1') {
-            return Promise.resolve({
-              data: {
-                Items: [
-                  { UserData: { Played: true } },
-                  { UserData: { Played: false, PlayedPercentage: 10 } },
-                ],
-              },
-            });
-          }
-          if (userId === 'user-2') {
-            return Promise.resolve({
-              data: {
-                Items: [
-                  { UserData: { Played: false, PlayedPercentage: 0 } },
-                  { UserData: { Played: false, PlayedPercentage: 20 } },
-                ],
-              },
-            });
-          }
-          if (userId === 'user-3') {
-            return Promise.resolve({
-              data: {
-                Items: [{ UserData: { Played: false, PlayedPercentage: 95 } }],
-              },
-            });
-          }
-          return Promise.resolve({ data: { Items: [] } });
-        },
+        ({ userId }: { userId: string }) =>
+          Promise.resolve({
+            data: {
+              Items: [
+                {
+                  Id: 'ep-1',
+                  UserData:
+                    userId === 'user-1'
+                      ? { Played: true }
+                      : { Played: false, PlayedPercentage: 95 },
+                },
+                {
+                  Id: 'ep-2',
+                  UserData: { Played: false, PlayedPercentage: 20 },
+                },
+              ],
+            },
+          }),
       );
 
-      const result = await service.getDescendantEpisodeWatchers('show-1');
+      const result = await service.getDescendantEpisodeWatchHistory('show-1');
 
-      expect(result).toEqual(expect.arrayContaining(['user-1', 'user-3']));
-      expect(result).not.toContain('user-2');
-      expect(result).toHaveLength(2);
-
+      expect(result['ep-1'].map((r) => r.userId).sort()).toEqual([
+        'user-1',
+        'user-2',
+      ]);
+      expect(result['ep-2']).toEqual([]);
       // One getItems call per user, scoped to Episode descendants.
       expect(jellyfinApiMocks.getItems).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -1017,54 +2136,22 @@ describe('JellyfinAdapterService', () => {
           enableUserData: true,
         }),
       );
-      expect(jellyfinApiMocks.getItems).toHaveBeenCalledTimes(3);
     });
 
-    it('returns an empty list when nobody has watched an episode', async () => {
+    it('records an empty history for an episode nobody watched', async () => {
       jellyfinApiMocks.getUsers.mockResolvedValue({
         data: [{ Id: 'user-1', Name: 'Alice' }],
       });
       jellyfinApiMocks.getItems.mockResolvedValue({
-        data: {
-          Items: [{ UserData: { Played: false, PlayedPercentage: 0 } }],
-        },
+        data: { Items: [{ Id: 'ep-1', UserData: { Played: false } }] },
       });
 
-      const result = await service.getDescendantEpisodeWatchers('show-1');
-      expect(result).toEqual([]);
+      const result = await service.getDescendantEpisodeWatchHistory('show-1');
+
+      expect(result).toEqual({ 'ep-1': [] });
     });
 
-    it('deduplicates users who watched multiple episodes', async () => {
-      jellyfinApiMocks.getUsers.mockResolvedValue({
-        data: [{ Id: 'user-1', Name: 'Alice' }],
-      });
-      jellyfinApiMocks.getItems.mockResolvedValue({
-        data: {
-          Items: [
-            { UserData: { Played: true } },
-            { UserData: { Played: true } },
-            { UserData: { Played: true } },
-          ],
-        },
-      });
-
-      const result = await service.getDescendantEpisodeWatchers('show-1');
-      expect(result).toEqual(['user-1']);
-    });
-
-    it('caches results per parent id', async () => {
-      jellyfinApiMocks.getUsers.mockResolvedValue({
-        data: [{ Id: 'user-1', Name: 'Alice' }],
-      });
-      jellyfinCacheMocks.data.get.mockReturnValue(['user-1']);
-
-      const result = await service.getDescendantEpisodeWatchers('show-1');
-
-      expect(result).toEqual(['user-1']);
-      expect(jellyfinApiMocks.getItems).not.toHaveBeenCalled();
-    });
-
-    it('skips users whose per-user query fails without aborting others', async () => {
+    it('throws instead of answering when a user sweep fails', async () => {
       jellyfinApiMocks.getUsers.mockResolvedValue({
         data: [
           { Id: 'user-1', Name: 'Alice' },
@@ -1072,18 +2159,59 @@ describe('JellyfinAdapterService', () => {
         ],
       });
       jellyfinApiMocks.getItems.mockImplementation(
-        ({ userId }: { userId: string }) => {
-          if (userId === 'user-1') {
-            return Promise.reject(new Error('boom'));
-          }
-          return Promise.resolve({
-            data: { Items: [{ UserData: { Played: true } }] },
-          });
-        },
+        ({ userId }: { userId: string }) =>
+          userId === 'user-1'
+            ? Promise.reject(new Error('boom'))
+            : Promise.resolve({
+                data: { Items: [{ Id: 'ep-1', UserData: { Played: true } }] },
+              }),
       );
 
-      const result = await service.getDescendantEpisodeWatchers('show-1');
-      expect(result).toEqual(['user-2']);
+      await expect(
+        service.getDescendantEpisodeWatchHistory('show-1'),
+      ).rejects.toThrow('covered 1 of 2 users');
+    });
+
+    it('throws instead of answering when a sweep returns a short page', async () => {
+      jellyfinApiMocks.getUsers.mockResolvedValue({
+        data: [{ Id: 'user-1', Name: 'Alice' }],
+      });
+      jellyfinApiMocks.getItems.mockResolvedValue({
+        data: {
+          Items: [{ Id: 'ep-1', UserData: { Played: true } }],
+          TotalRecordCount: 12,
+        },
+      });
+
+      await expect(
+        service.getDescendantEpisodeWatchHistory('show-1'),
+      ).rejects.toThrow('covered 0 of 1 users');
+    });
+
+    it('throws instead of answering when a sweep returns no episode list', async () => {
+      jellyfinApiMocks.getUsers.mockResolvedValue({
+        data: [{ Id: 'user-1', Name: 'Alice' }],
+      });
+      // A 200 whose body has no Items array (proxy error page, auth
+      // interstitial) must not read as "nobody watched".
+      jellyfinApiMocks.getItems.mockResolvedValue({
+        data: { unexpected: true },
+      });
+
+      await expect(
+        service.getDescendantEpisodeWatchHistory('show-1'),
+      ).rejects.toThrow('covered 0 of 1 users');
+    });
+
+    it('propagates a failed played-threshold lookup', async () => {
+      jellyfinApiMocks.getUsers.mockResolvedValue({
+        data: [{ Id: 'user-1', Name: 'Alice' }],
+      });
+      jellyfinApiMocks.getConfiguration.mockRejectedValue(new Error('boom'));
+
+      await expect(
+        service.getDescendantEpisodeWatchHistory('show-1'),
+      ).rejects.toThrow('boom');
     });
   });
 
@@ -1140,6 +2268,7 @@ describe('JellyfinAdapterService', () => {
             data: {
               Items: [
                 {
+                  Id: 'item123',
                   UserData: {
                     IsFavorite: userId === 'user-2',
                   },
@@ -1155,7 +2284,7 @@ describe('JellyfinAdapterService', () => {
       expect(jellyfinCacheMocks.data.set).toHaveBeenCalledWith(
         'jellyfin:favorited-by:item123',
         ['user-2'],
-        300000,
+        JELLYFIN_CACHE_TTL.USER_DATA,
       );
       expect(jellyfinApiMocks.getItems).toHaveBeenCalledWith({
         userId: 'user-1',
@@ -1208,6 +2337,7 @@ describe('JellyfinAdapterService', () => {
             data: {
               Items: [
                 {
+                  Id: 'item123',
                   UserData: {
                     PlayCount:
                       userId === 'user-1' ? 1 : userId === 'user-2' ? 3 : 0,
@@ -1224,7 +2354,7 @@ describe('JellyfinAdapterService', () => {
       expect(jellyfinCacheMocks.data.set).toHaveBeenCalledWith(
         'jellyfin:total-play-count:item123',
         4,
-        300000,
+        JELLYFIN_CACHE_TTL.USER_DATA,
       );
     });
 
@@ -1244,17 +2374,23 @@ describe('JellyfinAdapterService', () => {
   });
 
   describe('resetMetadataCache', () => {
-    it('should remove threshold-specific watch history entries for one item', () => {
+    it('clears every watch-history entry (incl. descendant episodes) plus this item’s favorite/play-count, keeping aggregates', () => {
       jellyfinCacheMocks.data.keys.mockReturnValue([
-        'jellyfin:watch:90:item123',
-        'jellyfin:watch:95:item123',
+        'jellyfin:watch:90:item123', // this item's watch history
+        'jellyfin:watch:95:item123', // ...at another played threshold
+        'jellyfin:watch:90:episode-999', // a DESCENDANT episode (#3274) - different id
+        'jellyfin:watch:90:other-item', // another item's watch entry
         'jellyfin:favorited-by:item123',
         'jellyfin:total-play-count:item123',
-        'jellyfin:watch:90:item999',
+        'jellyfin:favorited-by:other-item', // unrelated item - must be kept
+        'jellyfin:users', // server-wide aggregate - must be kept
+        'jellyfin:libraries', // server-wide aggregate - must be kept
       ]);
 
       service.resetMetadataCache('item123');
 
+      // Every watch-history key is cleared, including the descendant episode
+      // whose id != itemId - the regression that caused #3274.
       expect(jellyfinCacheMocks.data.del).toHaveBeenCalledWith(
         'jellyfin:watch:90:item123',
       );
@@ -1262,14 +2398,34 @@ describe('JellyfinAdapterService', () => {
         'jellyfin:watch:95:item123',
       );
       expect(jellyfinCacheMocks.data.del).toHaveBeenCalledWith(
+        'jellyfin:watch:90:episode-999',
+      );
+      expect(jellyfinCacheMocks.data.del).toHaveBeenCalledWith(
+        'jellyfin:watch:90:other-item',
+      );
+      // This item's per-item favorite/play-count entries still cleared as before.
+      expect(jellyfinCacheMocks.data.del).toHaveBeenCalledWith(
         'jellyfin:favorited-by:item123',
       );
       expect(jellyfinCacheMocks.data.del).toHaveBeenCalledWith(
         'jellyfin:total-play-count:item123',
       );
+      // Unrelated per-item and server-wide aggregate caches are preserved.
       expect(jellyfinCacheMocks.data.del).not.toHaveBeenCalledWith(
-        'jellyfin:watch:90:item999',
+        'jellyfin:favorited-by:other-item',
       );
+      expect(jellyfinCacheMocks.data.del).not.toHaveBeenCalledWith(
+        'jellyfin:users',
+      );
+      expect(jellyfinCacheMocks.data.del).not.toHaveBeenCalledWith(
+        'jellyfin:libraries',
+      );
+    });
+
+    it('flushes the whole cache when called without an item id', () => {
+      service.resetMetadataCache();
+
+      expect(jellyfinCacheMocks.data.flushAll).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -1329,6 +2485,35 @@ describe('JellyfinAdapterService', () => {
         'Failed to get collection collection-1',
       );
       expect(logger.debug).toHaveBeenCalledWith(serverError);
+    });
+
+    it('requests studios on both collection-children queries for studio sorting', async () => {
+      jellyfinApiMocks.getItems
+        .mockResolvedValueOnce({ data: { Items: [] } })
+        .mockResolvedValueOnce({
+          data: {
+            Items: [
+              { Id: 'item-1', Name: 'Movie One', Type: 'Movie', UserData: {} },
+            ],
+          },
+        });
+
+      await service.getCollectionChildren('collection-1');
+
+      expect(jellyfinApiMocks.getItems).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({
+          fields: expect.arrayContaining(['Studios']),
+          recursive: false,
+        }),
+      );
+      expect(jellyfinApiMocks.getItems).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({
+          fields: expect.arrayContaining(['Studios']),
+          recursive: true,
+        }),
+      );
     });
 
     it('retries once after a transient collection-children failure', async () => {
@@ -1416,13 +2601,18 @@ describe('JellyfinAdapterService', () => {
       ).rejects.toThrow(axiosError);
     });
 
-    it('returns empty array for non-400/404 errors', async () => {
-      jellyfinApiMocks.getItems.mockRejectedValueOnce(
-        new Error('random failure'),
-      );
+    it('re-throws non-400/404 errors so callers never mistake a failed read for an empty collection', async () => {
+      const serverError = createResponseError(500);
+      jellyfinApiMocks.getItems.mockRejectedValue(serverError);
 
-      const result = await service.getCollectionChildren('collection-1');
-      expect(result).toEqual([]);
+      await expect(
+        service.getCollectionChildren('collection-1'),
+      ).rejects.toThrow(serverError);
+
+      expect(logger.error).toHaveBeenCalledWith(
+        'Failed to get collection children for collection-1',
+        serverError,
+      );
     });
 
     it('should create a collection without initial item ids', async () => {
@@ -1456,35 +2646,13 @@ describe('JellyfinAdapterService', () => {
           isLocked: true,
         }),
       );
-      // When no initialItemIds are supplied, `ids` is forwarded as undefined
-      // rather than omitted — the SDK signature accepts undefined and the
-      // server treats it the same as absent.
-      expect(collectionApiMocks.createCollection).toHaveBeenCalledWith(
-        expect.objectContaining({ ids: undefined }),
+      // Collections are created empty - item ids must never be sent on create
+      // (they go in the query string → HTTP 414 at scale); items are added via
+      // addBatchToCollection.
+      expect(collectionApiMocks.createCollection).not.toHaveBeenCalledWith(
+        expect.objectContaining({ ids: expect.anything() }),
       );
       expect(result.id).toBe('collection-1');
-    });
-
-    it('forwards initialItemIds to the Jellyfin SDK as ids', async () => {
-      collectionApiMocks.createCollection.mockResolvedValueOnce({
-        data: { Id: 'collection-2' },
-      });
-
-      await service.createCollection({
-        libraryId: 'library-1',
-        title: 'Seeded',
-        type: 'movie',
-        initialItemIds: ['item-1', 'item-2'],
-      });
-
-      expect(collectionApiMocks.createCollection).toHaveBeenCalledWith(
-        expect.objectContaining({
-          name: 'Seeded',
-          parentId: 'library-1',
-          isLocked: true,
-          ids: ['item-1', 'item-2'],
-        }),
-      );
     });
 
     it('should add a batch of items in one Jellyfin request', async () => {
@@ -1686,11 +2854,17 @@ describe('JellyfinAdapterService', () => {
         return Promise.reject(new Error('ancestor lookup failed'));
       });
 
-      await service.cleanupCollectionForLibrary(
-        'collection-1',
-        'old-library',
-        false,
-      );
+      // The partial sweep still stands (1bf6c8e9): what could be resolved is
+      // removed and the collection is kept. It now also reports that it could
+      // not finish, so the caller logs that instead of dropping the link on an
+      // apparent success (#3344).
+      await expect(
+        service.cleanupCollectionForLibrary(
+          'collection-1',
+          'old-library',
+          false,
+        ),
+      ).rejects.toThrow('Could not determine library membership');
 
       expect(collectionApiMocks.removeFromCollection).toHaveBeenCalledWith({
         collectionId: 'collection-1',
@@ -1939,6 +3113,27 @@ describe('JellyfinAdapterService', () => {
           serverError,
         );
       });
+
+      // #3344: the swallow above must only fire on a CONFIRMED 404. While the
+      // re-check itself could not reach the server, a refused delete resolved
+      // as success and the caller dropped the link, orphaning a live BoxSet.
+      it('rethrows deleteCollection failure when the re-check cannot reach the server', async () => {
+        const outage = createRetryableError('ECONNREFUSED');
+        jellyfinApiMocks.deleteItem.mockRejectedValueOnce(outage);
+        jellyfinApiMocks.getItem.mockRejectedValueOnce(outage);
+
+        await expect(service.deleteCollection('collection-1')).rejects.toBe(
+          outage,
+        );
+      });
+
+      it('throws instead of resolving when the client is not initialized', async () => {
+        (service as unknown as { api: unknown }).api = undefined;
+
+        await expect(service.deleteCollection('collection-1')).rejects.toThrow(
+          'Jellyfin not initialized',
+        );
+      });
     });
   });
 
@@ -2150,6 +3345,15 @@ describe('JellyfinAdapterService', () => {
         jellyfinApiMocks.getItems.mockResolvedValue({ data: { Items: [] } });
 
         await expect(service.itemExists('42')).resolves.toBe(false);
+      });
+
+      it('returns false when the response holds only other items (ignored ids filter)', async () => {
+        await initializeAdapter();
+        jellyfinApiMocks.getItems.mockResolvedValue({
+          data: { Items: [{ Id: 'unrelated-item' }] },
+        });
+
+        await expect(service.itemExists('not-a-guid')).resolves.toBe(false);
       });
 
       it('returns false on a 404 from Jellyfin', async () => {

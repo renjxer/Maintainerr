@@ -80,6 +80,7 @@ export interface EmbyBaseItemDto {
   CommunityRating?: number;
   OfficialRating?: string;
   Overview?: string;
+  Studios?: { Name?: string }[];
   ProviderIds?: EmbyProviderIds;
   ImageTags?: Record<string, string>;
   BackdropImageTags?: string[];
@@ -116,6 +117,12 @@ export interface EmbyUserDto {
   Configuration?: Record<string, unknown>;
   HasPassword?: boolean;
   PrimaryImageTag?: string;
+}
+
+export interface EmbySessionInfoDto {
+  Id?: string;
+  UserId?: string;
+  NowPlayingItem?: EmbyBaseItemDto;
 }
 
 export interface EmbyItemsQueryResponse<T = EmbyBaseItemDto> {

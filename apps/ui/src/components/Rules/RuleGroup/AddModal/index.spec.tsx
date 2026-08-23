@@ -18,6 +18,7 @@ describe('ruleGroupFormSchema', () => {
       overlayEnabled: false,
       overlayTemplateId: null,
       listExclusions: true,
+      cleanupLeftoverFolders: false,
       forceSeerr: false,
       manualCollection: false,
       manualCollectionName: '',
@@ -49,6 +50,7 @@ describe('ruleGroupFormSchema', () => {
       overlayEnabled: false,
       overlayTemplateId: null,
       listExclusions: true,
+      cleanupLeftoverFolders: false,
       forceSeerr: false,
       manualCollection: false,
       manualCollectionName: '',
@@ -71,6 +73,93 @@ describe('ruleGroupFormSchema', () => {
     expect(result.error.flatten().fieldErrors.radarrQualityProfileId).toEqual([
       'Quality profile is required for this action',
     ])
+  })
+
+  it('requires a Sportarr quality profile for CHANGE_QUALITY_PROFILE on a Sportarr-managed show collection', () => {
+    const base = {
+      name: 'Rule group',
+      description: '',
+      libraryId: '1',
+      dataType: 'show',
+      arrAction: ServarrAction.CHANGE_QUALITY_PROFILE,
+      deleteAfterDays: undefined,
+      keepLogsForMonths: 6,
+      tautulliWatchedPercentOverride: undefined,
+      showRecommended: true,
+      showHome: true,
+      overlayEnabled: false,
+      overlayTemplateId: null,
+      listExclusions: false,
+      cleanupLeftoverFolders: false,
+      forceSeerr: false,
+      manualCollection: false,
+      manualCollectionName: '',
+      sortTitle: '',
+      active: true,
+      useRules: true,
+      radarrSettingsId: undefined,
+      sonarrSettingsId: undefined,
+      sportarrSettingsId: 1,
+      radarrQualityProfileId: undefined,
+      sonarrQualityProfileId: undefined,
+      sportarrQualityProfileId: null,
+      ruleHandlerCronSchedule: null,
+    }
+
+    const missing = ruleGroupFormSchema.safeParse(base)
+    expect(missing.success).toBe(false)
+    if (!missing.success) {
+      // The error must land on the Sportarr profile field, not the Sonarr one
+      // (which isn't rendered for a Sportarr-managed collection).
+      expect(
+        missing.error.flatten().fieldErrors.sportarrQualityProfileId,
+      ).toEqual(['Quality profile is required for this action'])
+      expect(
+        missing.error.flatten().fieldErrors.sonarrQualityProfileId,
+      ).toBeUndefined()
+    }
+
+    const provided = ruleGroupFormSchema.safeParse({
+      ...base,
+      sportarrQualityProfileId: 7,
+    })
+    expect(provided.success).toBe(true)
+  })
+
+  it('accepts the optional tagInArr membership-tag opt-in', () => {
+    const base = {
+      name: 'Rule group',
+      description: '',
+      libraryId: '1',
+      dataType: 'movie',
+      arrAction: ServarrAction.DELETE,
+      deleteAfterDays: 30,
+      keepLogsForMonths: 6,
+      showRecommended: true,
+      showHome: true,
+      overlayEnabled: false,
+      overlayTemplateId: null,
+      listExclusions: true,
+      cleanupLeftoverFolders: false,
+      forceSeerr: false,
+      manualCollection: false,
+      manualCollectionName: '',
+      sortTitle: '',
+      active: true,
+      useRules: true,
+      radarrSettingsId: 1,
+      sonarrSettingsId: undefined,
+      ruleHandlerCronSchedule: null,
+    }
+
+    const enabled = ruleGroupFormSchema.safeParse({ ...base, tagInArr: true })
+    expect(enabled.success).toBe(true)
+    if (enabled.success) {
+      expect(enabled.data.tagInArr).toBe(true)
+    }
+
+    // Optional - omitting it is still valid.
+    expect(ruleGroupFormSchema.safeParse(base).success).toBe(true)
   })
 
   it('does not show the stored-library fallback while libraries are still loading', () => {

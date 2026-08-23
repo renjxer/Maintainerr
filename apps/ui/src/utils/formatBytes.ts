@@ -1,3 +1,6 @@
+// Byte units and the sizes built from them stay as the SI-style
+// abbreviations every locale renders the same, so a translation can never
+// disagree with the number beside it.
 const UNITS = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'] as const
 
 export const formatBytes = (bytes: number, decimals = 2): string => {
@@ -47,6 +50,6 @@ export const getPercentValue = (
 
 export const formatPercent = (used: number, total: number): string => {
   const percent = getPercentValue(used, total)
-  if (percent === null) return '—'
+  if (percent === null) return '-'
   return `${percent.toFixed(1)}%`
 }

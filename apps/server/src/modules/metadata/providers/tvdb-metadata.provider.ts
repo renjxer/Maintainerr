@@ -1,9 +1,14 @@
 import { Injectable } from '@nestjs/common';
+import {
+  TvdbMovieBase,
+  TvdbSeriesBase,
+} from '../../api/tvdb-api/interfaces/tvdb.interface';
 import { TvdbApiService } from '../../api/tvdb-api/tvdb.service';
 import { IMetadataProvider } from '../interfaces/metadata-provider.interface';
 import {
   ExternalIdSearchResult,
   MetadataDetails,
+  MetadataImageOptions,
   PersonDetails,
   ProviderIds,
 } from '../interfaces/metadata.types';
@@ -48,7 +53,7 @@ export class TvdbMetadataProvider implements IMetadataProvider {
     type: 'movie' | 'tv',
   ): Promise<MetadataDetails | undefined> {
     const record = await this.getRecord(tvdbId, type);
-    if (!record) {
+    if (!record || typeof record !== 'object') {
       return undefined;
     }
 
@@ -67,15 +72,91 @@ export class TvdbMetadataProvider implements IMetadataProvider {
         type,
       },
       type,
+      ended:
+        'firstAired' in record
+          ? this.deriveEnded(record.status?.name)
+          : undefined,
+      firstAirDate:
+        'firstAired' in record ? record.firstAired || undefined : undefined,
+      seasonCount:
+        'firstAired' in record
+          ? this.countRealSeasons(record.seasons, record.defaultSeasonType)
+          : undefined,
     };
   }
 
+  private deriveEnded(status: string | undefined): boolean | undefined {
+    if (status === 'Ended') return true;
+    if (status === 'Continuing' || status === 'Upcoming') return false;
+    return undefined;
+  }
+
+  // TVDB returns season entries for every alternative ordering (Aired / DVD /
+  // Absolute / Alternate / Regional), so filter to the series' default ordering
+  // before excluding Season 0.
+  private countRealSeasons(
+    seasons: { number: number; type: { id: number } }[] | undefined,
+    defaultSeasonType: number | undefined,
+  ): number | undefined {
+    if (!Array.isArray(seasons) || defaultSeasonType === undefined) {
+      return undefined;
+    }
+    let count = 0;
+    for (const season of seasons) {
+      if (season.type?.id === defaultSeasonType && season.number > 0) count++;
+    }
+    return count;
+  }
+
+  /**
+   * The series record lists a season per alternative ordering (Aired / DVD /
+   * ...), so the series' default ordering decides which entry is "season N".
+   * `season.image` is the one image TVDB attaches to the season itself.
+   */
+  private findSeasonImage(
+    record: TvdbSeriesBase | TvdbMovieBase | undefined,
+    seasonNumber: number,
+  ): string | undefined {
+    if (!record || !('seasons' in record) || !Array.isArray(record.seasons)) {
+      return undefined;
+    }
+
+    return record.seasons.find(
+      (season) =>
+        season.type?.id === record.defaultSeasonType &&
+        season.number === seasonNumber,
+    )?.image;
+  }
+
+  // TVDB serves one fixed artwork URL per image, so there is no size to apply.
   async getPosterUrl(
     tvdbId: number,
     type: 'movie' | 'tv',
+    options: MetadataImageOptions = {},
   ): Promise<string | undefined> {
     const record = await this.getRecord(tvdbId, type);
+
+    if (options.ref) {
+      const seasonImage = this.findSeasonImage(
+        record,
+        options.ref.seasonNumber,
+      );
+
+      if (seasonImage) {
+        return seasonImage;
+      }
+    }
+
     return this.tvdbApi.getPosterUrl(record, type);
+  }
+
+  /**
+   * The series record holds no episode entries and only reports which languages
+   * a season overview is translated into, never the text, so TVDB has no
+   * description below show level to read without per-episode requests.
+   */
+  async getHierarchyOverview(): Promise<string | undefined> {
+    return undefined;
   }
 
   async getBackdropUrl(

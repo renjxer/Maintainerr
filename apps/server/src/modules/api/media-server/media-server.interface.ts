@@ -95,13 +95,24 @@ export interface IMediaServerService {
 
   /**
    * Compute per-library size on disk by enumerating items. Potentially slow
-   * — meant to be called on demand. Returns a map of library id → bytes.
+   * - meant to be called on demand. Returns a map of library id → bytes.
    * Libraries missing from the map could not be sized.
    */
   computeLibraryStorageSizes(): Promise<Map<string, number>>;
 
   /**
    * Get contents of a specific library with optional pagination and filtering.
+   * An empty page means the server confirmed there are no (more) items -
+   * never "the read failed".
+   *
+   * A page can hold fewer items than the limit asked for, mid-library: rows of
+   * a kind the query did not ask for are dropped (#3550). Page by offset
+   * window or resume from the rows returned; a short page is not the end.
+   *
+   * @throws Error on any failure to read the page (connection, 4xx/5xx).
+   * Like getCollectionChildren: a fabricated empty page would read as
+   * end-of-library and let rule evaluation truncate silently, mass-removing
+   * the unevaluated tail from collections.
    */
   getLibraryContents(
     libraryId: string,
@@ -110,6 +121,9 @@ export interface IMediaServerService {
 
   /**
    * Get total count of items in a library, optionally filtered by type.
+   *
+   * @throws Error on a failed read - a fabricated 0 masks the failure from
+   * callers that gate work on the count.
    */
   getLibraryContentCount(
     libraryId: string,
@@ -131,9 +145,41 @@ export interface IMediaServerService {
   getMetadata(itemId: string): Promise<MediaItem | undefined>;
 
   /**
-   * Get child items (seasons for shows, episodes for seasons).
+   * Metadata for many items, in as few reads as the server allows.
+   *
+   * Only the items the server resolved come back, in no guaranteed order, so
+   * callers must match on `id` rather than position. An id the server does not
+   * hold is left out rather than answering an entry for it.
+   *
+   * Same read contract as `getMetadata`: an absent item and a failed read are
+   * indistinguishable, both being an id that simply is not in the result. Never
+   * use it to decide an item is gone - `itemExists` is the primitive for that.
    */
-  getChildrenMetadata(parentId: string): Promise<MediaItem[]>;
+  getMetadataBatch(itemIds: string[]): Promise<MediaItem[]>;
+
+  /**
+   * Confirm an item is still present on the media server.
+   *
+   * Returns `false` only when the server explicitly reports the item as
+   * absent (404 / empty result); any other failure (auth, network, 5xx)
+   * throws so callers don't treat "couldn't check" as "gone" and drop state
+   * on a transient blip. Unlike `getMetadata`, which returns `undefined` for
+   * both absent and failed reads, this is safe for cleanup decisions.
+   */
+  itemExists(itemId: string): Promise<boolean>;
+
+  /**
+   * Get child items (seasons for shows, episodes for seasons).
+   *
+   * @param throwOnError - by default a failed read answers with an empty list,
+   * which reads as "no children" downstream. Callers that must not mistake the
+   * two pass true.
+   */
+  getChildrenMetadata(
+    parentId: string,
+    childType?: MediaItemType,
+    throwOnError?: boolean,
+  ): Promise<MediaItem[]>;
 
   /**
    * Get recently added items from a library.
@@ -149,6 +195,29 @@ export interface IMediaServerService {
   searchContent(query: string): Promise<MediaItem[]>;
 
   /**
+   * Prefetch watch history in bulk, caching the result so that subsequent
+   * per-item getWatchHistory / getWatchState calls can be served from memory
+   * instead of making individual HTTP requests.
+   *
+   * @param libraryId - The library about to be evaluated. Sweeps are scoped to
+   *   it and cached per library: a rule group only ever evaluates its own
+   *   library, and an unscoped sweep pays for every other one on the server.
+   *
+   * Gated by MediaServerFeature.CENTRAL_WATCH_HISTORY (watch history is
+   * fetchable in bulk, whether from one central endpoint or one sweep per
+   * user). Throws if not supported - callers must check supportsFeature()
+   * first; when unsupported, evaluation uses per-item queries.
+   *
+   * Best-effort: implementations swallow their own failures and leave no
+   * cached result, so getWatchHistory falls back to live per-item reads. A
+   * failed prefetch must never surface as "nothing was watched".
+   */
+  prefetchWatchHistory(options: {
+    libraryId: string;
+    abortSignal?: AbortSignal;
+  }): Promise<void>;
+
+  /**
    * Get watch history for a specific item.
    * Implementation varies by server:
    * - Plex: Single API call to history endpoint
@@ -159,11 +228,12 @@ export interface IMediaServerService {
   /**
    * Get aggregate watch state for a specific item.
    *
-   * @param nativeViewCount - Optional native view count from the media item
-   *   metadata. Used as a fallback signal for `isWatched` when watch history
-   *   has been purged or the item was marked watched without a play event.
-   *   Note: on Plex this value is per-user (admin token), so it is only used
-   *   for the boolean `isWatched`, not for the numeric `viewCount`.
+   * @param nativeViewCount - Optional view count carried by the item's own
+   *   metadata, for the servers that record a watched state without writing a
+   *   history row (marking something played by hand, a scrobble from an
+   *   external tracker). It is an extra signal, never a replacement: where a
+   *   server reports it per account rather than per server, it can raise the
+   *   aggregate but must never lower what history already established.
    */
   getWatchState(
     itemId: string,
@@ -177,12 +247,50 @@ export interface IMediaServerService {
   getItemSeenBy(itemId: string): Promise<string[]>;
 
   /**
-   * Get all collections in a library.
+   * Get the set of media server item IDs that are currently being played in
+   * an active streaming session. The collection worker uses this to defer
+   * handling of in-use media to the next run (deletion is the case that
+   * matters; the occasional non-destructive action is deferred too rather
+   * than scoped - a deliberate simplification).
+   *
+   * For hierarchical media the set includes every level a collection might
+   * track: a playing episode contributes its own id plus its season and show
+   * ids, so a collection holding the episode, season, or whole show is
+   * protected.
+   *
+   * Best-effort: returns an empty set when nothing is playing and, after the
+   * HTTP client's own retries, when the lookup could not be completed - so a
+   * session outage degrades to the pre-existing behaviour (handle as usual)
+   * rather than blocking the run. The worker reads this once at the start of a
+   * run, so media that starts playing mid-run isn't protected until the next
+   * run.
    */
-  getCollections(libraryId: string): Promise<MediaCollection[]>;
+  getActiveSessions(): Promise<Set<string>>;
 
   /**
-   * Get a specific collection by ID.
+   * Get all collections in a library. An empty array means the server confirmed
+   * the library holds no collections - never "the lookup failed".
+   *
+   * @throws Error on any failure to enumerate, including an uninitialized
+   * client. A failed listing read as "no collection with that title" is what
+   * makes the link lookup create a duplicate beside the real one (#3344).
+   *
+   * @param useCache - Cached by default for the per-item rule reads. Callers
+   * deciding whether a collection EXISTS must pass false; a stale listing
+   * reports one created since the last read as missing.
+   */
+  getCollections(
+    libraryId: string,
+    useCache?: boolean,
+  ): Promise<MediaCollection[]>;
+
+  /**
+   * Get a specific collection by ID. Undefined means the server confirmed the
+   * collection is gone (404) - never "the lookup failed".
+   *
+   * @param throwOnError - When true a failed lookup throws, so callers that
+   * unlink on "missing" can tell a deleted collection from an unreachable
+   * server. Uncertainty must never unlink.
    */
   getCollection(
     collectionId: string,
@@ -217,8 +325,13 @@ export interface IMediaServerService {
   ): Promise<void>;
 
   /**
-   * Get items in a collection.
-   * Returns empty array if collection not found or on error.
+   * Get items in a collection. An empty array means the server confirmed
+   * the collection has no children - never "the lookup failed".
+   *
+   * @throws Error on any failure to enumerate (connection, 4xx/5xx).
+   * Callers must treat a throw as "children unknown" and skip membership
+   * reconciliation instead of acting on an empty list; like itemExists,
+   * uncertainty must never add or remove anything.
    */
   getCollectionChildren(collectionId: string): Promise<MediaItem[]>;
 
@@ -286,7 +399,7 @@ export interface IMediaServerService {
    * Set the primary poster image on a collection on the media server.
    *
    * Maintainerr is one writer among several (Kometa, Posterizarr, manual
-   * uploads). This is a single write — last writer wins. Unlike per-item
+   * uploads). This is a single write - last writer wins. Unlike per-item
    * overlays (which re-apply on cron because they carry day-counter state),
    * collection posters carry no per-cycle state, so callers should write
    * only when the source bytes change (user upload, collection re-create);
@@ -334,14 +447,17 @@ export interface IMediaServerService {
 
   /**
    * Reset metadata cache.
-   * @param itemId - If provided, only reset cache for this item. Otherwise reset all.
+   * @param itemId - If provided, invalidate at least this item's cached
+   * metadata; implementations may drop more (Jellyfin also clears its
+   * children and watch namespaces, Emby flushes everything). Otherwise
+   * reset all.
    */
   resetMetadataCache(itemId?: string): void;
 
   /**
    * Ask the media server to re-fetch metadata for a specific item from its
    * own configured agents. This is a best-effort, fire-and-forget operation
-   * on the server side — the call returns quickly while the server works async.
+   * on the server side - the call returns quickly while the server works async.
    */
   refreshItemMetadata(itemId: string): Promise<void>;
 }

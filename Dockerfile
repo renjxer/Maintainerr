@@ -1,4 +1,4 @@
-FROM node:26.2.0-alpine3.22@sha256:56392f8949e007103b800098434f993924ea714bf2b1f84056e68c61d720e26c AS base
+FROM node:26.3.0-alpine3.22@sha256:c7932b9e5e337b0e733d6e16abc1b0e104759e8b05e59ed56586cce967d26dfe AS base
 LABEL Description="Contains the Maintainerr Docker image"
 
 FROM base AS builder
@@ -49,34 +49,42 @@ FROM base AS runner
 
 WORKDIR /opt/app
 
+# Application code is only ever read at runtime, so 755 is enough for any uid
+# the container is started with (see the `user` directive) to load it, while
+# keeping it unwritable.
+
 # copy root node_modules
-COPY --from=builder --chmod=777 --chown=node:node /app/node_modules ./node_modules
+COPY --from=builder --chmod=755 --chown=node:node /app/node_modules ./node_modules
 
 # Copy standalone server
-COPY --from=builder --chmod=777 --chown=node:node /app/apps/server/dist ./apps/server/dist
-COPY --from=builder --chmod=777 --chown=node:node /app/apps/server/package.json ./apps/server/package.json
-COPY --from=builder --chmod=777 --chown=node:node /app/apps/server/node_modules ./apps/server/node_modules
+COPY --from=builder --chmod=755 --chown=node:node /app/apps/server/dist ./apps/server/dist
+COPY --from=builder --chmod=755 --chown=node:node /app/apps/server/package.json ./apps/server/package.json
+COPY --from=builder --chmod=755 --chown=node:node /app/apps/server/node_modules ./apps/server/node_modules
 
-# copy UI output to API to be served statically
-COPY --from=builder --chmod=777 --chown=node:node /app/apps/ui/dist ./apps/server/dist/ui
+# copy UI output to API to be served statically. Read-only like the rest:
+# start.sh stages a copy under the data directory and resolves the BASE_PATH
+# placeholder there, so nothing rewrites this tree.
+COPY --from=builder --chmod=755 --chown=node:node /app/apps/ui/dist ./apps/server/dist/ui
 
 # Copy bundled fonts for overlay rendering
-COPY --from=builder --chmod=777 --chown=node:node /app/apps/server/assets ./apps/server/dist/assets
+COPY --from=builder --chmod=755 --chown=node:node /app/apps/server/assets ./apps/server/dist/assets
 
 # Copy packages/contracts
-COPY --from=builder --chmod=777 --chown=node:node /app/packages/contracts/dist ./packages/contracts/dist
-COPY --from=builder --chmod=777 --chown=node:node /app/packages/contracts/package.json ./packages/contracts/package.json
-COPY --from=builder --chmod=777 --chown=node:node /app/packages/contracts/node_modules ./packages/contracts/node_modules
+COPY --from=builder --chmod=755 --chown=node:node /app/packages/contracts/dist ./packages/contracts/dist
+COPY --from=builder --chmod=755 --chown=node:node /app/packages/contracts/package.json ./packages/contracts/package.json
+COPY --from=builder --chmod=755 --chown=node:node /app/packages/contracts/node_modules ./packages/contracts/node_modules
 
-COPY --chmod=777 --chown=node:node docker/start.sh /opt/app/start.sh
+# 755 keeps these executable by whichever uid the docker user directive selects.
+COPY --chmod=755 --chown=node:node docker/start.sh /opt/app/start.sh
+COPY --chmod=755 --chown=node:node docker/healthcheck.sh /opt/app/healthcheck.sh
 
-# Create required directories
+# Create required directories. World-writable on purpose: the image cannot know
+# which uid the container will run as, and this is the one tree that uid has to
+# write. It only applies to a fresh named volume - a bind mount keeps the host's
+# own ownership and modes.
 RUN mkdir -m 777 /opt/data && \
     mkdir -m 777 /opt/data/logs && \
     chown -R node:node /opt/data
-
-# This is required for docker user directive to work
-RUN chmod 777 /opt/app/start.sh
 
 # Runtime dependencies for node-canvas (cairo) and sharp (vips)
 RUN apk --update --no-cache add \
@@ -119,6 +127,11 @@ ENV UV_USE_IO_URING=0
 USER node
 
 EXPOSE 6246
+
+# Readiness probe: 200 while the DB answers, 503 otherwise. start-period covers
+# the first boot (UI base-path rewrite + Nest bootstrap + migrations).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+	CMD ["/opt/app/healthcheck.sh"]
 
 VOLUME [ "/opt/data" ]
 ENTRYPOINT ["/opt/app/start.sh"]

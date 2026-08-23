@@ -1,60 +1,70 @@
 import { MaintainerrEvent } from '@maintainerr/contracts'
-import {
-  createContext,
-  useContext,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from 'react'
+import { createContext, use, useEffect, useRef, useState } from 'react'
 import ReconnectingEventSource from 'reconnecting-eventsource'
 import { API_BASE_PATH } from '../utils/ApiHandler'
 import { logClientError } from '../utils/ClientLogger'
 
 const EventsContext = createContext<EventSource | undefined>(undefined)
+EventsContext.displayName = 'EventsContext'
 
-export const EventsProvider = (props: any) => {
-  const hasWarnedStreamError = useRef(false)
-  const hasConnectedOnce = useRef(false)
-  const eventSource = useMemo(() => {
-    const source = new ReconnectingEventSource(
-      `${API_BASE_PATH}/api/events/stream`,
+// One stream serves the whole app for as long as the page lives, so it is owned
+// at module scope like the query client, not by a component. Two things follow
+// from that, and both used to be broken: nothing can hand out a second
+// connection, and nothing can close the only one there is -
+// ReconnectingEventSource does not reconnect after close(), so a component
+// lifecycle closing it left every consumer permanently deaf.
+let sharedEventSource: EventSource | undefined
+let hasConnectedOnce = false
+let hasWarnedStreamError = false
+
+const getEventSource = (): EventSource => {
+  if (sharedEventSource) {
+    return sharedEventSource
+  }
+
+  const source = new ReconnectingEventSource(
+    `${API_BASE_PATH}/api/events/stream`,
+  )
+
+  source.onopen = () => {
+    hasConnectedOnce = true
+    hasWarnedStreamError = false
+  }
+
+  source.onerror = (error) => {
+    if (!hasConnectedOnce || hasWarnedStreamError) {
+      return
+    }
+
+    hasWarnedStreamError = true
+    console.warn(
+      'Event stream disconnected. Reconnecting automatically.',
+      error,
     )
+  }
 
-    source.onopen = () => {
-      hasConnectedOnce.current = true
-      hasWarnedStreamError.current = false
-    }
-
-    source.onerror = (error) => {
-      if (!hasConnectedOnce.current || hasWarnedStreamError.current) {
-        return
-      }
-
-      hasWarnedStreamError.current = true
-      console.warn(
-        'Event stream disconnected. Reconnecting automatically.',
-        error,
-      )
-    }
-
-    return source
-  }, [])
-
-  useEffect(() => {
-    return () => {
-      eventSource.close()
-    }
-  }, [eventSource])
-
-  return <EventsContext.Provider value={eventSource} {...props} />
+  sharedEventSource = source
+  return source
 }
+
+// Module state resets on a hot reload, so without this the previous stream
+// would stay open with nothing listening until the next full page load.
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    sharedEventSource?.close()
+    sharedEventSource = undefined
+  })
+}
+
+export const EventsProvider = (props: any) => (
+  <EventsContext value={getEventSource()} {...props} />
+)
 
 export const useEvent = <T,>(
   type: MaintainerrEvent,
   listener?: (event: T) => any,
 ) => {
-  const context = useContext(EventsContext)
+  const context = use(EventsContext)
   const listenerRef = useRef(listener)
   const [lastEvent, setLastEvent] = useState<T>()
 

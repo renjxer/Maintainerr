@@ -1,5 +1,5 @@
-import axios from 'axios';
 import { get } from 'lodash';
+import { rateLimitAwareHttp } from '../../api/lib/httpRetry';
 import { MaintainerrLogger } from '../../logging/logs.service';
 import { SettingsDataService } from '../../settings/settings-data.service';
 import { Notification } from '../entities/notification.entities';
@@ -10,6 +10,7 @@ import {
 } from '../notifications-interfaces';
 import { hasNotificationType } from '../notifications.service';
 import type { NotificationAgent, NotificationPayload } from './agent';
+import { validateWebhookUrl } from './webhookUrl';
 
 type KeyMapFunction = (
   payload: NotificationPayload,
@@ -17,7 +18,7 @@ type KeyMapFunction = (
 ) => string;
 
 const KeyMap: Record<string, string | KeyMapFunction> = {
-  notification_type: (_payload, type) => NotificationType[type],
+  notification_type: (payload, type) => NotificationType[type],
   event: 'event',
   subject: 'subject',
   message: 'message',
@@ -45,10 +46,11 @@ class WebhookAgent implements NotificationAgent {
     finalPayload: Record<string, unknown>,
     payload: NotificationPayload,
     type: NotificationType,
+    extra: NonNullable<NotificationPayload['extra']>,
   ): Record<string, unknown> {
     Object.keys(finalPayload).forEach((key) => {
       if (key === '{{extra}}') {
-        finalPayload.extra = payload.extra ?? [];
+        finalPayload.extra = extra;
         delete finalPayload[key];
         key = 'extra';
       }
@@ -68,6 +70,7 @@ class WebhookAgent implements NotificationAgent {
           finalPayload[key] as Record<string, unknown>,
           payload,
           type,
+          extra,
         );
       }
     });
@@ -76,17 +79,23 @@ class WebhookAgent implements NotificationAgent {
   }
 
   private buildPayload(type: NotificationType, payload: NotificationPayload) {
-    payload.extra?.forEach((el) => {
-      payload[el.name] = el.value;
-    });
-    delete payload.extra;
+    const extra = payload.extra ?? [];
+
+    // Flatten onto a copy: `sendNotification` hands the same payload object to
+    // every agent, so deleting `extra` here stripped it from any agent that ran
+    // after us (email and LunaSea both forward it) and left `{{extra}}` empty.
+    const flattened: Record<string, unknown> = { ...payload };
+    delete flattened.extra;
+    for (const el of extra) {
+      flattened[el.name] = el.value;
+    }
 
     const payloadString = this.getSettings().options.jsonPayload;
     const parsedJSON = JSON.parse(JSON.stringify(payloadString));
 
-    Object.assign(parsedJSON, payload);
+    Object.assign(parsedJSON, flattened);
 
-    return this.parseKeys(parsedJSON, payload, type);
+    return this.parseKeys(parsedJSON, payload, type, extra);
   }
 
   public shouldSend(): boolean {
@@ -109,11 +118,19 @@ class WebhookAgent implements NotificationAgent {
       return 'Success';
     }
 
+    const webhookUrl = validateWebhookUrl(settings.options.webhookUrl);
+    if (!webhookUrl.ok) {
+      this.logger.error(
+        `Webhook URL ${JSON.stringify(settings.options.webhookUrl)} rejected: ${webhookUrl.reason}.`,
+      );
+      return `Failure: ${webhookUrl.reason}`;
+    }
+
     this.logger.log('Sending webhook notification');
 
     try {
-      await axios.post(
-        settings.options.webhookUrl,
+      await rateLimitAwareHttp.post(
+        webhookUrl.url,
         this.buildPayload(type, payload),
         settings.options.authHeader
           ? {

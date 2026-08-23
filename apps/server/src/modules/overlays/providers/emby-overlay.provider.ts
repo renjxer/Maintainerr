@@ -50,7 +50,7 @@ export class EmbyOverlayProvider implements IOverlayProvider {
     const ep = await this.emby.findRandomEpisode(sectionKeys);
     if (!ep?.Id) return null;
     const name = ep.Name ?? '';
-    const title = ep.SeriesName ? `${ep.SeriesName} — ${name}` : name;
+    const title = ep.SeriesName ? `${ep.SeriesName} - ${name}` : name;
     return { itemId: ep.Id, title };
   }
 
@@ -66,9 +66,5 @@ export class EmbyOverlayProvider implements IOverlayProvider {
     // Reuse the collection-image upload path: Emby's image upload endpoint
     // accepts a base64 body with the original Content-Type on POST.
     await this.emby.setCollectionImage(itemId, buffer, contentType);
-  }
-
-  async itemExists(itemId: string): Promise<boolean> {
-    return this.emby.itemExists(itemId);
   }
 }

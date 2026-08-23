@@ -13,8 +13,13 @@ import {
   Property,
   RuleConstants,
 } from '../constants/rules.constants';
-import { RulesDto } from '../dtos/rules.dto';
-import { buildCollectionExcludeNames } from '../helpers/collection-exclude.helper';
+import { RuleGroupDto } from '../dtos/ruleGroup.dto';
+import { ArrLookupCache } from '../helpers/arr-lookup-cache';
+import {
+  filterRuleCollectionNames,
+  mapRuleUserIdsToNames,
+} from '../helpers/rule-property.helper';
+import { MetadataRuleValueService } from './metadata-rule-value.service';
 
 /**
  * Emby Getter Service
@@ -22,7 +27,7 @@ import { buildCollectionExcludeNames } from '../helpers/collection-exclude.helpe
  * Implements property getters for Emby media server.
  * Mirrors PlexGetterService functionality for Emby. Emby and Jellyfin share
  * the same .NET BoxSet backend, so the quirks below are inherited from that
- * lineage and largely match the Jellyfin getter — they're not Emby-specific.
+ * lineage and largely match the Jellyfin getter - they're not Emby-specific.
  *
  * Key differences from Plex:
  * - Watch history requires iterating over all users (no central endpoint)
@@ -38,6 +43,7 @@ export class EmbyGetterService {
 
   constructor(
     private readonly embyAdapter: EmbyAdapterService,
+    private readonly metadataRuleValueService: MetadataRuleValueService,
     private readonly logger: MaintainerrLogger,
   ) {
     logger.setContext(EmbyGetterService.name);
@@ -52,7 +58,8 @@ export class EmbyGetterService {
     id: number,
     libItem: MediaItem,
     dataType?: MediaItemType,
-    ruleGroup?: RulesDto,
+    ruleGroup?: RuleGroupDto,
+    arrLookupCache?: ArrLookupCache,
   ): Promise<RuleValueType> {
     try {
       if (!this.embyAdapter.isSetup()) {
@@ -66,13 +73,24 @@ export class EmbyGetterService {
         return null;
       }
 
+      if (prop.name === 'studios') {
+        return await this.metadataRuleValueService.getStudios(
+          libItem,
+          arrLookupCache,
+        );
+      }
+
       // Fetch full metadata from Emby
       // Note: libItem.id maps to Emby item ID
       const metadata = await this.embyAdapter.getMetadata(libItem.id);
 
       if (!metadata) {
         this.logger.warn(`Failed to get Emby metadata for item ${libItem.id}`);
-        return null;
+        // undefined, not null: getMetadata answers undefined for both a
+        // missing item and a failed read, and null is the comparator's
+        // "confirmed absent" signal - it would let NOT_EXISTS match on a
+        // transient blip. Mirrors the arr getter contract (#3125).
+        return undefined;
       }
 
       // Get parent/grandparent metadata lazily (like Plex getter)
@@ -103,8 +121,12 @@ export class EmbyGetterService {
             metadata.id,
           );
           const users = await this.embyAdapter.getUsers();
-          const userMap = new Map(users.map((u) => [u.id, u.name]));
-          return seenByUserIds.map((id) => userMap.get(id) || id);
+          return mapRuleUserIdsToNames(
+            seenByUserIds,
+            users,
+            (user) => user.id,
+            (user) => user.name,
+          );
         }
 
         case 'favoritedBy': {
@@ -112,8 +134,12 @@ export class EmbyGetterService {
             metadata.id,
           );
           const users = await this.embyAdapter.getUsers();
-          const userMap = new Map(users.map((u) => [u.id, u.name]));
-          return favoritedByUserIds.map((id) => userMap.get(id) || id);
+          return mapRuleUserIdsToNames(
+            favoritedByUserIds,
+            users,
+            (user) => user.id,
+            (user) => user.name,
+          );
         }
 
         case 'releaseDate': {
@@ -191,6 +217,11 @@ export class EmbyGetterService {
           return await this.getLastViewedAt(metadata.id);
         }
 
+        case 'lastPlayedAt': {
+          // Get newest play attempt across all users (includes unfinished views)
+          return await this.getLastPlayedAt(metadata.id, metadata.type);
+        }
+
         case 'fileVideoResolution': {
           return metadata.mediaSources?.[0]?.videoResolution ?? null;
         }
@@ -253,8 +284,12 @@ export class EmbyGetterService {
             metadata.id,
           );
           const users = await this.embyAdapter.getUsers();
-          const userMap = new Map(users.map((u) => [u.id, u.name]));
-          return favoritedByUserIds.map((id) => userMap.get(id) || id);
+          return mapRuleUserIdsToNames(
+            favoritedByUserIds,
+            users,
+            (user) => user.id,
+            (user) => user.name,
+          );
         }
 
         case 'sw_favoritedBy_including_parent': {
@@ -266,12 +301,16 @@ export class EmbyGetterService {
             grandparent?.id,
           );
           const users = await this.embyAdapter.getUsers();
-          const userMap = new Map(users.map((u) => [u.id, u.name]));
-          return favoritedByUserIds.map((id) => userMap.get(id) || id);
+          return mapRuleUserIdsToNames(
+            favoritedByUserIds,
+            users,
+            (user) => user.id,
+            (user) => user.name,
+          );
         }
 
         // At season/show level this returns the UNION of users that watched
-        // any descendant episode — not the intersection. A user who watched
+        // any descendant episode - not the intersection. A user who watched
         // 3/6 episodes is included. This is the documented behaviour and is
         // covered by the #2559 regression test in
         // jellyfin-getter.service.spec.ts. Use `sw_allEpisodesSeenBy` when
@@ -402,7 +441,7 @@ export class EmbyGetterService {
           return communityRating?.value ?? null;
         }
 
-        // Smart collection properties — Emby has no native smart collections
+        // Smart collection properties - Emby has no native smart collections
         // (TheMovieDb-driven "Automatic Creation of Collections" is metadata
         // grouping, not filter rules; the third-party Smart Playlists plugin
         // is out of scope here). Fall back to normal collection count/names,
@@ -476,6 +515,37 @@ export class EmbyGetterService {
       : null;
   }
 
+  private async getLastPlayedAt(
+    itemId: string,
+    type: MediaItemType,
+  ): Promise<Date | null> {
+    if (!isMediaType(type, 'show') && !isMediaType(type, 'season')) {
+      return this.embyAdapter.getLastPlayedAt(itemId);
+    }
+
+    const seasons =
+      type === 'season'
+        ? [{ id: itemId }]
+        : await this.embyAdapter.getChildrenMetadata(itemId, 'season', true);
+    let latestDate: Date | null = null;
+
+    for (const season of seasons) {
+      const episodes = await this.embyAdapter.getChildrenMetadata(
+        season.id,
+        'episode',
+        true,
+      );
+      for (const episode of episodes) {
+        const lastPlayedAt = await this.embyAdapter.getLastPlayedAt(episode.id);
+        if (lastPlayedAt && (!latestDate || lastPlayedAt > latestDate)) {
+          latestDate = lastPlayedAt;
+        }
+      }
+    }
+
+    return latestDate;
+  }
+
   private async getAllEpisodesSeenBy(
     itemId: string,
     type: MediaItemType,
@@ -519,9 +589,12 @@ export class EmbyGetterService {
       episodeWatchers.every((watchers) => watchers.includes(userId)),
     );
 
-    // Map to usernames
-    const userMap = new Map(users.map((u) => [u.id, u.name]));
-    return usersWhoWatchedAll.map((id) => userMap.get(id) || id);
+    return mapRuleUserIdsToNames(
+      usersWhoWatchedAll,
+      users,
+      (user) => user.id,
+      (user) => user.name,
+    );
   }
 
   /**
@@ -582,7 +655,7 @@ export class EmbyGetterService {
    * show or season, or null when nothing has been watched. Emby does not
    * expose a watched timestamp on the parent item, so the only way to derive
    * a "last watched" signal for shows/seasons is to walk the children and
-   * take the max. This is an aggregate — it is not the view date of the
+   * take the max. This is an aggregate - it is not the view date of the
    * highest-numbered episode, the way the Plex/Tautulli `sw_lastWatched`
    * getters compute it. Used by the `lastViewedAt` rule only.
    */
@@ -760,14 +833,18 @@ export class EmbyGetterService {
     }
 
     const users = await this.embyAdapter.getUsers();
-    const userMap = new Map(users.map((u) => [u.id, u.name]));
-    return watcherIds.map((id) => userMap.get(id) || id);
+    return mapRuleUserIdsToNames(
+      watcherIds,
+      users,
+      (user) => user.id,
+      (user) => user.name,
+    );
   }
 
   private async getCollectionNames(
     itemId: string,
     libraryId: string,
-    ruleGroup?: RulesDto,
+    ruleGroup?: RuleGroupDto,
   ): Promise<string[]> {
     // Cache the raw collection names (without exclusion filtering)
     // so we can apply different exclusions for different rule groups
@@ -791,12 +868,7 @@ export class EmbyGetterService {
       this.cache.data.set(cacheKey, allCollectionNames, 600);
     }
 
-    const excludeNames = buildCollectionExcludeNames(ruleGroup);
-    return excludeNames.length > 0
-      ? allCollectionNames.filter(
-          (name) => !excludeNames.includes(name.toLowerCase().trim()),
-        )
-      : allCollectionNames;
+    return filterRuleCollectionNames(allCollectionNames, ruleGroup);
   }
 
   private async getFavoritedByIncludingParent(
@@ -870,7 +942,7 @@ export class EmbyGetterService {
     parentId: string | undefined,
     grandparentId: string | undefined,
     libraryId: string,
-    ruleGroup?: RulesDto,
+    ruleGroup?: RuleGroupDto,
   ): Promise<number> {
     const names = await this.getCollectionNamesIncludingParent(
       itemId,
@@ -887,16 +959,14 @@ export class EmbyGetterService {
     parentId: string | undefined,
     grandparentId: string | undefined,
     libraryId: string,
-    ruleGroup?: RulesDto,
+    ruleGroup?: RuleGroupDto,
   ): Promise<string[]> {
     const collections = await this.embyAdapter.getCollections(libraryId);
-    const collectionNames = new Set<string>();
+    const collectionNames: string[] = [];
 
     const idsToCheck = [itemId, parentId, grandparentId].filter(
       (id): id is string => id !== undefined,
     );
-
-    const excludeNames = buildCollectionExcludeNames(ruleGroup);
 
     for (const collection of collections) {
       const children = await this.embyAdapter.getCollectionChildren(
@@ -906,27 +976,31 @@ export class EmbyGetterService {
       const hasMatch = children.some((child) => idsToCheck.includes(child.id));
 
       if (hasMatch) {
-        const collectionNameLower = collection.title.toLowerCase().trim();
-        if (!excludeNames.includes(collectionNameLower)) {
-          collectionNames.add(collection.title.trim());
-        }
+        collectionNames.push(collection.title);
       }
     }
 
-    return Array.from(collectionNames);
+    return Array.from(
+      new Set(filterRuleCollectionNames(collectionNames, ruleGroup)),
+    );
   }
 
   private async getCollectionSiblingsLastViewedAt(
     itemId: string,
     libraryId: string,
-    ruleGroup?: RulesDto,
+    ruleGroup?: RuleGroupDto,
   ): Promise<Date | null> {
     const collections = await this.embyAdapter.getCollections(libraryId);
-    const excludeNames = buildCollectionExcludeNames(ruleGroup);
+    const includedCollectionNames = new Set(
+      filterRuleCollectionNames(
+        collections.map((collection) => collection.title),
+        ruleGroup,
+      ),
+    );
 
     let latestMs = 0;
     for (const collection of collections) {
-      if (excludeNames.includes(collection.title.toLowerCase().trim())) {
+      if (!includedCollectionNames.has(collection.title.trim())) {
         continue;
       }
 

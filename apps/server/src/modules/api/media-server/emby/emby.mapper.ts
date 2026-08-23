@@ -13,6 +13,7 @@ import {
   type MediaUser,
   type WatchRecord,
 } from '@maintainerr/contracts';
+import { addProviderId, emptyProviderIds } from '../media-provider-ids.utils';
 import { EMBY_TICKS_PER_MS } from './emby.constants';
 import type {
   EmbyBaseItemDto,
@@ -71,24 +72,10 @@ export class EmbyMapper {
   static extractProviderIds(
     providerIds?: EmbyProviderIds | null,
   ): MediaProviderIds {
-    const result: MediaProviderIds = {
-      imdb: [],
-      tmdb: [],
-      tvdb: [],
-    };
+    const result = emptyProviderIds();
 
-    if (!providerIds) {
-      return result;
-    }
-
-    if (providerIds.Imdb) {
-      result.imdb.push(providerIds.Imdb);
-    }
-    if (providerIds.Tmdb) {
-      result.tmdb.push(providerIds.Tmdb);
-    }
-    if (providerIds.Tvdb) {
-      result.tvdb.push(providerIds.Tvdb);
+    for (const [provider, id] of Object.entries(providerIds ?? {})) {
+      addProviderId(result, provider, id);
     }
 
     return result;
@@ -175,6 +162,9 @@ export class EmbyMapper {
       parentIndex: item.ParentIndexNumber ?? undefined,
       collections: undefined,
       labels: item.Tags || undefined,
+      studios: item.Studios?.map((studio) => studio.Name ?? '').filter(
+        (studio) => studio.length > 0,
+      ),
     };
   }
 
@@ -236,7 +226,7 @@ export class EmbyMapper {
       updatedAt: extras.DateLastSaved
         ? new Date(extras.DateLastSaved)
         : undefined,
-      // Emby has no native smart collections — only manual BoxSets and the
+      // Emby has no native smart collections - only manual BoxSets and the
       // TheMovieDb-driven "Automatic Creation of Collections" (movie franchise
       // grouping, not filter rules). Always false, matching the Jellyfin mapper.
       smart: false,

@@ -17,6 +17,7 @@ export interface ICollection {
   overlayTemplateId?: number | null
   deleteAfterDays?: number
   listExclusions?: boolean
+  cleanupLeftoverFolders?: boolean
   forceSeerr?: boolean
   type: MediaItemType
   arrAction: number
@@ -30,8 +31,11 @@ export interface ICollection {
   tautulliWatchedPercentOverride?: number
   radarrSettingsId?: number
   sonarrSettingsId?: number
+  sportarrSettingsId?: number
   radarrQualityProfileId?: number
   sonarrQualityProfileId?: number
+  sportarrQualityProfileId?: number
+  tagInArr?: boolean
   sortTitle?: string
   mediaServerSort?: MediaServerCollectionSort | null
   totalSizeBytes?: number | null

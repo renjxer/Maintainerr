@@ -20,6 +20,7 @@ import { Exclusion } from '../rules/entities/exclusion.entities';
 import { RuleGroup } from '../rules/entities/rule-group.entities';
 import { Settings } from './entities/settings.entities';
 import { RuleMigrationService } from './rule-migration.service';
+import { TracearrApiService } from '../api/tracearr-api/tracearr-api.service';
 import { SettingsDataService } from './settings-data.service';
 
 interface MediaServerDataCounts {
@@ -55,6 +56,7 @@ export class MediaServerSwitchService {
     private readonly exclusionRepo: Repository<Exclusion>,
     private readonly connection: DataSource,
     private readonly ruleMigrationService: RuleMigrationService,
+    private readonly tracearrApi: TracearrApiService,
     private readonly logger: MaintainerrLogger,
   ) {
     logger.setContext(MediaServerSwitchService.name);
@@ -85,6 +87,8 @@ export class MediaServerSwitchService {
         generalSettings: true,
         radarrSettings: await this.settingsDataService.getRadarrSettingsCount(),
         sonarrSettings: await this.settingsDataService.getSonarrSettingsCount(),
+        sportarrSettings:
+          await this.settingsDataService.getSportarrSettingsCount(),
         seerrSettings: this.settingsDataService.seerrConfigured(),
         // Tautulli is Plex-specific and gets cleared when switching away from Plex
         tautulliSettings:
@@ -114,11 +118,27 @@ export class MediaServerSwitchService {
     }
     this.mediaServerSwitchState.setSwitching(true);
 
+    let response: SwitchMediaServerResponse;
     try {
-      return await this.executeSwitchInternal(request);
+      response = await this.executeSwitchInternal(request);
     } finally {
       this.mediaServerSwitchState.setSwitching(false);
     }
+
+    // Initialize the now-active media server adapter once the switch lock is
+    // released - getService() refuses while a switch is in progress, so this
+    // can't run inside executeSwitchInternal. When the target's credentials
+    // carried over (e.g. switching back to a still-configured server), this
+    // brings the adapter up immediately so its connection test reflects reality
+    // instead of reporting a false failure until the first operation lazily
+    // initializes it. No-ops gracefully when credentials aren't set yet (the
+    // switch-then-save flow), mirroring how updateSettings re-initializes after
+    // a settings save.
+    if (response.status === 'OK') {
+      await this.mediaServerFactory.initialize();
+    }
+
+    return response;
   }
 
   private async executeSwitchInternal(
@@ -209,6 +229,11 @@ export class MediaServerSwitchService {
 
       // Refresh in-memory settings and uninitialize old server after commit
       await this.settingsDataService.init();
+
+      // Clearing the stored binding is not enough: the resolved server is also
+      // held in memory, and reusing it would point the next run at the server
+      // the switch just moved away from.
+      this.tracearrApi.invalidateHistory();
 
       // Uninitialize old media server adapter
       this.uninitializeOldServer(currentServerType);
@@ -399,6 +424,11 @@ export class MediaServerSwitchService {
       updatedSettings.emby_user_id = null;
       updatedSettings.emby_server_name = null;
     }
+
+    // The Tracearr instance survives a switch, but its selected server does
+    // not: rating keys are per media server, so a stale binding silently
+    // matches nothing.
+    updatedSettings.tracearr_server_id = null;
 
     await queryRunner.manager.save(Settings, updatedSettings);
   }

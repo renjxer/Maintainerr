@@ -6,12 +6,14 @@ import * as fs from 'fs';
 import { cleanupOpenApiDoc } from 'nestjs-zod';
 import path from 'path';
 import { AppModule } from './app/app.module';
+import { resolveCorsOptions } from './app/config/cors';
 import { dataDir } from './app/config/dataDir';
 import { MaintainerrLogger } from './modules/logging/logs.service';
 import { installStdioPipeGuards } from './modules/logging/winston/stdioPipeGuard';
+import { isSharpAvailable, SHARP_UNAVAILABLE_MESSAGE } from './utils/sharp';
 
-// Pre-bootstrap guard so the console.warn/console.error calls below — and any
-// other write before LogsModule loads — cannot crash the process on a broken
+// Pre-bootstrap guard so the console.warn/console.error calls below - and any
+// other write before LogsModule loads - cannot crash the process on a broken
 // stdio pipe. The logging module re-installs these (idempotent) for
 // defence-in-depth.
 installStdioPipeGuards();
@@ -47,7 +49,17 @@ async function bootstrap() {
   SwaggerModule.setup('api/swagger', app, document);
 
   app.useLogger(await app.resolve(MaintainerrLogger));
-  app.enableCors({ origin: true });
+
+  const corsOptions = resolveCorsOptions();
+  if (corsOptions) {
+    app.enableCors(corsOptions);
+  }
+
+  if (!isSharpAvailable) {
+    const sharpLogger = await app.resolve(MaintainerrLogger);
+    sharpLogger.setContext('Sharp');
+    sharpLogger.warn(SHARP_UNAVAILABLE_MESSAGE);
+  }
 
   const apiPort = process.env.UI_PORT || 6246;
   const apiHostname = process.env.UI_HOSTNAME || '0.0.0.0';
@@ -64,7 +76,7 @@ function createDataDirectoryStructure() {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, {
         recursive: true,
-        mode: 0o777,
+        mode: 0o755,
       });
     }
 
@@ -73,7 +85,7 @@ function createDataDirectoryStructure() {
     for (const name of ['overlays/fonts', 'overlays/images']) {
       const overlayDir = path.join(dataDir, name);
       if (!fs.existsSync(overlayDir)) {
-        fs.mkdirSync(overlayDir, { recursive: true, mode: 0o777 });
+        fs.mkdirSync(overlayDir, { recursive: true, mode: 0o755 });
       }
     }
 

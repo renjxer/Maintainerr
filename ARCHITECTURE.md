@@ -25,6 +25,10 @@ Maintainerr/
 |-- docs/                    # Feature-level technical notes
 |-- docker/                  # Docker helper configuration
 |-- tools/                   # Release and maintenance scripts
+|   `-- dev/                 # Local dev mocks (fake Plex/Jellyfin) and DB seed
+|-- .codex/config.toml       # Codex project MCP server config
+|-- .mcp.json                # Claude Code project MCP server config
+|-- .vscode/mcp.json         # VS Code MCP server config mirror
 |-- Dockerfile               # Multi-stage production image
 |-- README.md                # Product overview and installation entry point
 |-- CONTRIBUTING.md          # Contributor setup and process
@@ -103,12 +107,15 @@ integrations, and production static serving.
   service data.
 - `src/modules/collections/` tracks matched media, exclusions, collection logs,
   posters, and collection handling actions.
-- `src/modules/actions/` contains the Radarr and Sonarr action handlers for
-  destructive or state-changing Servarr actions such as delete, unmonitor, and
-  quality profile changes.
+- `src/modules/actions/` contains the Radarr, Sonarr and Sportarr action handlers
+  for destructive or state-changing Servarr actions such as delete, unmonitor,
+  and quality profile changes, plus the opt-in leftover-folder cleanup - the one
+  place in the module that writes to the local filesystem.
 - `src/modules/tasks/` creates and tracks scheduled jobs.
 - `src/modules/events/` exposes server-sent events for rule and collection job
   progress.
+- `src/modules/version/` resolves the running build against GitHub, for the
+  version indicator and the update-available notification.
 - `src/modules/overlays/`, `src/modules/metadata/`,
   `src/modules/notifications/`, `src/modules/logging/`, and
   `src/modules/storage-metrics/` own their respective feature areas.
@@ -174,7 +181,14 @@ Important runtime environment variables include:
 - `BASE_PATH`: optional subdirectory mount path for both API and UI serving.
 - `GITHUB_TOKEN`: optional token for higher GitHub API rate limits.
 - `VERSION_TAG` and `GIT_SHA`: release metadata surfaced by the app.
+- `LOG_LEVEL`: optional process-local log level override; recognised values
+  take precedence over the saved setting without writing the database.
 - `DEBUG`: influences default log level during migration seeding.
+
+The server exposes health probes under `/api/health`: `/live` is process-only,
+`/ready` checks database readiness, and `/api/health` mirrors readiness. The
+Docker image runs `/opt/app/healthcheck.sh`, normalises `BASE_PATH`, and probes
+`/api/health/ready` on the local `UI_PORT`.
 
 ## Security Notes
 
@@ -218,6 +232,13 @@ Testing conventions:
   `apps/server/src`.
 - UI tests use Vitest and React Testing Library.
 - Contracts use TypeScript checks and package-level linting.
+- Project MCP server config lives in `.codex/config.toml`, `.mcp.json`, and
+  `.vscode/mcp.json`; keep them in sync. The GitHub MCP server is read-only,
+  and Playwright screenshots should be saved under `.playwright-mcp/`.
+- End-to-end checks of media-server-dependent flows use the dev mocks and DB
+  seed under `tools/dev/` (`fake-plex.mjs` / `fake-jellyfin.mjs` +
+  `seed-db.mjs`) to drive the UI with Playwright against deterministic data;
+  see `AGENTS.md` for the workflow.
 
 See `CONTRIBUTING.md` for setup, branching, and pull request expectations.
 
@@ -240,10 +261,17 @@ See `CONTRIBUTING.md` for setup, branching, and pull request expectations.
 
 ## Feature References
 
-- `docs/collection-poster.md` describes custom collection poster storage,
-  media-server support, and switch behaviour.
-- `docs/overlay-feature.md` describes overlay templates, rendering, storage,
-  scheduling, and provider integration.
+Feature documentation lives in the `Maintainerr_docs` repository and is published
+at <https://docs.maintainerr.info>. It is the single source of truth: describe a
+feature there, not here, so the two cannot drift. This repository documents
+architecture and intent only; for how the code works, read the code.
+
+- <https://docs.maintainerr.info/collections/> covers custom collection posters
+  and the per-collection opt-in post-delete folder cleanup, including which
+  \*arr actions strand a folder, the same-path mount requirement, and the
+  guardrails.
+- <https://docs.maintainerr.info/overlays/> covers overlay templates, settings,
+  and processing behaviour.
 - `README.md` describes product capabilities, installation, API compatibility,
   and supported services.
 
@@ -261,6 +289,6 @@ See `CONTRIBUTING.md` for setup, branching, and pull request expectations.
   shared code.
 - Rule group: A configured set of rules that selects media and links it to a
   Maintainerr collection.
-- Seerr: The request-management integration family covering Overseerr,
-  Jellyseerr, and Seerr-compatible APIs.
+- Seerr: The request-management integration (github.com/seerr-team/seerr) used
+  for request cleanup.
 - SSE: Server-sent events used for live rule and collection job updates.

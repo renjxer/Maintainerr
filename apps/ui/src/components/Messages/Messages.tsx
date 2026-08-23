@@ -9,6 +9,7 @@ import {
   RuleHandlerProgressedEventDto,
   RuleHandlerStartedEventDto,
 } from '@maintainerr/contracts'
+import { Trans } from '@lingui/react/macro'
 import { useRef, useState } from 'react'
 import { useEvent } from '../../contexts/events-context'
 import { getPercentValue } from '../../utils/formatBytes'
@@ -67,7 +68,7 @@ const Messages = () => {
 }
 
 const RuleHandlerMessages = () => {
-  const finishedTimer = useRef<NodeJS.Timeout>(undefined)
+  const finishedTimerRef = useRef<NodeJS.Timeout>(undefined)
   const [show, setShow] = useState<boolean>(false)
 
   const [event, setEvent] = useState<
@@ -81,7 +82,7 @@ const RuleHandlerMessages = () => {
     (event) => {
       setEvent(event)
       setShow(true)
-      clearTimeout(finishedTimer.current)
+      clearTimeout(finishedTimerRef.current)
     },
   )
 
@@ -90,7 +91,7 @@ const RuleHandlerMessages = () => {
     (event) => {
       setEvent(event)
       setShow(true)
-      clearTimeout(finishedTimer.current)
+      clearTimeout(finishedTimerRef.current)
     },
   )
 
@@ -99,9 +100,15 @@ const RuleHandlerMessages = () => {
     (event) => {
       setEvent(event)
       setShow(true)
-      finishedTimer.current = setTimeout(() => setShow(false), 5000)
+      finishedTimerRef.current = setTimeout(() => setShow(false), 5000)
     },
   )
+
+  // Named here so the extracted message reads "Processing: {ruleGroupName}".
+  const ruleGroupName =
+    event && isRuleHandlerProgressedEvent(event)
+      ? event.ruleGroupName
+      : undefined
 
   return (
     <Transition
@@ -124,7 +131,9 @@ const RuleHandlerMessages = () => {
           </div>
           {event && isStartedOrFinishedEvent(event) && <>{event.message}</>}
           {event && isRuleHandlerProgressedEvent(event) && (
-            <div>Processing: {event.ruleGroupName}</div>
+            <div>
+              <Trans>Processing: {ruleGroupName}</Trans>
+            </div>
           )}
         </div>
         {event && isRuleHandlerProgressedEvent(event) && (
@@ -147,7 +156,7 @@ const RuleHandlerMessages = () => {
 }
 
 const CollectionHandlerMessages = () => {
-  const finishedTimer = useRef<NodeJS.Timeout>(undefined)
+  const finishedTimerRef = useRef<NodeJS.Timeout>(undefined)
   const [show, setShow] = useState<boolean>(false)
 
   const [event, setEvent] = useState<
@@ -161,7 +170,7 @@ const CollectionHandlerMessages = () => {
     (event) => {
       setEvent(event)
       setShow(true)
-      clearTimeout(finishedTimer.current)
+      clearTimeout(finishedTimerRef.current)
     },
   )
 
@@ -170,7 +179,7 @@ const CollectionHandlerMessages = () => {
     (event) => {
       setEvent(event)
       setShow(true)
-      clearTimeout(finishedTimer.current)
+      clearTimeout(finishedTimerRef.current)
     },
   )
 
@@ -179,7 +188,7 @@ const CollectionHandlerMessages = () => {
     (event) => {
       setEvent(event)
       setShow(true)
-      finishedTimer.current = setTimeout(() => setShow(false), 5000)
+      finishedTimerRef.current = setTimeout(() => setShow(false), 5000)
     },
   )
 
@@ -187,6 +196,12 @@ const CollectionHandlerMessages = () => {
     !!event &&
     isCollectionHandlerProgressedEvent(event) &&
     event.totalMediaToHandle > 0
+
+  // Named here so the extracted message reads "Processing: {collectionName}".
+  const collectionName =
+    event && isCollectionHandlerProgressedEvent(event)
+      ? event.processingCollection?.name
+      : undefined
 
   return (
     <Transition
@@ -208,7 +223,9 @@ const CollectionHandlerMessages = () => {
         {event &&
           isCollectionHandlerProgressedEvent(event) &&
           event.processingCollection && (
-            <div>Processing: {event.processingCollection.name}</div>
+            <div>
+              <Trans>Processing: {collectionName}</Trans>
+            </div>
           )}
       </div>
       {showCollectionProgressBars && (

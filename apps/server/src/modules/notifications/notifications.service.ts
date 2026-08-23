@@ -11,15 +11,17 @@ import {
 } from '@nestjs/common';
 import { OnEvent } from '@nestjs/event-emitter';
 import { InjectRepository } from '@nestjs/typeorm';
-import _ from 'lodash';
+import { isEqual, sortBy } from 'lodash';
 import { DataSource, Repository } from 'typeorm';
 import { getErrorMessage } from '../../utils/connection-error';
 import { MediaServerFactory } from '../api/media-server/media-server.factory';
 import { IMediaServerService } from '../api/media-server/media-server.interface';
 import {
+  CollectionHandlerFailedDto,
   CollectionMediaAddedDto,
   CollectionMediaHandledDto,
   CollectionMediaRemovedDto,
+  NotificationMediaItem,
   OverlayAppliedDto,
   OverlayRevertedDto,
   RuleHandlerFailedDto,
@@ -78,6 +80,17 @@ export class NotificationService implements OnModuleInit {
   private batchActive = false;
   private readonly batchSeenKeys = new Set<string>();
 
+  // Collection handling acts on one item at a time, so every removal emits its
+  // own CollectionMedia_Removed - one webhook per item, which Discord answers
+  // with 429 and drops. Buffer them for the length of a handler run and send
+  // one notification per collection at the end. Rule runs already batch at the
+  // emitter, so they keep sending immediately.
+  private collectionRunActive = false;
+  private readonly collectionRunRemovals = new Map<
+    number,
+    CollectionMediaRemovedDto
+  >();
+
   constructor(
     @InjectRepository(Notification)
     private readonly notificationRepo: Repository<Notification>,
@@ -117,12 +130,13 @@ export class NotificationService implements OnModuleInit {
     return this.activeAgents;
   };
 
+  /** Returns each agent's outcome, so a caller can tell whether anyone took it. */
   public async sendNotification(
     type: NotificationType,
     payload: NotificationPayload,
     rulegroup?: RuleGroup,
-  ): Promise<void> {
-    await Promise.allSettled(
+  ): Promise<string[]> {
+    const results = await Promise.allSettled(
       this.activeAgents.map(async (agent) => {
         // if rulegroup is supplied, then only send the notification if configured
         if (
@@ -131,8 +145,14 @@ export class NotificationService implements OnModuleInit {
             (n) => n.id === agent.getNotification().id,
           )
         )
-          await this.sendNotificationToAgent(type, payload, agent);
+          return await this.sendNotificationToAgent(type, payload, agent);
+
+        return 'Agent is not connected to this rule group.';
       }),
+    );
+
+    return results.map((result) =>
+      result.status === 'fulfilled' ? result.value : 'Failure',
     );
   }
 
@@ -141,11 +161,23 @@ export class NotificationService implements OnModuleInit {
     payload: NotificationPayload,
     agent: NotificationAgent,
   ): Promise<string> {
-    if (agent.shouldSend()) {
-      if (agent.getSettings().types?.includes(type))
-        return await agent.send(type, payload);
+    if (this.canSend(type, agent)) {
+      return await agent.send(type, payload);
     }
     return Promise.resolve('Agent is not allowed to send this message.');
+  }
+
+  /**
+   * Whether any configured agent would actually deliver this type. Lets a
+   * producer skip work (and skip marking something as announced) when nobody
+   * is listening yet.
+   */
+  public hasSubscribers(type: NotificationType): boolean {
+    return this.activeAgents.some((agent) => this.canSend(type, agent));
+  }
+
+  private canSend(type: NotificationType, agent: NotificationAgent): boolean {
+    return agent.shouldSend() && !!agent.getSettings().types?.includes(type);
   }
 
   async addNotificationConfiguration(payload: {
@@ -250,20 +282,22 @@ export class NotificationService implements OnModuleInit {
     notificationId: number;
   }) {
     try {
-      const ruleGroup = await this.ruleGroupRepo.findOne({
-        where: { id: payload.rulegroupId },
-      });
+      if (payload.rulegroupId && payload.notificationId) {
+        const ruleGroup = await this.ruleGroupRepo.findOne({
+          where: { id: payload.rulegroupId },
+        });
 
-      const notificationConfig = await this.notificationRepo.findOne({
-        where: { id: payload.notificationId },
-      });
+        const notificationConfig = await this.notificationRepo.findOne({
+          where: { id: payload.notificationId },
+        });
 
-      if (ruleGroup && notificationConfig) {
-        ruleGroup.notifications = ruleGroup.notifications.filter(
-          (c) => c.id !== payload.notificationId,
-        );
-        await this.ruleGroupRepo.save(ruleGroup);
-        return { code: 1, result: 'success' };
+        if (ruleGroup && notificationConfig) {
+          ruleGroup.notifications = ruleGroup.notifications.filter(
+            (c) => c.id !== payload.notificationId,
+          );
+          await this.ruleGroupRepo.save(ruleGroup);
+          return { code: 1, result: 'success' };
+        }
       }
 
       return { code: 0, result: 'failed' };
@@ -330,18 +364,31 @@ export class NotificationService implements OnModuleInit {
   public async registerConfiguredAgents(skiplog = false) {
     const configuredAgents = await this.getNotificationConfigurations();
 
-    const isEqual = (a: Notification[], b: Notification[]) =>
-      _.isEqual(_.sortBy(a, 'id'), _.sortBy(b, 'id'));
+    const sameAgents = (a: Notification[], b: Notification[]) =>
+      isEqual(sortBy(a, 'id'), sortBy(b, 'id'));
 
     const notifications = this.activeAgents.map((e) => e.getNotification());
 
     // Only (re-)register agents when required
-    if (!isEqual(notifications, configuredAgents)) {
+    if (!sameAgents(notifications, configuredAgents)) {
       this.activeAgents = [];
 
-      const agents: NotificationAgent[] = configuredAgents?.map(
-        (notification) => this.createAgent(notification),
-      );
+      // A row whose agent key this build doesn't know (a downgrade after
+      // configuring a newer agent type) yields no agent. Drop it here rather
+      // than letting an undefined entry reach the send paths.
+      const agents: NotificationAgent[] = [];
+      for (const notification of configuredAgents ?? []) {
+        const agent = this.createAgent(notification);
+
+        if (!agent) {
+          this.logger.warn(
+            `Skipping notification configuration '${notification.name}': unknown agent '${notification.agent}'`,
+          );
+          continue;
+        }
+
+        agents.push(agent);
+      }
 
       this.registerAgents(agents, skiplog);
     }
@@ -679,7 +726,7 @@ export class NotificationService implements OnModuleInit {
 
   public async handleNotification(
     type: NotificationType,
-    mediaItems?: { mediaServerId: string }[],
+    mediaItems?: NotificationMediaItem[],
     collectionName?: string,
     dayAmount?: number,
     agent?: NotificationAgent,
@@ -708,7 +755,29 @@ export class NotificationService implements OnModuleInit {
     payload.extra.push({ name: 'dayAmount', value: dayAmount?.toString() });
     payload.extra.push({
       name: 'mediaItems',
-      value: JSON.stringify(mediaItems),
+      // The identity an external workflow needs, and nothing else from the
+      // snapshot: `requestedBy` to know who to ask before deletion, and
+      // `type`/`title`/`providerIds` to still identify the item once deletion
+      // has invalidated its media server id. `title` is the message's own
+      // rendering, so both name the item the same way. `providerIds` are the
+      // item's own: a season or episode carries season/episode-scoped ids (a
+      // TVDB season id, not the series one), so a consumer keying a show-level
+      // list off them has to resolve the series itself.
+      value: JSON.stringify(
+        mediaItems?.map((item) => ({
+          mediaServerId: item.mediaServerId,
+          ...(item.metadata
+            ? {
+                type: item.metadata.type,
+                title: this.getTitle(item.metadata),
+                providerIds: item.metadata.providerIds,
+              }
+            : {}),
+          ...(item.requestedBy?.length
+            ? { requestedBy: item.requestedBy }
+            : {}),
+        })),
+      ),
     });
 
     // get the rulegroup when available
@@ -741,6 +810,39 @@ export class NotificationService implements OnModuleInit {
     }
   }
 
+  /**
+   * Announces a newer Maintainerr release to every agent subscribed to the
+   * type. Separate from `handleNotification` because it substitutes versions
+   * rather than media, and carries no collection or day count to put in
+   * `extra`. Returns whether an agent accepted it.
+   */
+  public async handleUpdateAvailableNotification(
+    currentVersion: string,
+    newVersion: string,
+    releaseUrl?: string,
+  ): Promise<boolean> {
+    const type = NotificationType.UPDATE_AVAILABLE;
+    const { subject, message } = this.getContent(type, false);
+
+    const results = await this.sendNotification(type, {
+      subject,
+      message: message
+        .replace('{current_version}', currentVersion)
+        .replace('{new_version}', newVersion)
+        .replace(
+          '{release_notes}',
+          releaseUrl ? `\n\nRelease notes: ${releaseUrl}` : '',
+        ),
+      extra: [
+        { name: 'currentVersion', value: currentVersion },
+        { name: 'newVersion', value: newVersion },
+        ...(releaseUrl ? [{ name: 'releaseUrl', value: releaseUrl }] : []),
+      ],
+    });
+
+    return results.includes('Success');
+  }
+
   private getContent(
     type: NotificationType,
     multiple: boolean,
@@ -760,7 +862,7 @@ export class NotificationService implements OnModuleInit {
         case NotificationType.COLLECTION_HANDLING_FAILED:
           subject = 'Collection Handling Failed';
           message =
-            '⚠️ Oops! Something went wrong while processing your collections.';
+            "⚠️ Couldn't finish handling one or more items in '{collection_name}'. Check the Maintainerr logs for details.";
           break;
         case NotificationType.RULE_HANDLING_FAILED:
           subject = 'Rule Handling Failed';
@@ -770,7 +872,7 @@ export class NotificationService implements OnModuleInit {
         case NotificationType.MEDIA_ABOUT_TO_BE_HANDLED:
           subject = 'Media About to be Handled';
           message =
-            "⏰ Reminder: '{media_title}' will be handled in {days} days. If you want to keep it, make sure to take action before it's gone. Don’t miss out!";
+            "⏰ Reminder: '{media_title}'{requested_by} will be handled in {days} days. If you want to keep it, make sure to take action before it's gone. Don’t miss out!";
           break;
         case NotificationType.MEDIA_ADDED_TO_COLLECTION:
           subject = 'Media Added to Collection';
@@ -800,6 +902,14 @@ export class NotificationService implements OnModuleInit {
           subject = 'Overlay Reverted';
           message =
             "↩️ Overlay has been reverted for '{media_title}' in '{collection_name}'.";
+          break;
+        case NotificationType.UPDATE_AVAILABLE:
+          subject = 'Update Available';
+          // {release_notes} carries its own separator so the single replace
+          // always fires, collapsing to '' for a branch build that has no
+          // release page. A raw token can never reach a user.
+          message =
+            "📦 Maintainerr {new_version} is available. You're running {current_version}.{release_notes}\n\nHow to update: https://docs.maintainerr.info/installation/#updating";
           break;
       }
     } else {
@@ -855,93 +965,146 @@ export class NotificationService implements OnModuleInit {
 
   private async transformMessageContent(
     message: string,
-    items?: { mediaServerId: string }[],
+    items?: NotificationMediaItem[],
     collectionName?: string,
     dayAmount?: number,
   ): Promise<string> {
-    try {
-      const mediaServer = await this.getMediaServer();
-      if (items) {
-        if (items.length > 1) {
-          // if multiple items
-          const titles = [];
-          let numUnknownItems = 0;
+    // Collection name and day count are plain string substitutions that don't
+    // need the media server - resolve them up front so an unavailable media
+    // server (which only affects the media-title lookups below) can't leave
+    // their placeholders raw. Strip the collection clause entirely when there's
+    // no collection context (e.g. an infrastructure-level failure) so we never
+    // deliver a raw "{collection_name}" token.
+    message = collectionName
+      ? message.replace('{collection_name}', collectionName)
+      : message.replace(" in '{collection_name}'", '');
 
-          for (const i of items) {
-            const item = await mediaServer.getMetadata(i.mediaServerId);
-
-            if (item) {
-              titles.push(this.getTitle(item));
-            } else {
-              numUnknownItems++;
-            }
-          }
-
-          if (numUnknownItems > 0) {
-            titles.push(
-              `${numUnknownItems} item${
-                numUnknownItems > 1 ? 's' : ''
-              } that no longer exist${numUnknownItems > 1 ? '' : 's'} in the media server`,
-            );
-          }
-
-          const result = titles
-            .map((name) => `* ${name.charAt(0).toUpperCase() + name.slice(1)}`)
-            .join(' \n');
-
-          message = message.replace('{media_items}', result);
-        } else {
-          // if 1 item
-          const item = await mediaServer.getMetadata(items[0].mediaServerId);
-          message = message.replace(
-            '{media_title}',
-            item
-              ? this.getTitle(item)
-              : '1 item that no longer exists in the media server',
-          );
-        }
-      }
-
-      message = collectionName
-        ? message.replace('{collection_name}', collectionName)
+    message =
+      dayAmount && dayAmount > 0
+        ? message.replace('{days}', dayAmount.toString())
         : message;
 
-      message =
-        dayAmount && dayAmount > 0
-          ? message.replace('{days}', dayAmount.toString())
-          : message;
+    if (!items) {
+      return this.applyRequestedBy(message);
+    }
+
+    try {
+      const mediaServer = await this.getMediaServer();
+      if (items.length > 1) {
+        // if multiple items
+        const titles = [];
+        let numUnknownItems = 0;
+
+        for (const i of items) {
+          // Prefer the snapshot captured before handling; a handled item is
+          // often already gone from the media server, so a live lookup would
+          // come back empty (#3249).
+          const item =
+            i.metadata ?? (await mediaServer.getMetadata(i.mediaServerId));
+
+          if (item) {
+            // Per line, not per message: a batch can mix requesters.
+            titles.push(`${this.getTitle(item)}${this.formatRequestedBy(i)}`);
+          } else {
+            numUnknownItems++;
+          }
+        }
+
+        if (numUnknownItems > 0) {
+          titles.push(
+            `${numUnknownItems} item${
+              numUnknownItems > 1 ? 's' : ''
+            } that no longer exist${numUnknownItems > 1 ? '' : 's'} in the media server`,
+          );
+        }
+
+        const result = titles
+          .map((name) => `* ${name.charAt(0).toUpperCase() + name.slice(1)}`)
+          .join(' \n');
+
+        message = message.replace('{media_items}', result);
+        message = this.applyRequestedBy(message);
+      } else {
+        // if 1 item
+        const item =
+          items[0].metadata ??
+          (await mediaServer.getMetadata(items[0].mediaServerId));
+        message = message.replace(
+          '{media_title}',
+          item
+            ? this.getTitle(item)
+            : '1 item that no longer exists in the media server',
+        );
+        message = this.applyRequestedBy(message, items[0]);
+      }
 
       return message;
     } catch (error) {
       if (error instanceof ServiceUnavailableException) {
         // Media server in transition (switched but not yet configured, or
         // mid-switch). Leave the message untransformed; downstream handlers
-        // will still see the raw template.
+        // will still see the raw template. The requester came from Seerr, so it
+        // still resolves.
         this.logger.debug(
           'Skipping notification message transformation; media server not ready',
         );
         this.logger.debug(error);
-        return message;
+        return this.applyRequestedBy(
+          message,
+          items.length === 1 ? items[0] : undefined,
+        );
       }
       this.logger.error("Couldn't transform notification message");
       this.logger.debug(error);
     }
   }
 
+  /**
+   * The `{requested_by}` placeholder carries its own punctuation so this single
+   * replace always fires, collapsing to '' when nobody requested the item. A
+   * raw token can therefore never reach a user.
+   */
+  private applyRequestedBy(
+    message: string,
+    item?: NotificationMediaItem,
+  ): string {
+    return message.replace('{requested_by}', this.formatRequestedBy(item));
+  }
+
+  private formatRequestedBy(item?: NotificationMediaItem): string {
+    return item?.requestedBy?.length
+      ? ` (requested by ${item.requestedBy.join(', ')})`
+      : '';
+  }
+
   private getTitle(item: MediaItem): string {
     // Branch on the server-agnostic item type, not on parentId/grandparentId
     // presence. Plex leaves a movie's parent empty, but Emby/Jellyfin set
-    // parentId to the containing library folder — so keying off parentId
+    // parentId to the containing library folder - so keying off parentId
     // misclassified Emby movies as seasons and rendered them as
     // "undefined - season undefined".
     switch (item.type) {
       case 'episode':
-        return `${item.grandparentTitle} - season ${item.parentIndex} - episode ${item.index}`;
+        return item.parentIndex != null && item.index != null
+          ? `${item.grandparentTitle} - season ${item.parentIndex} - episode ${item.index}`
+          : this.underShow(item.grandparentTitle, item.title);
       case 'season':
-        return `${item.parentTitle} - season ${item.index}`;
+        return item.index != null
+          ? `${item.parentTitle} - season ${item.index}`
+          : this.underShow(item.parentTitle, item.title);
       default:
         return item.title;
     }
+  }
+
+  /**
+   * A library can leave the season/episode number unset - Jellyfin files those
+   * under a "Season Unknown" container - so name the item itself rather than
+   * render "season undefined". A sports or PVR library tends to name the
+   * episode after the show already, so don't repeat the show in that case.
+   */
+  private underShow(show: string | undefined, title: string): string {
+    return show && !title.startsWith(show) ? `${show} - ${title}` : title;
   }
 
   // OnEvent handlers
@@ -959,15 +1122,22 @@ export class NotificationService implements OnModuleInit {
   }
 
   @OnEvent(MaintainerrEvent.CollectionHandler_Failed)
-  private async collectionHandlerFailed() {
-    await this.handleNotification(NotificationType.COLLECTION_HANDLING_FAILED);
+  private async collectionHandlerFailed(data?: CollectionHandlerFailedDto) {
+    await this.handleNotification(
+      NotificationType.COLLECTION_HANDLING_FAILED,
+      undefined,
+      data?.collectionName,
+      undefined,
+      undefined,
+      data?.identifier,
+    );
   }
 
   @OnEvent(MaintainerrEvent.RuleHandlerQueue_StatusUpdated)
   private ruleQueueStatusChanged(event: RuleHandlerQueueStatusUpdatedEventDto) {
     const nowActive = !!event.data?.processingQueue;
     if (nowActive === this.batchActive) {
-      // Mid-batch progress update — nothing to do.
+      // Mid-batch progress update - nothing to do.
       return;
     }
     // Reset on every transition (in either direction). Clearing on the
@@ -997,6 +1167,31 @@ export class NotificationService implements OnModuleInit {
 
   @OnEvent(MaintainerrEvent.CollectionMedia_Removed)
   private async collectionMediaRemoved(data: CollectionMediaRemovedDto) {
+    if (this.collectionRunActive) {
+      // Appending is enough: an item can only be removed once, so the same id
+      // cannot arrive twice in one run.
+      const buffered = this.collectionRunRemovals.get(data.collectionId);
+      if (buffered) {
+        buffered.mediaItems.push(...data.mediaItems);
+      } else {
+        this.collectionRunRemovals.set(
+          data.collectionId,
+          new CollectionMediaRemovedDto(
+            [...data.mediaItems],
+            data.collectionName,
+            data.identifier,
+            data.collectionId,
+            data.dayAmount,
+          ),
+        );
+      }
+      return;
+    }
+
+    await this.notifyCollectionMediaRemoved(data);
+  }
+
+  private async notifyCollectionMediaRemoved(data: CollectionMediaRemovedDto) {
     const filteredMediaItems = this.dedupeBatchMediaItems(
       MaintainerrEvent.CollectionMedia_Removed,
       data.collectionName,
@@ -1012,6 +1207,23 @@ export class NotificationService implements OnModuleInit {
       undefined,
       data.identifier,
     );
+  }
+
+  @OnEvent(MaintainerrEvent.CollectionHandler_Started)
+  private collectionHandlerStarted() {
+    this.collectionRunRemovals.clear();
+    this.collectionRunActive = true;
+  }
+
+  @OnEvent(MaintainerrEvent.CollectionHandler_Finished)
+  private async collectionHandlerFinished() {
+    this.collectionRunActive = false;
+    const buffered = [...this.collectionRunRemovals.values()];
+    this.collectionRunRemovals.clear();
+
+    for (const data of buffered) {
+      await this.notifyCollectionMediaRemoved(data);
+    }
   }
 
   /**

@@ -1,4 +1,7 @@
-import { AxiosError } from 'axios';
+// isAxiosError, not `instanceof AxiosError`: errors raised inside ESM-only
+// SDKs (e.g. @jellyfin/sdk) come from a second axios module instance, so an
+// instanceof check against this CommonJS build never matches them.
+import { isAxiosError } from 'axios';
 import type { MaintainerrLogger } from '../modules/logging/logs.service';
 
 export const CONNECTION_TEST_TIMEOUT_MS = 5000;
@@ -35,7 +38,8 @@ const normalizeMessageText = (message?: string): string | undefined => {
   if (
     lower.includes('timeout') ||
     lower.includes('aborted') ||
-    lower.includes('econnaborted')
+    lower.includes('econnaborted') ||
+    lower.includes('etimedout')
   ) {
     return `Connection timed out after ${CONNECTION_TEST_TIMEOUT_MS / 1000} seconds. Verify URL and network reachability.`;
   }
@@ -47,7 +51,7 @@ export const formatConnectionFailureMessage = (
   error: unknown,
   fallbackMessage: string,
 ): string => {
-  if (error instanceof AxiosError) {
+  if (isAxiosError(error)) {
     if (error.response?.status === 401 || error.response?.status === 403) {
       return 'Invalid API key';
     }
@@ -56,8 +60,14 @@ export const formatConnectionFailureMessage = (
       return `Connection failed: received response ${error.response.status} ${error.response.statusText}.`;
     }
 
+    // Network-level failure (no HTTP response). Classify from the error code as
+    // well as the message: Node surfaces ECONNREFUSED/ENOTFOUND for a dual-stack
+    // host (e.g. localhost) as an AggregateError whose `message` is empty, so
+    // the message alone would miss them and fall through to the generic text.
     const normalizedAxiosMessage = normalizeMessageText(
-      error.code === 'ECONNABORTED' ? 'timeout' : error.message,
+      error.code === 'ECONNABORTED'
+        ? 'timeout'
+        : [error.code, error.message].filter(Boolean).join(' '),
     );
     if (normalizedAxiosMessage) {
       return normalizedAxiosMessage;

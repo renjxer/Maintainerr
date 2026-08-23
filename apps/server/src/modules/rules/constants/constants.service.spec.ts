@@ -1,4 +1,8 @@
-import { Application, MediaType } from '@maintainerr/contracts';
+import {
+  Application,
+  MediaServerType,
+  MediaType,
+} from '@maintainerr/contracts';
 import { RuleConstanstService } from './constants.service';
 import { RuleConstants, RuleType } from './rules.constants';
 
@@ -81,4 +85,133 @@ describe('RuleConstanstService', () => {
       'Value unavailable',
     );
   });
+
+  // A getter answering `undefined` never established the value. Reporting that
+  // as "has no entries" sent users hunting for missing data instead of a failed
+  // lookup (#3395).
+  it('separates a failed lookup from a confirmed empty value', () => {
+    expect(
+      service.getValueNullReason([Application.PLEX, 5], undefined, {
+        lookupFailed: true,
+      }),
+    ).toBe('Plex Collection titles could not be read for this item');
+  });
+
+  describe('naming a value after the server it was read from', () => {
+    // The getter routes every media-server app to the configured server and
+    // looks the property id up there, so a rule left unmigrated after a server
+    // switch reads a different property than the one it stores. Property ids
+    // do not line up across servers, so the label has to follow the value.
+    beforeEach(() => {
+      service.ruleConstants = {
+        applications: [
+          {
+            id: Application.PLEX,
+            name: 'Plex',
+            mediaType: MediaType.BOTH,
+            props: [
+              {
+                id: 39,
+                name: 'collectionsIncludingSmart',
+                humanName: 'Present in amount of other collections',
+                mediaType: MediaType.BOTH,
+                type: RuleType.NUMBER,
+              },
+            ],
+          },
+          {
+            id: Application.JELLYFIN,
+            name: 'Jellyfin',
+            mediaType: MediaType.BOTH,
+            props: [
+              {
+                id: 39,
+                name: 'favoritedBy',
+                humanName: '[list] Favorited by (username)',
+                mediaType: MediaType.BOTH,
+                type: RuleType.TEXT_LIST,
+              },
+            ],
+          },
+        ],
+      } as RuleConstants;
+    });
+
+    it('names a media-server value after the configured server, not the stored app', () => {
+      expect(
+        service.getValueHumanName(
+          [Application.PLEX, 39],
+          MediaServerType.JELLYFIN,
+        ),
+      ).toBe('Jellyfin - [list] Favorited by (username)');
+    });
+
+    it('explains a missing value with the configured server property too', () => {
+      expect(
+        service.getValueNullReason(
+          [Application.PLEX, 39],
+          MediaServerType.JELLYFIN,
+        ),
+      ).toBe('Jellyfin Favorited by (username) has no entries for this item');
+    });
+
+    it('leaves the stored app alone when it already matches the server', () => {
+      expect(
+        service.getValueHumanName([Application.PLEX, 39], MediaServerType.PLEX),
+      ).toBe('Plex - Present in amount of other collections');
+    });
+
+    it('leaves the stored app alone when the server is unknown', () => {
+      expect(service.getValueHumanName([Application.PLEX, 39])).toBe(
+        'Plex - Present in amount of other collections',
+      );
+    });
+  });
+
+  describe('getCustomValueFromIdentifier', () => {
+    // The encoder emits the RuleType humanName, so a TEXT_LIST custom value
+    // serialises as "text list" (with a space). The decoder must still resolve
+    // it; otherwise the whole YAML import throws. Regression for the spaced key.
+    it('resolves a spaced "text list" type to TEXT_LIST without throwing', () => {
+      expect(
+        service.getCustomValueFromIdentifier({
+          type: 'text list',
+          value: 'a,b',
+        }),
+      ).toEqual({ ruleTypeId: 4, value: 'a,b' });
+    });
+
+    it('resolves single-word custom value types', () => {
+      expect(
+        service.getCustomValueFromIdentifier({
+          type: 'date',
+          value: '2026-01-01',
+        }),
+      ).toEqual({ ruleTypeId: 1, value: '2026-01-01' });
+      expect(
+        service.getCustomValueFromIdentifier({ type: 'number', value: '5' }),
+      ).toEqual({ ruleTypeId: 0, value: '5' });
+    });
+  });
+});
+
+describe('RuleConstanstService with the real rule constants', () => {
+  // Uses the constructor-built RuleConstants so these round-trips break if the
+  // shared studios property (id 46) is removed or renamed on any server.
+  const service = new RuleConstanstService();
+
+  it.each([
+    [Application.PLEX, 'Plex.studios'],
+    [Application.JELLYFIN, 'Jellyfin.studios'],
+    [Application.EMBY, 'Emby.studios'],
+  ])(
+    'round-trips the studios identifier for application %i',
+    (application, identifier) => {
+      expect(service.getValueIdentifier([application, 46])).toBe(identifier);
+      expect(service.getValueFromIdentifier(identifier)).toEqual([
+        application,
+        46,
+      ]);
+    },
+  );
 });

@@ -1,5 +1,7 @@
 import {
   BasicResponseDto,
+  CronSchedule,
+  cronScheduleSchema,
   EmbyLoginRequest,
   embyLoginRequestSchema,
   EmbySetting,
@@ -9,16 +11,29 @@ import {
   MediaServerSwitchPreview,
   MediaServerType,
   MetadataProviderPreference,
+  DownloadClientSetting,
+  downloadClientSettingSchema,
   MetadataProviderSetting,
   metadataProviderSettingSchema,
+  PlexAuthToken,
+  plexAuthTokenSchema,
   RadarrSetting,
   radarrSettingSchema,
   SeerrSetting,
   seerrSettingSchema,
+  SettingsUpdate,
+  settingsUpdateSchema,
   SonarrSetting,
   sonarrSettingSchema,
+  SportarrSetting,
+  sportarrSettingSchema,
   StreamystatsSetting,
   streamystatsSettingSchema,
+  TracearrConnection,
+  TracearrSetting,
+  TracearrSettingForm,
+  tracearrConnectionSchema,
+  tracearrSettingSchema,
   SwitchMediaServerRequest,
   SwitchMediaServerResponse,
   switchMediaServerSchema,
@@ -35,6 +50,7 @@ import {
   Body,
   Controller,
   Delete,
+  BadGatewayException,
   ForbiddenException,
   Get,
   Header,
@@ -51,9 +67,6 @@ import { ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { Response } from 'express';
 import { ZodValidationPipe } from 'nestjs-zod';
 import { DatabaseDownloadService } from './database-download.service';
-import { CronScheduleDto } from "./dto's/cron.schedule.dto";
-import { SettingDto } from "./dto's/setting.dto";
-import { UpdateSettingDto } from "./dto's/update-setting.dto";
 import { Settings } from './entities/settings.entities';
 import { MediaServerSwitchService } from './media-server-switch.service';
 import { MetadataProvider } from './metadata-provider';
@@ -83,6 +96,11 @@ export class SettingsController {
   @Get('/sonarr')
   getSonarrSettings() {
     return this.settingsOperationsService.getSonarrSettings();
+  }
+
+  @Get('/sportarr')
+  getSportarrSettings() {
+    return this.settingsOperationsService.getSportarrSettings();
   }
   @Get('/version')
   getVersion() {
@@ -115,15 +133,24 @@ export class SettingsController {
     return this.settingsOperationsService.deletePlexApiAuth();
   }
   @Post()
-  updateSettings(@Body() payload: SettingDto) {
+  updateSettings(
+    @Body(new ZodValidationPipe(settingsUpdateSchema))
+    payload: SettingsUpdate,
+  ) {
     return this.settingsOperationsService.updateSettings(payload);
   }
   @Patch()
-  patchSettings(@Body() payload: UpdateSettingDto) {
+  patchSettings(
+    @Body(new ZodValidationPipe(settingsUpdateSchema))
+    payload: SettingsUpdate,
+  ) {
     return this.settingsOperationsService.patchSettings(payload);
   }
   @Post('/plex/token')
-  updateAuthToken(@Body() payload: { plex_auth_token: string }) {
+  updateAuthToken(
+    @Body(new ZodValidationPipe(plexAuthTokenSchema))
+    payload: PlexAuthToken,
+  ) {
     return this.settingsOperationsService.savePlexApiAuthToken(
       payload.plex_auth_token,
     );
@@ -188,6 +215,34 @@ export class SettingsController {
     payload: SonarrSetting,
   ) {
     return await this.settingsOperationsService.updateSonarrSetting({
+      id,
+      ...payload,
+    });
+  }
+
+  @Post('/test/sportarr')
+  testSportarr(
+    @Body(new ZodValidationPipe(sportarrSettingSchema))
+    payload: SportarrSetting,
+  ) {
+    return this.settingsOperationsService.testSportarr(payload);
+  }
+
+  @Post('/sportarr')
+  async addSportarrSetting(
+    @Body(new ZodValidationPipe(sportarrSettingSchema))
+    payload: SportarrSetting,
+  ) {
+    return await this.settingsOperationsService.addSportarrSetting(payload);
+  }
+
+  @Put('/sportarr/:id')
+  async updateSportarrSetting(
+    @Param('id', new ParseIntPipe()) id: number,
+    @Body(new ZodValidationPipe(sportarrSettingSchema))
+    payload: SportarrSetting,
+  ) {
+    return await this.settingsOperationsService.updateSportarrSetting({
       id,
       ...payload,
     });
@@ -269,6 +324,102 @@ export class SettingsController {
   ): Promise<BasicResponseDto> {
     this.assertJellyfinActive();
     return this.settingsOperationsService.testStreamystats(payload);
+  }
+
+  @Get('/tracearr')
+  async getTracearrSetting(): Promise<TracearrSettingForm | BasicResponseDto> {
+    const settings = await this.settingsOperationsService.getSettings();
+
+    if (!(settings instanceof Settings)) {
+      return settings;
+    }
+
+    return {
+      url: settings.tracearr_url,
+      api_key: settings.tracearr_api_key,
+      server_id: settings.tracearr_server_id,
+    };
+  }
+
+  @Post('/tracearr')
+  async updateTracearrSetting(
+    @Body(new ZodValidationPipe(tracearrSettingSchema))
+    payload: TracearrSetting,
+  ) {
+    return await this.settingsOperationsService.updateTracearrSetting(payload);
+  }
+
+  @Delete('/tracearr')
+  async removeTracearrSetting() {
+    return await this.settingsOperationsService.removeTracearrSetting();
+  }
+
+  @Post('/tracearr/servers')
+  async getTracearrServers(
+    @Body(new ZodValidationPipe(tracearrConnectionSchema))
+    payload: TracearrConnection,
+  ) {
+    const servers =
+      await this.settingsOperationsService.getTracearrServers(payload);
+
+    if (!servers) {
+      throw new BadGatewayException(
+        'Could not load Tracearr servers. Verify URL and API key.',
+      );
+    }
+
+    return servers;
+  }
+
+  @Post('/test/tracearr')
+  testTracearr(
+    @Body(new ZodValidationPipe(tracearrSettingSchema))
+    payload: TracearrSetting,
+  ): Promise<BasicResponseDto> {
+    return this.settingsOperationsService.testTracearr(payload);
+  }
+
+  @Get('/download-client')
+  async getDownloadClientSetting(): Promise<
+    DownloadClientSetting | BasicResponseDto
+  > {
+    const settings = await this.settingsOperationsService.getSettings();
+
+    if (!(settings instanceof Settings)) {
+      return settings;
+    }
+
+    return {
+      download_client_url: settings.download_client_url ?? '',
+      download_client_username: settings.download_client_username ?? '',
+      download_client_password: settings.download_client_password ?? '',
+      download_client_delete_data: settings.download_client_delete_data ?? true,
+      download_client_fallback_ratio:
+        settings.download_client_fallback_ratio ?? 0.5,
+    };
+  }
+
+  @Post('/download-client')
+  async updateDownloadClientSetting(
+    @Body(new ZodValidationPipe(downloadClientSettingSchema))
+    payload: DownloadClientSetting,
+  ) {
+    return await this.settingsOperationsService.updateDownloadClientSetting(
+      payload,
+    );
+  }
+
+  @Delete('/download-client')
+  async removeDownloadClientSetting() {
+    return await this.settingsOperationsService.removeDownloadClientSetting();
+  }
+
+  @Post('/test/download-client')
+  testDownloadClient(
+    @Body(new ZodValidationPipe(downloadClientSettingSchema))
+    payload: DownloadClientSetting,
+  ): Promise<BasicResponseDto> {
+    return this.settingsOperationsService.testDownloadClient(payload);
   }
 
   private assertJellyfinActive(): void {
@@ -384,7 +535,7 @@ export class SettingsController {
     return this.metadataSettingsService.refreshMetadataCache(provider);
   }
 
-  // Unified Seerr endpoints (replaces both Overseerr and Jellyseerr)
+  // Unified Seerr settings endpoints (legacy aliases kept for backward compatibility)
   @Get(['/seerr', '/overseerr', '/jellyseerr'])
   async getSeerrSetting(): Promise<SeerrSetting | BasicResponseDto> {
     const settings = await this.settingsOperationsService.getSettings();
@@ -517,6 +668,11 @@ export class SettingsController {
     return await this.settingsOperationsService.deleteSonarrSetting(id);
   }
 
+  @Delete('/sportarr/:id')
+  async deleteSportarrSetting(@Param('id', new ParseIntPipe()) id: number) {
+    return await this.settingsOperationsService.deleteSportarrSetting(id);
+  }
+
   @Get('/test/plex')
   @ApiOperation({ summary: 'Test Plex server connectivity' })
   @ApiResponse({ status: 200, description: 'Plex connectivity test result' })
@@ -540,7 +696,9 @@ export class SettingsController {
   }
 
   @Post('/cron/validate')
-  validateSingleCron(@Body() payload: CronScheduleDto) {
+  validateSingleCron(
+    @Body(new ZodValidationPipe(cronScheduleSchema)) payload: CronSchedule,
+  ) {
     return this.settingsOperationsService.cronIsValid(payload.schedule)
       ? { status: 'OK', code: 1, message: 'Success' }
       : { status: 'NOK', code: 0, message: 'Failure' };

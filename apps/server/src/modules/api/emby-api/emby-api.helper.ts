@@ -1,4 +1,6 @@
+import { stripTrailingSlashes } from '@maintainerr/contracts';
 import axios, { type AxiosInstance } from 'axios';
+import { applyHttpRetry } from '../lib/httpRetry';
 
 interface EmbyApiOptions {
   url: string;
@@ -25,8 +27,9 @@ export class EmbyApi {
   readonly axios: AxiosInstance;
 
   constructor(options: EmbyApiOptions) {
-    let baseURL = options.url;
-    while (baseURL.endsWith('/')) baseURL = baseURL.slice(0, -1);
+    // Rows saved before the schema stripped trailing slashes (#3422) can
+    // still hold one, and Emby 404s routes reached through a double slash.
+    const baseURL = stripTrailingSlashes(options.url);
 
     const headers: Record<string, string> = {
       Accept: 'application/json',
@@ -43,5 +46,9 @@ export class EmbyApi {
       timeout: options.timeout ?? 30000,
       headers,
     });
+
+    // Retry transient failures with exponential backoff, like every other
+    // outbound client.
+    applyHttpRetry(this.axios);
   }
 }

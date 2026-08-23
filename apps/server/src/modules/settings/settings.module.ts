@@ -3,10 +3,12 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { InternalApiModule } from '../api/internal-api/internal-api.module';
 import { MediaServerModule } from '../api/media-server/media-server.module';
 import { SeerrApiModule } from '../api/seerr-api/seerr-api.module';
+import { DownloadClientApiModule } from '../api/download-client-api/download-client-api.module';
 import { PlexApiModule } from '../api/plex-api/plex-api.module';
 import { ServarrApiModule } from '../api/servarr-api/servarr-api.module';
 import { StreamystatsApiModule } from '../api/streamystats-api/streamystats-api.module';
 import { TautulliApiModule } from '../api/tautulli-api/tautulli-api.module';
+import { TracearrApiModule } from '../api/tracearr-api/tracearr-api.module';
 import { TmdbApiModule } from '../api/tmdb-api/tmdb.module';
 import { TvdbApiModule } from '../api/tvdb-api/tvdb.module';
 import { Collection } from '../collections/entities/collection.entities';
@@ -19,6 +21,7 @@ import { DatabaseDownloadService } from './database-download.service';
 import { RadarrSettings } from './entities/radarr_settings.entities';
 import { Settings } from './entities/settings.entities';
 import { SonarrSettings } from './entities/sonarr_settings.entities';
+import { SportarrSettings } from './entities/sportarr_settings.entities';
 import { MediaServerSwitchService } from './media-server-switch.service';
 import { MetadataSettingsService } from './metadata-settings.service';
 import { RuleMigrationService } from './rule-migration.service';
@@ -35,6 +38,8 @@ import { SettingsDataService } from './settings-data.service';
     SeerrApiModule,
     TautulliApiModule,
     StreamystatsApiModule,
+    TracearrApiModule,
+    DownloadClientApiModule,
     TmdbApiModule,
     TvdbApiModule,
     InternalApiModule,
@@ -42,6 +47,7 @@ import { SettingsDataService } from './settings-data.service';
       Settings,
       RadarrSettings,
       SonarrSettings,
+      SportarrSettings,
       Collection,
       CollectionMedia,
       CollectionLog,

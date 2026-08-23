@@ -9,12 +9,12 @@ import {
 export { Application, MediaType, RuleOperators, RulePossibility };
 
 // How many media items a rule is evaluated against concurrently. Each item's
-// operand lookup can hit an external service (Plex, Tautulli, Sonarr, …) with
-// no bulk equivalent — most expensively Plex watch history, which has no bulk
-// endpoint (see feature #2936). Resolving a bounded number of items in parallel
-// turns a long sequential chain of round-trips into batches. This is the single
-// global cap on concurrent operand lookups (batching happens only here, never
-// nested inside the getters).
+// operand lookup can hit an external service (Plex, Tautulli, Sonarr, …). Plex
+// leaf watch history now has a batch-scoped prefetch, but show/season rollups
+// and other integrations still fall back to per-item calls. Resolving a bounded
+// number of items in parallel turns a long sequential chain of round-trips into
+// batches. This is the single global cap on concurrent operand lookups (batching
+// happens only here, never nested inside the getters).
 //
 // Deliberately conservative: the binding constraint is the slowest co-located
 // backend, not the host's core count. On an all-in-one box (e.g. Tautulli's
@@ -259,6 +259,14 @@ export class RuleConstants {
           showType: ['show', 'season'],
         },
         {
+          id: 45,
+          name: 'sw_markedWatchedEpisodes',
+          humanName: 'Amount of episodes marked as watched',
+          mediaType: MediaType.SHOW,
+          type: RuleType.NUMBER,
+          showType: ['show', 'season'],
+        },
+        {
           id: 16,
           name: 'sw_lastEpisodeAddedAt',
           humanName: 'Last episode added at',
@@ -495,6 +503,20 @@ export class RuleConstants {
           type: RuleType.DATE,
           cacheReset: true,
         },
+        {
+          id: 46,
+          name: 'studios',
+          humanName: '[list] Studios',
+          mediaType: MediaType.BOTH,
+          type: RuleType.TEXT_LIST,
+        },
+        {
+          id: 47,
+          name: 'lastPlayedAt',
+          humanName: 'Last play date (including unfinished)',
+          mediaType: MediaType.BOTH,
+          type: RuleType.DATE,
+        },
       ],
     },
     {
@@ -668,6 +690,20 @@ export class RuleConstants {
           id: 24,
           name: 'diskspace_total_gb',
           humanName: 'Total disk space (GB)',
+          mediaType: MediaType.MOVIE,
+          type: RuleType.NUMBER,
+        },
+        {
+          id: 25,
+          name: 'movieTitle',
+          humanName: 'Movie title',
+          mediaType: MediaType.MOVIE,
+          type: RuleType.TEXT,
+        },
+        {
+          id: 26,
+          name: 'movieId',
+          humanName: 'Movie ID',
           mediaType: MediaType.MOVIE,
           type: RuleType.NUMBER,
         },
@@ -921,6 +957,163 @@ export class RuleConstants {
           type: RuleType.NUMBER,
           showType: ['show', 'season', 'episode'],
         },
+        {
+          id: 32,
+          name: 'episodeFileRank',
+          humanName: 'Episode position by air date (1 = latest)',
+          mediaType: MediaType.SHOW,
+          type: RuleType.NUMBER,
+          showType: ['episode'],
+        },
+        {
+          id: 33,
+          name: 'seriesTitle',
+          humanName: 'Series title',
+          mediaType: MediaType.SHOW,
+          type: RuleType.TEXT,
+          showType: ['show', 'season', 'episode'],
+        },
+        {
+          id: 34,
+          name: 'seriesId',
+          humanName: 'Series ID',
+          mediaType: MediaType.SHOW,
+          type: RuleType.NUMBER,
+          showType: ['show', 'season', 'episode'],
+        },
+        {
+          id: 35,
+          name: 'seasonFileRank',
+          humanName: 'Season position by air date (1 = latest)',
+          mediaType: MediaType.SHOW,
+          type: RuleType.NUMBER,
+          showType: ['season'],
+        },
+      ],
+    },
+    {
+      id: Application.SPORTARR,
+      name: 'Sportarr',
+      mediaType: MediaType.SHOW,
+      props: [
+        {
+          id: 0,
+          name: 'addDate',
+          humanName: 'Date added',
+          mediaType: MediaType.SHOW,
+          type: RuleType.DATE,
+          showType: ['show'],
+        },
+        {
+          id: 1,
+          name: 'monitored',
+          humanName: 'Is monitored',
+          mediaType: MediaType.SHOW,
+          type: RuleType.BOOL,
+          showType: ['show', 'season', 'episode'],
+        },
+        {
+          id: 2,
+          name: 'sport',
+          humanName: 'Sport',
+          mediaType: MediaType.SHOW,
+          type: RuleType.TEXT,
+          showType: ['show', 'season', 'episode'],
+        },
+        {
+          id: 3,
+          name: 'leagueTitle',
+          humanName: 'League title',
+          mediaType: MediaType.SHOW,
+          type: RuleType.TEXT,
+          showType: ['show', 'season', 'episode'],
+        },
+        {
+          id: 4,
+          name: 'leagueId',
+          humanName: 'League ID',
+          mediaType: MediaType.SHOW,
+          type: RuleType.NUMBER,
+          showType: ['show', 'season', 'episode'],
+        },
+        {
+          id: 5,
+          name: 'qualityProfileId',
+          humanName: 'Quality profile ID',
+          mediaType: MediaType.SHOW,
+          type: RuleType.NUMBER,
+        },
+        {
+          id: 6,
+          name: 'qualityProfileName',
+          humanName: 'Quality profile name',
+          mediaType: MediaType.SHOW,
+          type: RuleType.TEXT,
+        },
+        {
+          id: 7,
+          name: 'events',
+          humanName: 'Number of events',
+          mediaType: MediaType.SHOW,
+          type: RuleType.NUMBER,
+          showType: ['show', 'season'],
+        },
+        {
+          id: 8,
+          name: 'downloadedEvents',
+          humanName: 'Number of downloaded events',
+          mediaType: MediaType.SHOW,
+          type: RuleType.NUMBER,
+          showType: ['show', 'season'],
+        },
+        {
+          id: 14,
+          name: 'hasFutureEvents',
+          humanName: 'Has upcoming events',
+          mediaType: MediaType.SHOW,
+          type: RuleType.BOOL,
+          showType: ['show', 'season'],
+        },
+        {
+          id: 9,
+          name: 'seasonNumber',
+          humanName: 'Season number (year)',
+          mediaType: MediaType.SHOW,
+          type: RuleType.NUMBER,
+          showType: ['season', 'episode'],
+        },
+        {
+          id: 10,
+          name: 'episodeNumber',
+          humanName: 'Event number in season',
+          mediaType: MediaType.SHOW,
+          type: RuleType.NUMBER,
+          showType: ['episode'],
+        },
+        {
+          id: 11,
+          name: 'eventDate',
+          humanName: 'Event date',
+          mediaType: MediaType.SHOW,
+          type: RuleType.DATE,
+          showType: ['episode'],
+        },
+        {
+          id: 12,
+          name: 'hasFile',
+          humanName: 'Event has a file',
+          mediaType: MediaType.SHOW,
+          type: RuleType.BOOL,
+          showType: ['episode'],
+        },
+        {
+          id: 13,
+          name: 'filePath',
+          humanName: 'Event file path',
+          mediaType: MediaType.SHOW,
+          type: RuleType.TEXT,
+          showType: ['episode'],
+        },
       ],
     },
     {
@@ -1051,6 +1244,133 @@ export class RuleConstants {
           mediaType: MediaType.SHOW,
           type: RuleType.TEXT_LIST, // return usernames []
           showType: ['show', 'season', 'episode'],
+        },
+        // Scoped to the rule's user; same names as the other two companions.
+        {
+          id: 9,
+          name: 'viewCountByUser',
+          humanName: 'Times viewed by user',
+          mediaType: MediaType.BOTH,
+          type: RuleType.NUMBER,
+        },
+        {
+          id: 10,
+          name: 'watchTimeByUser',
+          humanName: 'Watch time by user (minutes)',
+          mediaType: MediaType.BOTH,
+          type: RuleType.NUMBER,
+        },
+        {
+          id: 11,
+          name: 'lastViewedAtByUser',
+          humanName: 'Last view date by user',
+          mediaType: MediaType.BOTH,
+          type: RuleType.DATE,
+        },
+        {
+          id: 12,
+          name: 'lastPlayedAt',
+          humanName: 'Last play date (including unfinished)',
+          mediaType: MediaType.BOTH,
+          type: RuleType.DATE,
+        },
+      ],
+    },
+    {
+      id: Application.TRACEARR,
+      name: 'Tracearr',
+      mediaType: MediaType.BOTH,
+      props: [
+        {
+          id: 0,
+          name: 'seenBy',
+          humanName: '[list] Viewed by (username)',
+          mediaType: MediaType.MOVIE,
+          type: RuleType.TEXT_LIST,
+        },
+        {
+          id: 1,
+          name: 'sw_allEpisodesSeenBy',
+          humanName: '[list] Users that watched every episode',
+          mediaType: MediaType.SHOW,
+          type: RuleType.TEXT_LIST,
+          showType: ['show', 'season'],
+        },
+        // Id 2 remains reserved for Tautulli's addDate. Rule property IDs are
+        // persisted, so Tracearr must never renumber this gap.
+        {
+          id: 3,
+          name: 'viewCount',
+          humanName: 'Times viewed',
+          mediaType: MediaType.MOVIE,
+          type: RuleType.NUMBER,
+        },
+        {
+          id: 4,
+          name: 'lastViewedAt',
+          humanName: 'Last view date',
+          mediaType: MediaType.BOTH,
+          type: RuleType.DATE,
+        },
+        {
+          id: 5,
+          name: 'sw_amountOfViews',
+          humanName: 'Total views',
+          mediaType: MediaType.SHOW,
+          type: RuleType.NUMBER,
+        },
+        {
+          id: 6,
+          name: 'sw_viewedEpisodes',
+          humanName: 'Amount of watched episodes',
+          mediaType: MediaType.SHOW,
+          type: RuleType.NUMBER,
+          showType: ['show', 'season'],
+        },
+        {
+          id: 7,
+          name: 'sw_lastWatched',
+          humanName: 'Newest episode view date',
+          mediaType: MediaType.SHOW,
+          type: RuleType.DATE,
+          showType: ['show', 'season'],
+        },
+        {
+          id: 8,
+          name: 'sw_watchers',
+          humanName: '[list] Users that watched at least one episode',
+          mediaType: MediaType.SHOW,
+          type: RuleType.TEXT_LIST,
+          showType: ['show', 'season', 'episode'],
+        },
+        // Scoped to the rule's user; same names as the other two companions.
+        {
+          id: 9,
+          name: 'viewCountByUser',
+          humanName: 'Times viewed by user',
+          mediaType: MediaType.BOTH,
+          type: RuleType.NUMBER,
+        },
+        {
+          id: 10,
+          name: 'watchTimeByUser',
+          humanName: 'Watch time by user (minutes)',
+          mediaType: MediaType.BOTH,
+          type: RuleType.NUMBER,
+        },
+        {
+          id: 11,
+          name: 'lastViewedAtByUser',
+          humanName: 'Last view date by user',
+          mediaType: MediaType.BOTH,
+          type: RuleType.DATE,
+        },
+        {
+          id: 12,
+          name: 'lastPlayedAt',
+          humanName: 'Last play date (including unfinished)',
+          mediaType: MediaType.BOTH,
+          type: RuleType.DATE,
         },
       ],
     },
@@ -1292,7 +1612,7 @@ export class RuleConstants {
           type: RuleType.NUMBER,
           showType: ['episode'],
         },
-        // Rating properties — sourced from Jellyfin's CommunityRating and CriticRating.
+        // Rating properties - sourced from Jellyfin's CommunityRating and CriticRating.
         // CommunityRating is provider-dependent, commonly TMDb and sometimes IMDb.
         // CriticRating is typically the Rotten Tomatoes Tomatometer via OMDb.
         // IDs match Plex so rules migrate without property ID remapping.
@@ -1398,6 +1718,104 @@ export class RuleConstants {
           mediaType: MediaType.MOVIE,
           type: RuleType.DATE,
           cacheReset: true,
+        },
+        {
+          id: 46,
+          name: 'studios',
+          humanName: '[list] Studios',
+          mediaType: MediaType.BOTH,
+          type: RuleType.TEXT_LIST,
+        },
+        {
+          id: 47,
+          name: 'lastPlayedAt',
+          humanName: 'Last play date (including unfinished)',
+          mediaType: MediaType.BOTH,
+          type: RuleType.DATE,
+        },
+      ],
+    },
+    {
+      // Streamystats is an optional, Jellyfin-only companion (the Jellyfin
+      // analog of Tautulli for Plex). It is removed from the constants unless
+      // configured and Jellyfin is the active server (see RulesService).
+      //
+      // A Streamystats "watchlist" is a user-created curated list, and only
+      // PUBLIC lists are reachable with Maintainerr's Jellyfin API key - see
+      // the StreamystatsWatchlistMembership contract for why. These properties
+      // act as a "users curated this" protection signal.
+      id: Application.STREAMYSTATS,
+      name: 'Streamystats',
+      mediaType: MediaType.BOTH,
+      props: [
+        {
+          id: 0,
+          name: 'isInWatchlist',
+          humanName: 'Is in a watchlist',
+          mediaType: MediaType.BOTH,
+          type: RuleType.BOOL,
+        },
+        {
+          id: 1,
+          name: 'watchlistedByUsers',
+          humanName: '[list] In watchlist of (username)',
+          mediaType: MediaType.BOTH,
+          type: RuleType.TEXT_LIST, // returns usernames []
+        },
+        // Parent-inclusive variants: a Streamystats list holds the show item ID,
+        // not its seasons/episodes, so the item-only props above never match a
+        // watchlisted show when evaluated below show level. These roll the
+        // parent show (and season) in. Show-only and season/episode-only - a
+        // show is the top level (no parent) and a movie has no parent show.
+        {
+          id: 2,
+          name: 'isInWatchlist_including_parent',
+          humanName: 'Is in a watchlist (incl. parents)',
+          mediaType: MediaType.SHOW,
+          type: RuleType.BOOL,
+          showType: ['season', 'episode'],
+        },
+        {
+          id: 3,
+          name: 'watchlistedByUsers_including_parent',
+          humanName: '[list] In watchlist of (username) (incl. parents)',
+          mediaType: MediaType.SHOW,
+          type: RuleType.TEXT_LIST, // returns usernames []
+          showType: ['season', 'episode'],
+        },
+        // Scoped to the rule's user. Streamystats aggregates a show from its
+        // episodes but holds no session against a season, so seasons are out.
+        {
+          id: 4,
+          name: 'viewCountByUser',
+          humanName: 'Times viewed by user',
+          mediaType: MediaType.BOTH,
+          type: RuleType.NUMBER,
+          showType: ['show', 'episode'],
+        },
+        {
+          id: 5,
+          name: 'watchTimeByUser',
+          humanName: 'Watch time by user (minutes)',
+          mediaType: MediaType.BOTH,
+          type: RuleType.NUMBER,
+          showType: ['show', 'episode'],
+        },
+        {
+          id: 6,
+          name: 'lastViewedAtByUser',
+          humanName: 'Last view date by user',
+          mediaType: MediaType.BOTH,
+          type: RuleType.DATE,
+          showType: ['show', 'episode'],
+        },
+        {
+          id: 7,
+          name: 'lastPlayedAt',
+          humanName: 'Last play date (including unfinished)',
+          mediaType: MediaType.BOTH,
+          type: RuleType.DATE,
+          showType: ['show', 'episode'],
         },
       ],
     },

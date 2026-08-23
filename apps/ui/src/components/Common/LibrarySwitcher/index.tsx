@@ -1,3 +1,4 @@
+import { useLingui } from '@lingui/react/macro'
 import { type MediaLibrary } from '@maintainerr/contracts'
 import { useEffect, useRef } from 'react'
 import { Select } from '../../Forms/Select'
@@ -14,6 +15,7 @@ interface ILibrarySwitcher {
 }
 
 const LibrarySwitcher = (props: ILibrarySwitcher) => {
+  const { t } = useLingui()
   const {
     onLibraryChange,
     selectedLibraryId,
@@ -24,7 +26,7 @@ const LibrarySwitcher = (props: ILibrarySwitcher) => {
     librariesLoading = false,
     librariesError = false,
   } = props
-  const lastAutoSelectedLibraryId = useRef<string | null>(null)
+  const lastAutoSelectedLibraryIdRef = useRef<string | null>(null)
   const selectValue =
     librariesLoading || librariesError
       ? ''
@@ -42,18 +44,18 @@ const LibrarySwitcher = (props: ILibrarySwitcher) => {
 
     if (shouldShowAllOption === false) {
       if (selectedLibraryId) {
-        lastAutoSelectedLibraryId.current = selectedLibraryId
+        lastAutoSelectedLibraryIdRef.current = selectedLibraryId
         return
       }
 
       const firstId = libraries[0].id
 
-      if (firstId && lastAutoSelectedLibraryId.current !== firstId) {
-        lastAutoSelectedLibraryId.current = firstId
+      if (firstId && lastAutoSelectedLibraryIdRef.current !== firstId) {
+        lastAutoSelectedLibraryIdRef.current = firstId
         onLibraryChange(firstId)
       }
     } else {
-      lastAutoSelectedLibraryId.current = null
+      lastAutoSelectedLibraryIdRef.current = null
     }
   }, [libraries, onLibraryChange, selectedLibraryId, shouldShowAllOption])
 
@@ -63,16 +65,18 @@ const LibrarySwitcher = (props: ILibrarySwitcher) => {
         <Select name="library" onChange={onSwitchLibrary} value={selectValue}>
           {librariesLoading ? (
             <option disabled={true} value="">
-              Loading libraries...
+              {t`Loading libraries...`}
             </option>
           ) : librariesError ? (
             <option disabled={true} value="">
-              Could not fetch libraries
+              {t`Could not fetch libraries`}
             </option>
           ) : (
             <>
               {(props.shouldShowAllOption === undefined ||
-                props.shouldShowAllOption) && <option value="all">All</option>}
+                props.shouldShowAllOption) && (
+                <option value="all">{t`All`}</option>
+              )}
 
               {libraries?.map((lib) => {
                 return (

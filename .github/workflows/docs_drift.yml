@@ -29,7 +29,6 @@ permissions:
   contents: read
   pull-requests: write
   issues: read
-  models: read
 
 jobs:
   guard_manual_run:
@@ -68,14 +67,14 @@ jobs:
           repositories: Maintainerr_docs
 
       - name: Checkout Maintainerr
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || github.ref }}
           token: ${{ steps.app-token.outputs.token }}
 
       - name: Checkout Maintainerr_docs
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: Maintainerr/Maintainerr_docs
           ref: main
@@ -84,7 +83,7 @@ jobs:
           token: ${{ steps.docs-app-token.outputs.token }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -131,6 +130,9 @@ jobs:
           DOCS_ROOT: ${{ github.workspace }}/.maintainerr_docs
           BASE_REF: ${{ steps.base.outputs.ref }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AI_MODEL_API_KEY: ${{ secrets.AI_MODEL_API_KEY }}
+          AI_MODEL: ${{ vars.AI_MODEL }}
+          AI_MODEL_REASONING_EFFORT: ${{ vars.AI_MODEL_REASONING_EFFORT }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           OUTPUT_PATH: ${{ github.workspace }}/.drift-report.md
         run: node tools/docs-drift-ai.mjs
@@ -179,7 +181,7 @@ jobs:
           - **Always work from local clones, not github.com web views (they can be cached or truncated).
             Clone `Maintainerr/Maintainerr` and `Maintainerr/Maintainerr_docs` before anything else.**
           - **Read complete files, not excerpts or partial reads.** Coverage you would otherwise miss often
-            sits past the first screenful — read each doc file and each commit diff end-to-end.
+            sits past the first screenful - read each doc file and each commit diff end-to-end.
           - **Source of truth:** the upstream Maintainerr commits and file diffs listed above.
             Use the prose summary as guidance, but always confirm against the local clone
             (`git show <sha>`) before editing.
@@ -191,8 +193,8 @@ jobs:
           - **Doc-only changes:** restrict edits to files under `docs/` and `static/openapi-spec/`.
             Do not touch sidebars, config, or unrelated assets unless strictly required by a doc edit.
           - **PR description structure:**
-            1. **What was added** — one short bullet per doc edit, citing the upstream commit or PR.
-            2. **Already covered by prior PRs** — list anything from this drift that earlier merged
+            1. **What was added** - one short bullet per doc edit, citing the upstream commit or PR.
+            2. **Already covered by prior PRs** - list anything from this drift that earlier merged
                docs PRs already documented, so reviewers can confirm it's intentionally skipped.
           - Keep the PR focused and tied to the actual code diff rather than the issue summary alone.
           EOF
@@ -216,7 +218,7 @@ jobs:
             echo "- Updated drift issue: [$DOCS_REPO#$issue_num](https://github.com/$DOCS_REPO/issues/$issue_num)" >> "$GITHUB_STEP_SUMMARY"
           else
             created=$(gh issue create --repo "$DOCS_REPO" \
-              --title "Docs drift — updates needed for the next Maintainerr release" \
+              --title "Docs drift - updates needed for the next Maintainerr release" \
               --body-file .drift-report.md)
             echo "Created: $created"
             echo "- Created drift issue: $created" >> "$GITHUB_STEP_SUMMARY"

@@ -2,10 +2,15 @@ import {
   BasicResponseDto,
   EmbySetting,
   JellyfinSetting,
+  DownloadClientSetting,
   MediaServerType,
+  MINIMUM_SPORTARR_VERSION,
   SeerrSetting,
   StreamystatsSetting,
   TautulliSetting,
+  TracearrConnection,
+  TracearrServer,
+  TracearrSetting,
 } from '@maintainerr/contracts';
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
@@ -17,11 +22,14 @@ import {
 } from '../../utils/connection-error';
 import { InternalApiService } from '../api/internal-api/internal-api.service';
 import { MediaServerFactory } from '../api/media-server/media-server.factory';
+import { DownloadClientApiService } from '../api/download-client-api/download-client-api.service';
 import { PlexApiService } from '../api/plex-api/plex-api.service';
 import { SeerrApiService } from '../api/seerr-api/seerr-api.service';
+import { isBelowMinimumVersion } from '../../utils/required-version-helper';
 import { ServarrService } from '../api/servarr-api/servarr.service';
 import { StreamystatsApiService } from '../api/streamystats-api/streamystats-api.service';
 import { TautulliApiService } from '../api/tautulli-api/tautulli-api.service';
+import { TracearrApiService } from '../api/tracearr-api/tracearr-api.service';
 import { MaintainerrLogger } from '../logging/logs.service';
 import { SettingsDataService } from './settings-data.service';
 import {
@@ -34,9 +42,15 @@ import {
   SonarrSettingRawDto,
   SonarrSettingResponseDto,
 } from "./dto's/sonarr-setting.dto";
+import {
+  DeleteSportarrSettingResponseDto,
+  SportarrSettingRawDto,
+  SportarrSettingResponseDto,
+} from "./dto's/sportarr-setting.dto";
 import { RadarrSettings } from './entities/radarr_settings.entities';
 import { Settings } from './entities/settings.entities';
 import { SonarrSettings } from './entities/sonarr_settings.entities';
+import { SportarrSettings } from './entities/sportarr_settings.entities';
 
 @Injectable()
 export class SettingsOperationsService {
@@ -48,6 +62,8 @@ export class SettingsOperationsService {
     private readonly seerr: SeerrApiService,
     private readonly tautulli: TautulliApiService,
     private readonly streamystats: StreamystatsApiService,
+    private readonly tracearr: TracearrApiService,
+    private readonly downloadClient: DownloadClientApiService,
     private readonly internalApi: InternalApiService,
     @InjectRepository(Settings)
     private readonly settingsRepo: Repository<Settings>,
@@ -55,13 +71,15 @@ export class SettingsOperationsService {
     private readonly radarrSettingsRepo: Repository<RadarrSettings>,
     @InjectRepository(SonarrSettings)
     private readonly sonarrSettingsRepo: Repository<SonarrSettings>,
+    @InjectRepository(SportarrSettings)
+    private readonly sportarrSettingsRepo: Repository<SportarrSettings>,
     private readonly logger: MaintainerrLogger,
   ) {
     logger.setContext(SettingsOperationsService.name);
   }
 
   // ==========================================================================
-  // Read API — delegated to the passive settings store
+  // Read API - delegated to the passive settings store
   // ==========================================================================
 
   public init() {
@@ -112,6 +130,18 @@ export class SettingsOperationsService {
     return this.settingsDataService.getSonarrSettingsCount();
   }
 
+  public getSportarrSettings() {
+    return this.settingsDataService.getSportarrSettings();
+  }
+
+  public getSportarrSetting(id: number) {
+    return this.settingsDataService.getSportarrSetting(id);
+  }
+
+  public getSportarrSettingsCount(): Promise<number> {
+    return this.settingsDataService.getSportarrSettingsCount();
+  }
+
   public generateApiKey(): string {
     return this.settingsDataService.generateApiKey();
   }
@@ -140,7 +170,7 @@ export class SettingsOperationsService {
   }
 
   // ==========================================================================
-  // Coordination — test / save / reinit flows
+  // Coordination - test / save / reinit flows
   // ==========================================================================
 
   public async addRadarrSetting(
@@ -198,7 +228,7 @@ export class SettingsOperationsService {
     try {
       const settingsDb = await this.radarrSettingsRepo.findOne({
         where: { id: id },
-        relations: ['collections'],
+        relations: { collections: true },
       });
 
       if (settingsDb.collections.length > 0) {
@@ -308,6 +338,185 @@ export class SettingsOperationsService {
       return { status: 'OK', code: 1, message: 'Success' };
     } catch (error) {
       this.logger.error('Error while updating Streamystats settings');
+      this.logger.debug(error);
+      return { status: 'NOK', code: 0, message: 'Failed' };
+    }
+  }
+
+  public async removeTracearrSetting(): Promise<BasicResponseDto> {
+    try {
+      const settingsDb = await this.settingsRepo.findOne({ where: {} });
+
+      await this.settingsDataService.saveSettings({
+        ...settingsDb,
+        tracearr_url: null,
+        tracearr_api_key: null,
+        tracearr_server_id: null,
+      });
+
+      await this.settingsDataService.init();
+      this.tracearr.init();
+
+      return { status: 'OK', code: 1, message: 'Success' };
+    } catch (error) {
+      this.logger.error('Error removing Tracearr settings');
+      this.logger.debug(error);
+      return { status: 'NOK', code: 0, message: 'Failed' };
+    }
+  }
+
+  public async updateTracearrSetting(
+    settings: TracearrSetting,
+  ): Promise<BasicResponseDto> {
+    try {
+      const settingsDb = await this.settingsRepo.findOne({ where: {} });
+
+      // A chosen server wins: it is only ever offered when Tracearr has several
+      // of the configured type and nothing can pick between them.
+      const serverId =
+        settings.server_id ??
+        (await this.tracearr.resolveServerId({
+          url: settings.url,
+          apiKey: settings.api_key,
+        }));
+      if (!serverId) {
+        return {
+          status: 'NOK',
+          code: 0,
+          message: `Tracearr has no single ${this.settingsDataService.media_server_type ?? 'media'} server matching the one Maintainerr manages. Add it in Tracearr and let it sync a library first, or pick the server to use.`,
+        };
+      }
+
+      // A chosen server is checked rather than trusted: rating keys from the
+      // wrong server match nothing, and every rule would read as unwatched.
+      const sharesLibrary = await this.tracearr.serverSharesLibrary(
+        { url: settings.url, apiKey: settings.api_key },
+        serverId,
+      );
+      if (sharesLibrary === false) {
+        return {
+          status: 'NOK',
+          code: 0,
+          message:
+            'That Tracearr server tracks a different media server than the one Maintainerr manages. Pick the Tracearr server for this media server.',
+        };
+      }
+
+      await this.settingsDataService.saveSettings({
+        ...settingsDb,
+        tracearr_url: settings.url,
+        tracearr_api_key: settings.api_key,
+        tracearr_server_id: serverId,
+      });
+
+      await this.settingsDataService.init();
+      this.tracearr.init();
+
+      return { status: 'OK', code: 1, message: 'Success' };
+    } catch (error) {
+      this.logger.error('Error updating Tracearr settings');
+      this.logger.debug(error);
+      return { status: 'NOK', code: 0, message: 'Failed' };
+    }
+  }
+
+  /**
+   * Settings resolved against the media server go stale when Maintainerr is
+   * re-pointed at another instance of the same type: the type is unchanged, so
+   * the switch path never runs.
+   */
+  private async revalidateMediaServerDependentSettings(): Promise<void> {
+    try {
+      // The swept history, the resolved server and its verification all
+      // describe the previous connection, so they go regardless of what the
+      // check below concludes. Keeping them would let the next run read the
+      // old server from memory without probing it again.
+      this.tracearr.invalidateHistory();
+
+      if ((await this.tracearr.savedServerTracksMediaServer()) !== false) {
+        return;
+      }
+
+      const settingsDb = await this.settingsRepo.findOne({ where: {} });
+      await this.settingsDataService.saveSettings({
+        ...settingsDb,
+        tracearr_server_id: null,
+      });
+      await this.settingsDataService.init();
+
+      this.logger.log(
+        'Cleared the selected Tracearr server: it tracks a different media server than the one now configured.',
+      );
+    } catch (error) {
+      // The settings are already saved; this check must not fail that.
+      this.logger.debug(error);
+    }
+  }
+
+  public getTracearrServers(
+    settings: TracearrConnection,
+  ): Promise<TracearrServer[] | undefined> {
+    return this.tracearr.getServers({
+      url: settings.url,
+      apiKey: settings.api_key,
+    });
+  }
+
+  public testTracearr(settings: TracearrSetting): Promise<BasicResponseDto> {
+    return this.tracearr.testConnection({
+      url: settings.url,
+      apiKey: settings.api_key,
+    });
+  }
+
+  public async removeDownloadClientSetting() {
+    try {
+      const settingsDb = await this.settingsRepo.findOne({ where: {} });
+
+      // Clear the whole integration config, not just the connection fields, so
+      // a removed download client leaves no stale cleanup options behind (and a
+      // later reconfigure starts from defaults).
+      await this.settingsDataService.saveSettings({
+        ...settingsDb,
+        download_client_url: null,
+        download_client_username: null,
+        download_client_password: null,
+        download_client_delete_data: true,
+        download_client_fallback_ratio: 0.5,
+      });
+
+      await this.settingsDataService.init();
+      this.downloadClient.init();
+
+      return { status: 'OK', code: 1, message: 'Success' };
+    } catch (error) {
+      this.logger.error('Error removing download client settings');
+      this.logger.debug(error);
+      return { status: 'NOK', code: 0, message: 'Failed' };
+    }
+  }
+
+  public async updateDownloadClientSetting(
+    settings: DownloadClientSetting,
+  ): Promise<BasicResponseDto> {
+    try {
+      const settingsDb = await this.settingsRepo.findOne({ where: {} });
+
+      await this.settingsDataService.saveSettings({
+        ...settingsDb,
+        download_client_url: settings.download_client_url,
+        download_client_username: settings.download_client_username || null,
+        download_client_password: settings.download_client_password || null,
+        download_client_delete_data: settings.download_client_delete_data,
+        download_client_fallback_ratio: settings.download_client_fallback_ratio,
+      });
+
+      await this.settingsDataService.init();
+      this.downloadClient.init();
+
+      return { status: 'OK', code: 1, message: 'Success' };
+    } catch (error) {
+      this.logger.error('Error while updating download client settings');
       this.logger.debug(error);
       return { status: 'NOK', code: 0, message: 'Failed' };
     }
@@ -467,6 +676,13 @@ export class SettingsOperationsService {
       // Streamystats uses the Jellyfin API key + server identity. Re-init so
       // the cached client and resolved serverId track the new credentials.
       this.streamystats.init();
+
+      if (
+        settingsDb?.jellyfin_url !== settings.jellyfin_url ||
+        settingsDb?.jellyfin_api_key !== settings.jellyfin_api_key
+      ) {
+        await this.revalidateMediaServerDependentSettings();
+      }
 
       this.logger.log('Jellyfin settings saved successfully');
       return { status: 'OK', code: 1, message: 'Success' };
@@ -705,6 +921,13 @@ export class SettingsOperationsService {
 
       await this.settingsDataService.init();
 
+      if (
+        settingsDb?.emby_url !== settings.emby_url ||
+        settingsDb?.emby_api_key !== settings.emby_api_key
+      ) {
+        await this.revalidateMediaServerDependentSettings();
+      }
+
       this.logger.log('Emby settings saved successfully');
       return { status: 'OK', code: 1, message: 'Success' };
     } catch (error) {
@@ -800,7 +1023,7 @@ export class SettingsOperationsService {
     try {
       const settingsDb = await this.sonarrSettingsRepo.findOne({
         where: { id: id },
-        relations: ['collections'],
+        relations: { collections: true },
       });
 
       if (settingsDb.collections.length > 0) {
@@ -823,6 +1046,90 @@ export class SettingsOperationsService {
       return { status: 'OK', code: 1, message: 'Success' };
     } catch (error) {
       this.logger.error('Error while deleting Sonarr setting');
+      this.logger.debug(error);
+      return { status: 'NOK', code: 0, message: 'Failure', data: null };
+    }
+  }
+
+  public async addSportarrSetting(
+    settings: Omit<SportarrSettings, 'id' | 'collections'>,
+  ): Promise<SportarrSettingResponseDto> {
+    try {
+      settings.url = settings.url.toLowerCase();
+
+      const savedSetting = await this.sportarrSettingsRepo.save(settings);
+
+      this.logger.log('Sportarr setting added');
+      return {
+        data: savedSetting,
+        status: 'OK',
+        code: 1,
+        message: 'Success',
+      };
+    } catch (error) {
+      this.logger.error('Error while adding Sportarr setting');
+      this.logger.debug(error);
+      return { status: 'NOK', code: 0, message: 'Failure' };
+    }
+  }
+
+  public async updateSportarrSetting(
+    settings: Omit<SportarrSettings, 'collections'>,
+  ): Promise<SportarrSettingResponseDto> {
+    try {
+      settings.url = settings.url.toLowerCase();
+
+      const settingsDb = await this.sportarrSettingsRepo.findOne({
+        where: { id: settings.id },
+      });
+
+      const data = {
+        ...settingsDb,
+        ...settings,
+      };
+
+      await this.sportarrSettingsRepo.save(data);
+
+      this.servarr.deleteCachedSportarrApiClient(settings.id);
+
+      this.logger.log('Sportarr settings updated');
+      return { data, status: 'OK', code: 1, message: 'Success' };
+    } catch (error) {
+      this.logger.error('Error while updating Sportarr settings');
+      this.logger.debug(error);
+      return { status: 'NOK', code: 0, message: 'Failure' };
+    }
+  }
+
+  public async deleteSportarrSetting(
+    id: number,
+  ): Promise<DeleteSportarrSettingResponseDto> {
+    try {
+      const settingsDb = await this.sportarrSettingsRepo.findOne({
+        where: { id: id },
+        relations: { collections: true },
+      });
+
+      if (settingsDb.collections.length > 0) {
+        return {
+          status: 'NOK',
+          code: 0,
+          message: 'Cannot delete setting with associated collections',
+          data: {
+            collectionsInUse: settingsDb.collections,
+          },
+        };
+      }
+
+      await this.sportarrSettingsRepo.delete({
+        id,
+      });
+      this.servarr.deleteCachedSportarrApiClient(id);
+
+      this.logger.log('Sportarr settings deleted');
+      return { status: 'OK', code: 1, message: 'Success' };
+    } catch (error) {
+      this.logger.error('Error while deleting Sportarr setting');
       this.logger.debug(error);
       return { status: 'NOK', code: 0, message: 'Failure', data: null };
     }
@@ -879,26 +1186,11 @@ export class SettingsOperationsService {
     }
   }
 
+  /** Kept as its own route verb; updateSettings merges over the stored row too. */
   public async patchSettings(
     settings: Partial<Settings>,
   ): Promise<BasicResponseDto> {
-    const settingsDb = await this.settingsRepo.findOne({ where: {} });
-
-    if (!settingsDb) {
-      this.logger.error('Settings could not be loaded for partial update.');
-      return {
-        status: 'NOK',
-        code: 0,
-        message: 'No settings found to update',
-      };
-    }
-
-    const mergedSettings: Settings = {
-      ...settingsDb,
-      ...settings,
-    };
-
-    return this.updateSettings(mergedSettings);
+    return this.updateSettings(settings);
   }
 
   private stripPlexProtocolPrefix(hostname: string | null | undefined) {
@@ -920,16 +1212,25 @@ export class SettingsOperationsService {
   private normalizePlexServerConnectionSettings({
     hostname,
     port,
+    fallbackSsl,
   }: {
     hostname: string | null | undefined;
     port: number | null | undefined;
+    fallbackSsl: number | null | undefined;
   }) {
     const normalizedHostnameInput = hostname?.trim().toLowerCase();
     const normalizedHostname = this.stripPlexProtocolPrefix(
       normalizedHostnameInput,
     );
+    // Only a scheme prefix or port 443 says anything about TLS. The stored
+    // hostname is always bare and auto-discovery stores plex.direct hosts on
+    // 32400 with ssl=1, so a bare hostname must not downgrade fallbackSsl.
     const normalizedSsl =
-      normalizedHostnameInput?.startsWith('https://') || port === 443 ? 1 : 0;
+      normalizedHostnameInput?.startsWith('https://') || port === 443
+        ? 1
+        : normalizedHostnameInput?.startsWith('http://')
+          ? 0
+          : (fallbackSsl ?? 0);
 
     return {
       hostname: normalizedHostname,
@@ -940,7 +1241,7 @@ export class SettingsOperationsService {
 
   private isPlexServerSettingsUpdate(
     currentSettings: Settings,
-    nextSettings: Settings,
+    nextSettings: Partial<Settings>,
   ): boolean {
     const currentMediaServerType =
       nextSettings.media_server_type ?? currentSettings.media_server_type;
@@ -952,10 +1253,12 @@ export class SettingsOperationsService {
     const normalizedCurrent = this.normalizePlexServerConnectionSettings({
       hostname: currentSettings.plex_hostname,
       port: currentSettings.plex_port,
+      fallbackSsl: currentSettings.plex_ssl,
     });
     const normalizedNext = this.normalizePlexServerConnectionSettings({
       hostname: nextSettings.plex_hostname,
       port: nextSettings.plex_port,
+      fallbackSsl: nextSettings.plex_ssl,
     });
 
     return (
@@ -966,21 +1269,9 @@ export class SettingsOperationsService {
     );
   }
 
-  public async updateSettings(settings: Settings): Promise<BasicResponseDto> {
-    if (
-      !this.cronIsValid(settings.collection_handler_job_cron) ||
-      !this.cronIsValid(settings.rules_handler_job_cron)
-    ) {
-      this.logger.error(
-        'Invalid CRON configuration found, settings update aborted.',
-      );
-      return {
-        status: 'NOK',
-        code: 0,
-        message: 'Update failed, invalid CRON value was found',
-      };
-    }
-
+  public async updateSettings(
+    settings: Partial<Settings>,
+  ): Promise<BasicResponseDto> {
     try {
       const settingsDb = await this.settingsRepo.findOne({ where: {} });
 
@@ -993,8 +1284,29 @@ export class SettingsOperationsService {
         };
       }
 
+      // Merge before anything reads the payload. An absent field means "leave
+      // as-is", and every step below - cron validation, the Plex-change check,
+      // URL lowercasing, hostname/ssl normalisation - assumes it is looking at
+      // a complete settings object. Reading the raw partial instead reset
+      // plex_ssl to 0 and rescheduled the collection handler to "undefined".
+      const merged: Settings = { ...settingsDb, ...settings };
+
       if (
-        this.isPlexServerSettingsUpdate(settingsDb, settings) &&
+        !this.cronIsValid(merged.collection_handler_job_cron) ||
+        !this.cronIsValid(merged.rules_handler_job_cron)
+      ) {
+        this.logger.error(
+          'Invalid CRON configuration found, settings update aborted.',
+        );
+        return {
+          status: 'NOK',
+          code: 0,
+          message: 'Update failed, invalid CRON value was found',
+        };
+      }
+
+      if (
+        this.isPlexServerSettingsUpdate(settingsDb, merged) &&
         !settingsDb.plex_auth_token
       ) {
         return {
@@ -1004,34 +1316,44 @@ export class SettingsOperationsService {
         };
       }
 
-      settings.seerr_url = settings.seerr_url?.toLowerCase();
-      settings.tautulli_url = settings.tautulli_url?.toLowerCase();
+      merged.seerr_url = merged.seerr_url?.toLowerCase();
+      merged.tautulli_url = merged.tautulli_url?.toLowerCase();
 
       const normalizedPlexServerSettings =
         this.normalizePlexServerConnectionSettings({
-          hostname: settings.plex_hostname,
-          port: settings.plex_port,
+          hostname: merged.plex_hostname,
+          port: merged.plex_port,
+          fallbackSsl: merged.plex_ssl,
         });
 
-      settings.plex_hostname = normalizedPlexServerSettings.hostname;
-      settings.plex_ssl = normalizedPlexServerSettings.ssl;
+      merged.plex_hostname = normalizedPlexServerSettings.hostname;
+      merged.plex_ssl = normalizedPlexServerSettings.ssl;
 
-      await this.settingsDataService.saveSettings({
-        ...settingsDb,
-        ...settings,
-      });
+      // Plex is the only media server configured through this endpoint; the
+      // others have their own save paths.
+      const mediaServerConnectionChanged = this.isPlexServerSettingsUpdate(
+        settingsDb,
+        merged,
+      );
+
+      await this.settingsDataService.saveSettings(merged);
 
       await this.settingsDataService.init();
       this.logger.log('Settings updated');
       await this.mediaServerFactory.initialize();
       this.seerr.init();
       this.tautulli.init();
+      this.downloadClient.init();
       this.internalApi.init();
+
+      if (mediaServerConnectionChanged) {
+        await this.revalidateMediaServerDependentSettings();
+      }
 
       // reload Collection handler job if changed
       if (
         settingsDb.collection_handler_job_cron !==
-        settings.collection_handler_job_cron
+        merged.collection_handler_job_cron
       ) {
         this.logger.log(
           `Collection Handler cron schedule changed.. Reloading job.`,
@@ -1040,7 +1362,7 @@ export class SettingsOperationsService {
           .getApi()
           .put(
             '/collections/schedule/update',
-            `{"schedule": "${settings.collection_handler_job_cron}"}`,
+            `{"schedule": "${merged.collection_handler_job_cron}"}`,
           );
       }
 
@@ -1130,6 +1452,32 @@ export class SettingsOperationsService {
     }
   }
 
+  public async testDownloadClient(
+    setting?: DownloadClientSetting,
+  ): Promise<BasicResponseDto> {
+    if (setting) {
+      return await this.downloadClient.testConnection({
+        url: setting.download_client_url,
+        username: setting.download_client_username,
+        password: setting.download_client_password,
+      });
+    }
+
+    if (!this.settingsDataService.downloadClientConfigured()) {
+      return {
+        status: 'NOK',
+        code: 0,
+        message: 'Download client is not configured',
+      };
+    }
+
+    return await this.downloadClient.testConnection({
+      url: this.settingsDataService.download_client_url,
+      username: this.settingsDataService.download_client_username,
+      password: this.settingsDataService.download_client_password,
+    });
+  }
+
   public async testRadarr(
     id: number | RadarrSettingRawDto,
   ): Promise<BasicResponseDto> {
@@ -1192,6 +1540,47 @@ export class SettingsOperationsService {
     }
   }
 
+  public async testSportarr(
+    id: number | SportarrSettingRawDto,
+  ): Promise<BasicResponseDto> {
+    try {
+      const apiClient = await this.servarr.getSportarrApiClient(id);
+
+      const resp = await apiClient.info();
+      // Make sure it's actually Sportarr and not another *arr behind the URL
+      if (resp?.appName && resp.appName.toLowerCase() !== 'sportarr') {
+        return {
+          status: 'NOK',
+          code: 0,
+          message: `Unexpected application name returned: ${resp.appName}`,
+        };
+      }
+      if (
+        resp?.version != null &&
+        isBelowMinimumVersion(resp.version, MINIMUM_SPORTARR_VERSION)
+      ) {
+        return {
+          status: 'NOK',
+          code: 0,
+          message: `Sportarr ${resp.version} is below the minimum supported version ${MINIMUM_SPORTARR_VERSION}. Please update Sportarr.`,
+        };
+      }
+      return resp?.version != null
+        ? { status: 'OK', code: 1, message: resp.version }
+        : { status: 'NOK', code: 0, message: 'Failure' };
+    } catch (error) {
+      logConnectionTestError(this.logger, 'Sportarr');
+      return {
+        status: 'NOK',
+        code: 0,
+        message: formatConnectionFailureMessage(
+          error,
+          'Failed to connect to Sportarr. Verify URL and API key.',
+        ),
+      };
+    }
+  }
+
   public async testPlex(): Promise<BasicResponseDto> {
     if (!this.settingsDataService.plex_auth_token) {
       return {
@@ -1219,7 +1608,9 @@ export class SettingsOperationsService {
     }
   }
 
-  public async testPlexAuthToken(): Promise<BasicResponseDto> {
+  public async testPlexAuthToken(): Promise<
+    BasicResponseDto & { unreachable?: boolean }
+  > {
     if (!this.settingsDataService.plex_auth_token) {
       return {
         status: 'NOK',
@@ -1228,26 +1619,35 @@ export class SettingsOperationsService {
       };
     }
 
-    try {
-      const valid = await this.plexApi.validateAuthToken();
+    const unreachableMessage =
+      "Couldn't reach plex.tv to verify your credentials - retrying. Your saved token is still in use.";
 
-      return valid
-        ? { status: 'OK', code: 1, message: 'Success' }
-        : {
+    try {
+      switch (await this.plexApi.validateAuthToken()) {
+        case 'valid':
+          return { status: 'OK', code: 1, message: 'Success' };
+        case 'invalid':
+          return {
             status: 'NOK',
             code: 0,
             message:
               'Stored Plex credentials are invalid. Re-authenticate with Plex.',
           };
+        case 'unreachable':
+          return {
+            status: 'NOK',
+            code: 0,
+            unreachable: true,
+            message: unreachableMessage,
+          };
+      }
     } catch (error) {
       logConnectionTestError(this.logger, 'Plex auth');
       return {
         status: 'NOK',
         code: 0,
-        message: formatConnectionFailureMessage(
-          error,
-          'Stored Plex credentials could not be validated. Re-authenticate with Plex.',
-        ),
+        unreachable: true,
+        message: formatConnectionFailureMessage(error, unreachableMessage),
       };
     }
   }

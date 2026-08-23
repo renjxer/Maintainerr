@@ -1,11 +1,19 @@
 import { Injectable } from '@nestjs/common';
+import {
+  TmdbMovieDetails,
+  TmdbTvDetails,
+  TmdbTvEpisodeResult,
+  TmdbTvSeasonResult,
+} from '../../api/tmdb-api/interfaces/tmdb.interface';
 import { TmdbApiService } from '../../api/tmdb-api/tmdb.service';
 import { IMetadataProvider } from '../interfaces/metadata-provider.interface';
 import {
   ExternalIdSearchResult,
   MetadataDetails,
+  MetadataImageOptions,
   PersonDetails,
   ProviderIds,
+  TvHierarchyRef,
 } from '../interfaces/metadata.types';
 
 const TMDB_IMAGE_BASE = 'https://image.tmdb.org/t/p';
@@ -57,7 +65,7 @@ export class TmdbMetadataProvider implements IMetadataProvider {
     type: 'movie' | 'tv',
   ): Promise<MetadataDetails | undefined> {
     const record = await this.getRecord(tmdbId, type);
-    if (!record) {
+    if (!record || typeof record !== 'object') {
       return undefined;
     }
 
@@ -71,6 +79,7 @@ export class TmdbMetadataProvider implements IMetadataProvider {
       posterUrl: this.buildImageUrl(record.poster_path, 'w500'),
       backdropUrl: this.buildImageUrl(record.backdrop_path, 'w1280'),
       rating: record.vote_average || undefined,
+      studios: this.getStudios(record, type),
       externalIds: {
         tmdb: record.id,
         tvdb: record.external_ids?.tvdb_id ?? undefined,
@@ -81,23 +90,154 @@ export class TmdbMetadataProvider implements IMetadataProvider {
         type,
       },
       type,
+      ended:
+        'in_production' in record
+          ? this.deriveEnded(record.status, record.in_production)
+          : undefined,
+      firstAirDate:
+        'first_air_date' in record
+          ? record.first_air_date || undefined
+          : undefined,
+      seasonCount:
+        'seasons' in record ? this.countRealSeasons(record.seasons) : undefined,
     };
+  }
+
+  // Movies use production companies, TV uses networks - the same split Seerr,
+  // Radarr (studio) and Sonarr (network) landed on, and what media servers'
+  // own TMDB agents surface as an item's studio. Movie company lists are kept
+  // unfiltered: TMDB does not flag distributors or shell companies, so any
+  // heuristic would silently drop real studios from a CONTAINS match.
+  private getStudios(
+    record: TmdbMovieDetails | TmdbTvDetails,
+    type: 'movie' | 'tv',
+  ): string[] | undefined {
+    const values =
+      type === 'movie'
+        ? (record as TmdbMovieDetails).production_companies
+        : (record as TmdbTvDetails).networks;
+
+    return Array.isArray(values)
+      ? values.map((value) => value.name)
+      : undefined;
+  }
+
+  private countRealSeasons(
+    seasons: { season_number: number }[] | undefined,
+  ): number | undefined {
+    if (!Array.isArray(seasons)) return undefined;
+    let count = 0;
+    for (const season of seasons) {
+      if (season.season_number > 0) count++;
+    }
+    return count;
+  }
+
+  // `in_production` is the authoritative "no more episodes coming" signal;
+  // status strings (Ended/Canceled/Returning Series/…) are only consulted
+  // when it's absent.
+  private deriveEnded(
+    status: string | undefined,
+    inProduction: boolean | undefined,
+  ): boolean | undefined {
+    if (inProduction === true) return false;
+    if (inProduction === false) return true;
+    if (status === 'Ended' || status === 'Canceled') return true;
+    if (status === 'Returning Series' || status === 'In Production')
+      return false;
+    return undefined;
+  }
+
+  /** The show record already carries every season, so this costs no extra call. */
+  private findSeason(
+    record: TmdbMovieDetails | TmdbTvDetails | undefined,
+    seasonNumber: number,
+  ): TmdbTvSeasonResult | undefined {
+    if (!record || !('seasons' in record) || !Array.isArray(record.seasons)) {
+      return undefined;
+    }
+
+    return record.seasons.find(
+      (season) => season.season_number === seasonNumber,
+    );
+  }
+
+  /**
+   * Episode records are not part of the show record, so this is one extra
+   * request - but it returns the whole season, and it is cached like every
+   * other TMDB read, so the season's other episodes come for free.
+   */
+  private async findEpisode(
+    tmdbId: number,
+    ref: TvHierarchyRef,
+  ): Promise<TmdbTvEpisodeResult | undefined> {
+    if (ref.episodeNumber === undefined) {
+      return undefined;
+    }
+
+    const season = await this.tmdbApi.getTvSeason({
+      tvId: tmdbId,
+      seasonNumber: ref.seasonNumber,
+    });
+
+    return season?.episodes?.find(
+      (episode) => episode.episode_number === ref.episodeNumber,
+    );
   }
 
   async getPosterUrl(
     tmdbId: number,
     type: 'movie' | 'tv',
-    sizeHint = 'w500',
+    options: MetadataImageOptions = {},
   ): Promise<string | undefined> {
+    const { sizeHint = 'w500', ref } = options;
     const record = await this.getRecord(tmdbId, type);
+
+    if (ref) {
+      const seasonPosterUrl = this.buildImageUrl(
+        this.findSeason(record, ref.seasonNumber)?.poster_path,
+        sizeHint,
+      );
+
+      if (seasonPosterUrl) {
+        return seasonPosterUrl;
+      }
+    }
+
     return this.buildImageUrl(record?.poster_path, sizeHint);
+  }
+
+  async getHierarchyOverview(
+    tmdbId: number,
+    ref: TvHierarchyRef,
+  ): Promise<string | undefined> {
+    if (ref.episodeNumber !== undefined) {
+      const episode = await this.findEpisode(tmdbId, ref);
+      return episode?.overview || undefined;
+    }
+
+    const record = await this.getRecord(tmdbId, 'tv');
+    return this.findSeason(record, ref.seasonNumber)?.overview || undefined;
   }
 
   async getBackdropUrl(
     tmdbId: number,
     type: 'movie' | 'tv',
-    sizeHint = 'w1280',
+    options: MetadataImageOptions = {},
   ): Promise<string | undefined> {
+    const { sizeHint = 'w1280', ref } = options;
+
+    if (ref?.episodeNumber !== undefined) {
+      const episode = await this.findEpisode(tmdbId, ref);
+      // Stills are only published in w92/w185/w300/original, so a backdrop
+      // size hint would not apply; `original` is the only one large enough.
+      const stillUrl = this.buildImageUrl(episode?.still_path, 'original');
+
+      if (stillUrl) {
+        return stillUrl;
+      }
+    }
+
     const record = await this.getRecord(tmdbId, type);
     return this.buildImageUrl(record?.backdrop_path, sizeHint);
   }

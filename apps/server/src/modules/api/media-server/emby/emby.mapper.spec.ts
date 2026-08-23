@@ -6,7 +6,7 @@ import type { EmbyBaseItemDto, EmbyUserDto } from './emby.types';
  * Maintainerr's MediaItem contract. Emby's API and Jellyfin's API share the
  * same .NET-derived BaseItemDto field shape (Jellyfin forked Emby in 2018),
  * so the synthetic fixtures below mirror the ones in jellyfin.mapper.spec.ts
- * — they assert how the mapper transforms a known input, not what Emby
+ * - they assert how the mapper transforms a known input, not what Emby
  * returns over the wire.
  */
 describe('EmbyMapper', () => {
@@ -232,6 +232,7 @@ describe('EmbyMapper', () => {
         },
       ],
       Tags: ['HD', '4K'],
+      Studios: [{ Name: 'Studio One' }, { Name: '' }, {}],
     };
 
     it('converts ISO timestamps to Date objects', () => {
@@ -313,6 +314,11 @@ describe('EmbyMapper', () => {
     it('returns labels from Tags', () => {
       const result = EmbyMapper.toMediaItem(baseItem);
       expect(result.labels).toEqual(['HD', '4K']);
+    });
+
+    it('maps studio names and drops empty entries', () => {
+      const result = EmbyMapper.toMediaItem(baseItem);
+      expect(result.studios).toEqual(['Studio One']);
     });
 
     it('handles minimal items without crashing', () => {

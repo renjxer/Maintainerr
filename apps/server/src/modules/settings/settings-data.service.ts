@@ -17,6 +17,7 @@ import { SettingDto } from "./dto's/setting.dto";
 import { RadarrSettings } from './entities/radarr_settings.entities';
 import { Settings } from './entities/settings.entities';
 import { SonarrSettings } from './entities/sonarr_settings.entities';
+import { SportarrSettings } from './entities/sportarr_settings.entities';
 
 type PlexConnectionSettingsUpdate = Partial<
   Pick<
@@ -101,9 +102,37 @@ export class SettingsDataService implements SettingDto {
 
   streamystats_url: string;
 
+  tracearr_url: string;
+
+  tracearr_api_key: string;
+
+  tracearr_server_id: string;
+
+  download_client_url: string;
+
+  download_client_username: string;
+
+  download_client_password: string;
+
+  download_client_delete_data: boolean;
+
+  download_client_fallback_ratio: number;
+
   collection_handler_job_cron: string;
 
   rules_handler_job_cron: string;
+
+  radarr_tag_exclusions: boolean;
+
+  radarr_exclusion_tag: string;
+
+  radarr_untag_on_unexclude: boolean;
+
+  sonarr_tag_exclusions: boolean;
+
+  sonarr_exclusion_tag: string;
+
+  sonarr_untag_on_unexclude: boolean;
 
   constructor(
     @InjectRepository(Settings)
@@ -112,6 +141,8 @@ export class SettingsDataService implements SettingDto {
     private readonly radarrSettingsRepo: Repository<RadarrSettings>,
     @InjectRepository(SonarrSettings)
     private readonly sonarrSettingsRepo: Repository<SonarrSettings>,
+    @InjectRepository(SportarrSettings)
+    private readonly sportarrSettingsRepo: Repository<SportarrSettings>,
     private readonly eventEmitter: EventEmitter2,
     private readonly logger: MaintainerrLogger,
   ) {
@@ -155,9 +186,27 @@ export class SettingsDataService implements SettingDto {
       this.tautulli_url = settingsDb?.tautulli_url;
       this.tautulli_api_key = settingsDb?.tautulli_api_key;
       this.streamystats_url = settingsDb?.streamystats_url;
+      this.tracearr_url = settingsDb?.tracearr_url;
+      this.tracearr_api_key = settingsDb?.tracearr_api_key;
+      this.tracearr_server_id = settingsDb?.tracearr_server_id;
+      this.download_client_url = settingsDb?.download_client_url;
+      this.download_client_username = settingsDb?.download_client_username;
+      this.download_client_password = settingsDb?.download_client_password;
+      this.download_client_delete_data =
+        settingsDb?.download_client_delete_data ?? true;
+      this.download_client_fallback_ratio =
+        settingsDb?.download_client_fallback_ratio ?? 0.5;
       this.collection_handler_job_cron =
         settingsDb?.collection_handler_job_cron;
       this.rules_handler_job_cron = settingsDb?.rules_handler_job_cron;
+      this.radarr_tag_exclusions = settingsDb?.radarr_tag_exclusions ?? false;
+      this.radarr_exclusion_tag = settingsDb?.radarr_exclusion_tag ?? 'dnd';
+      this.radarr_untag_on_unexclude =
+        settingsDb?.radarr_untag_on_unexclude ?? false;
+      this.sonarr_tag_exclusions = settingsDb?.sonarr_tag_exclusions ?? false;
+      this.sonarr_exclusion_tag = settingsDb?.sonarr_exclusion_tag ?? 'dnd';
+      this.sonarr_untag_on_unexclude =
+        settingsDb?.sonarr_untag_on_unexclude ?? false;
 
       // Auto-detect media server type when not set but credentials exist.
       // This handles upgrades from pre-Jellyfin versions (Plex) and any future
@@ -261,6 +310,8 @@ export class SettingsDataService implements SettingDto {
       tmdb_api_key: maskSecret(settings.tmdb_api_key),
       tvdb_api_key: maskSecret(settings.tvdb_api_key),
       tautulli_api_key: maskSecret(settings.tautulli_api_key),
+      tracearr_api_key: maskSecret(settings.tracearr_api_key),
+      download_client_password: maskSecret(settings.download_client_password),
     };
   }
 
@@ -336,6 +387,10 @@ export class SettingsDataService implements SettingDto {
     return this.tautulli_url !== null && this.tautulli_api_key !== null;
   }
 
+  public downloadClientConfigured(): boolean {
+    return this.download_client_url != null;
+  }
+
   /**
    * Get the current media server type
    */
@@ -395,6 +450,42 @@ export class SettingsDataService implements SettingDto {
    */
   public async getSonarrSettingsCount(): Promise<number> {
     return this.sonarrSettingsRepo.count();
+  }
+
+  public async getSportarrSettings() {
+    try {
+      return this.sportarrSettingsRepo.find();
+    } catch (error) {
+      this.logger.error(
+        'Something went wrong while getting sportarr settings. Is the database file locked?',
+      );
+      this.logger.debug(error);
+      return {
+        status: 'NOK',
+        code: 0,
+        message: getErrorMessage(error, 'Failed to get Sportarr settings'),
+      } as BasicResponseDto;
+    }
+  }
+
+  public async getSportarrSetting(id: number) {
+    try {
+      return this.sportarrSettingsRepo.findOne({ where: { id: id } });
+    } catch (error) {
+      this.logger.error(
+        `Something went wrong while getting sportarr setting ${id}. Is the database file locked?`,
+      );
+      this.logger.debug(error);
+      return {
+        status: 'NOK',
+        code: 0,
+        message: getErrorMessage(error, 'Failed to get Sportarr setting'),
+      } as BasicResponseDto;
+    }
+  }
+
+  public async getSportarrSettingsCount(): Promise<number> {
+    return this.sportarrSettingsRepo.count();
   }
 
   public generateApiKey(): string {

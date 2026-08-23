@@ -14,7 +14,7 @@ import {
   RuleConstants,
 } from '../constants/rules.constants';
 import { RuleDto } from '../dtos/rule.dto';
-import { RulesDto } from '../dtos/rules.dto';
+import { RuleGroupDto } from '../dtos/ruleGroup.dto';
 import { ArrLookupCache } from '../helpers/arr-lookup-cache';
 import { evaluateArrDiskspaceGiB } from '../helpers/diskspace.utils';
 
@@ -36,7 +36,7 @@ export class RadarrGetterService {
   async get(
     id: number,
     libItem: MediaItem,
-    ruleGroup?: RulesDto,
+    ruleGroup?: RuleGroupDto,
     rule?: RuleDto,
     arrLookupCache?: ArrLookupCache,
   ) {
@@ -67,14 +67,25 @@ export class RadarrGetterService {
         );
       }
 
-      const lookupCandidates =
-        await this.findLookupCandidatesFromMediaItem(libItem);
+      const lookupCandidates = await this.findLookupCandidatesFromMediaItem(
+        libItem,
+        arrLookupCache,
+      );
 
       if (lookupCandidates.length === 0) {
-        this.logger.warn(
-          `Failed to resolve external IDs for '${libItem.title}' with id '${libItem.id}'. As a result, no Radarr query could be made.`,
-        );
-        return null;
+        // An item the media server gave no external IDs for can never resolve,
+        // so log it quietly rather than warning about it every run. The answer
+        // stays transient either way: "we could not look it up" is not the same
+        // claim as "it is not there", and a definitive one would let unmatched
+        // and personal media match NOT_EXISTS rules.
+        const message = `Failed to resolve external IDs for '${libItem.title}' (media server ID '${libItem.id}'). As a result, no Radarr query could be made.`;
+        if (this.metadataService.hasExternalIds(libItem)) {
+          this.logger.warn(message);
+        } else {
+          this.logger.debug(message);
+        }
+
+        return undefined;
       }
 
       const radarrApiClient = await this.servarrService.getRadarrApiClient(
@@ -100,11 +111,19 @@ export class RadarrGetterService {
       });
       const movieResponse = matchedResult?.result;
 
+      if (movieResponse === undefined) {
+        // The Radarr lookup itself failed (or every candidate's lookup
+        // returned undefined) - could be a transient outage. Fail closed
+        // rather than returning null (definitive absence), which would drop
+        // the item from the collection on a transient blip. (#3125)
+        return undefined;
+      }
+
       if (!movieResponse) {
         const attemptedIds = formatMetadataLookupCandidates(lookupCandidates);
 
         this.logger.warn(
-          `None of the resolved external IDs [${attemptedIds}] for '${libItem.title}' matched a movie in Radarr.`,
+          `None of the resolved external IDs [${attemptedIds}] for '${libItem.title}' matched a movie in Radarr. Is the movie tracked in Radarr?`,
         );
         return null;
       }
@@ -151,6 +170,12 @@ export class RadarrGetterService {
               ?.filter((el) => movieTags.includes(el.id))
               .map((el) => el.label);
           }
+          case 'movieTitle': {
+            return movieResponse.title ?? null;
+          }
+          case 'movieId': {
+            return movieResponse.id;
+          }
           case 'profile': {
             const movieProfile = movieResponse.qualityProfileId;
 
@@ -167,7 +192,7 @@ export class RadarrGetterService {
           }
           case 'releaseDate': {
             return movieResponse.physicalRelease && movieResponse.digitalRelease
-              ? (await new Date(movieResponse.physicalRelease)) >
+              ? new Date(movieResponse.physicalRelease) >
                 new Date(movieResponse.digitalRelease)
                 ? new Date(movieResponse.digitalRelease)
                 : new Date(movieResponse.physicalRelease)
@@ -237,10 +262,27 @@ export class RadarrGetterService {
 
   public async findLookupCandidatesFromMediaItem(
     libItem: MediaItem,
+    arrLookupCache?: ArrLookupCache,
   ): Promise<MetadataLookupCandidate[]> {
-    return this.metadataService.resolveLookupCandidatesFromMediaItemForService(
-      libItem,
-      'radarr',
-    );
+    // Candidate resolution (media-server ids -> validated provider ids) is
+    // identical for an item across every condition in a run, yet ran once per
+    // condition - redundant CPU, response cloning and duplicate logs (#3285).
+    // Dedupe it through the same run-scoped memo the arr identity lookup uses.
+    // Evict an empty result so a transient metadata-provider failure retries on
+    // the next condition instead of sticking for the run (mirrors resolveMovie's
+    // evict-on-failure and keeps the #3125 fail-closed behaviour).
+    const resolve = () =>
+      this.metadataService.resolveLookupCandidatesFromMediaItemForService(
+        libItem,
+        'radarr',
+      );
+
+    return arrLookupCache
+      ? arrLookupCache.memoize(
+          `metadata:radarr:${libItem.id}`,
+          resolve,
+          (candidates) => candidates.length === 0,
+        )
+      : resolve();
   }
 }

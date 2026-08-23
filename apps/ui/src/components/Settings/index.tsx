@@ -6,7 +6,11 @@ import {
   useLocation,
   useOutletContext,
 } from 'react-router-dom'
-import { useSettings, type UseSettingsResult } from '../../api/settings'
+import {
+  useServarrSettings,
+  useSettings,
+  type UseSettingsResult,
+} from '../../api/settings'
 import {
   hasCompletedMediaServerSetup,
   hasSelectedMediaServerType,
@@ -22,6 +26,7 @@ import {
   showMediaServerSetupRequiredToast,
 } from '../Layout/MediaServerSetupGuard'
 import SettingsTabs, { SettingsRoute } from './Tabs'
+import { Trans, useLingui } from '@lingui/react/macro'
 
 const mediaServerTabContent = (label?: string) => {
   if (label) {
@@ -113,10 +118,27 @@ export const useSettingsOutletContext = () =>
   useOutletContext<SettingsOutletContext>()
 
 const SettingsWrapper = () => {
+  const { t } = useLingui()
   const location = useLocation()
   const { data: settings, isLoading, error } = useSettings()
   const [hasDismissedSetupWelcome, setHasDismissedSetupWelcome] =
     useState(false)
+
+  // The download client tab is only relevant when Radarr/Sonarr/Sportarr is
+  // configured (it cleans up downloads for media those services delete).
+  const { data: radarrSettings } = useServarrSettings('radarr', {
+    enabled: !!settings,
+  })
+  const { data: sonarrSettings } = useServarrSettings('sonarr', {
+    enabled: !!settings,
+  })
+  const { data: sportarrSettings } = useServarrSettings('sportarr', {
+    enabled: !!settings,
+  })
+  const hasArrConfigured =
+    (radarrSettings?.length ?? 0) > 0 ||
+    (sonarrSettings?.length ?? 0) > 0 ||
+    (sportarrSettings?.length ?? 0) > 0
 
   // Determine which media server tab to show based on settings
   const mediaServerType =
@@ -126,7 +148,7 @@ const SettingsWrapper = () => {
   const settingsRoutes: SettingsRoute[] = useMemo(() => {
     const baseRoutes: SettingsRoute[] = [
       {
-        text: 'General',
+        text: t`General`,
         route: '/settings/main',
         regex: /^\/settings\/main$/,
       },
@@ -155,9 +177,19 @@ const SettingsWrapper = () => {
         regex: /^\/settings\/sonarr$/,
       },
       {
-        text: 'Metadata',
+        text: 'Sportarr',
+        route: '/settings/sportarr',
+        regex: /^\/settings\/sportarr$/,
+      },
+      {
+        text: t`Metadata`,
         route: '/settings/metadata',
         regex: /^\/settings\/metadata$/,
+      },
+      {
+        text: 'Tracearr',
+        route: '/settings/tracearr',
+        regex: /^\/settings\/tracearr$/,
       },
     )
 
@@ -179,31 +211,42 @@ const SettingsWrapper = () => {
       })
     }
 
+    // The download client only cleans up downloads for media deleted through
+    // Radarr/Sonarr/Sportarr, so the tab is only shown when at least one is
+    // configured.
+    if (hasArrConfigured) {
+      baseRoutes.push({
+        text: t`Download client`,
+        route: '/settings/download-client',
+        regex: /^\/settings\/download-client$/,
+      })
+    }
+
     baseRoutes.push(
       {
-        text: 'Notifications',
+        text: t`Notifications`,
         route: '/settings/notifications',
         regex: /^\/settings\/notifications$/,
       },
       {
-        text: 'Logs',
+        text: t`Logs`,
         route: '/settings/logs',
         regex: /^\/settings\/logs$/,
       },
       {
-        text: 'Jobs',
+        text: t`Jobs`,
         route: '/settings/jobs',
         regex: /^\/settings\/jobs$/,
       },
       {
-        text: 'About',
+        text: t`About`,
         route: '/settings/about',
         regex: /^\/settings\/about$/,
       },
     )
 
     return baseRoutes
-  }, [isLoading, mediaServerType])
+  }, [isLoading, mediaServerType, hasArrConfigured, t])
 
   const isMediaServerSetupComplete = hasCompletedMediaServerSetup(settings)
   const hasSelectedMediaServer = hasSelectedMediaServerType(settings)
@@ -233,7 +276,10 @@ const SettingsWrapper = () => {
           <SettingsTabs settingsRoutes={settingsRoutes} allEnabled={false} />
         </div>
         <div className="mt-10 flex">
-          <Alert type="error" title="There was a problem loading settings." />
+          <Alert
+            type="error"
+            title={t`There was a problem loading settings.`}
+          />
         </div>
       </>
     )
@@ -267,7 +313,7 @@ const SettingsWrapper = () => {
       <>
         {shouldShowSetupWelcome ? (
           <Modal
-            title="Welcome to Maintainerr!"
+            title={t`Welcome to Maintainerr!`}
             backgroundClickable={false}
             size="md"
             footerActions={
@@ -276,23 +322,27 @@ const SettingsWrapper = () => {
                 className="ml-3"
                 onClick={() => setHasDismissedSetupWelcome(true)}
               >
-                Let&apos;s get started
+                <Trans>Let&apos;s get started</Trans>
               </Button>
             }
           >
             <div className="space-y-4 text-zinc-100">
               <div className="rounded-md border border-info-500/40 bg-info-900/30 p-4 backdrop-blur-sm">
                 <p className="text-base font-medium text-info-100">
-                  Connect your media server to finish setup.
+                  <Trans>Connect your media server to finish setup.</Trans>
                 </p>
                 <p className="mt-2 leading-6 text-info-200">
-                  Choose your media server, confirm the connection, and then you
-                  can continue configuring the rest of Maintainerr.
+                  <Trans>
+                    Choose your media server, confirm the connection, and then
+                    you can continue configuring the rest of Maintainerr.
+                  </Trans>
                 </p>
               </div>
               <p className="text-sm leading-6 text-zinc-400">
-                The Logs page stays available during setup if you need to
-                troubleshoot your connection.
+                <Trans>
+                  The Logs page stays available during setup if you need to
+                  troubleshoot your connection.
+                </Trans>
               </p>
             </div>
           </Modal>

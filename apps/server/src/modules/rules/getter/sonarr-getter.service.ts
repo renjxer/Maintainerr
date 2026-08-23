@@ -1,6 +1,6 @@
 import { MediaItem, MediaItemType } from '@maintainerr/contracts';
 import { Injectable } from '@nestjs/common';
-import _ from 'lodash';
+import { cloneDeep } from 'lodash';
 import {
   SonarrEpisode,
   SonarrEpisodeFile,
@@ -24,7 +24,7 @@ import {
   RuleConstants,
 } from '../constants/rules.constants';
 import { RuleDto } from '../dtos/rule.dto';
-import { RulesDto } from '../dtos/rules.dto';
+import { RuleGroupDto } from '../dtos/ruleGroup.dto';
 import { ArrLookupCache } from '../helpers/arr-lookup-cache';
 import { evaluateArrDiskspaceGiB } from '../helpers/diskspace.utils';
 
@@ -53,7 +53,7 @@ export class SonarrGetterService {
     id: number,
     libItem: MediaItem,
     dataType?: MediaItemType,
-    ruleGroup?: RulesDto,
+    ruleGroup?: RuleGroupDto,
     rule?: RuleDto,
     arrLookupCache?: ArrLookupCache,
   ) {
@@ -88,10 +88,25 @@ export class SonarrGetterService {
       let seasonRatingKey: number | undefined = undefined;
 
       if (dataType === 'season' || dataType === 'episode') {
-        origLibItem = _.cloneDeep(libItem);
+        origLibItem = cloneDeep(libItem);
         seasonRatingKey = libItem.grandparentId
           ? libItem.parentIndex
           : libItem.index;
+
+        // Every season-scoped read below has to be limited to this number.
+        // Jellyfin and Emby file episodes they can't place under a permanent
+        // "Season Unknown" that carries no index, which leaves it undefined -
+        // and the episode reads drop their season filter when it is, so the
+        // rule would be answered with another season's data. Report the
+        // transport-failure signal instead (same as the outer catch): the
+        // comparator skips the item rather than matching it, and the executor
+        // keeps it in any collection it already belongs to.
+        if (seasonRatingKey == null) {
+          this.logger.debug(
+            `Sonarr-Getter - No season number for '${libItem.title}' with id '${libItem.id}'; skipping this item.`,
+          );
+          return undefined;
+        }
 
         // get (grand)parent
         const mediaServer = await this.getMediaServer();
@@ -100,14 +115,25 @@ export class SonarrGetterService {
         );
       }
 
-      const lookupCandidates =
-        await this.findLookupCandidatesFromMediaItem(libItem);
+      const lookupCandidates = await this.findLookupCandidatesFromMediaItem(
+        libItem,
+        arrLookupCache,
+      );
 
       if (lookupCandidates.length === 0) {
-        this.logger.warn(
-          `Failed to resolve external IDs for '${libItem.title}' with id '${libItem.id}'. As a result, no Sonarr query could be made.`,
-        );
-        return null;
+        // An item the media server gave no external IDs for can never resolve,
+        // so log it quietly rather than warning about it every run. The answer
+        // stays transient either way: "we could not look it up" is not the same
+        // claim as "it is not there", and a definitive one would let unmatched
+        // and personal media match NOT_EXISTS rules.
+        const message = `Failed to resolve external IDs for '${libItem.title}' (media server ID '${libItem.id}'). As a result, no Sonarr query could be made.`;
+        if (this.metadataService.hasExternalIds(libItem)) {
+          this.logger.warn(message);
+        } else {
+          this.logger.debug(message);
+        }
+
+        return undefined;
       }
 
       const sonarrApiClient = await this.servarrService.getSonarrApiClient(
@@ -116,7 +142,7 @@ export class SonarrGetterService {
 
       // The series lookup is keyed on the resolved tvdbId and is identical for
       // every episode/season of a show. The API call stays uncached (the
-      // cleanup needs post-deletion truth — #2757/#2891), but during rule
+      // cleanup needs post-deletion truth - #2757/#2891), but during rule
       // evaluation we dedupe it through the run-scoped memo, which is gone
       // before any deletion runs. Evict on a failed (undefined) lookup so a
       // transient error doesn't mark the whole series unresolved for the run.
@@ -130,23 +156,56 @@ export class SonarrGetterService {
             )
           : sonarrApiClient.getSeriesByTvdbId(lookupId);
 
-      const matchedResult = await findMetadataLookupMatch(lookupCandidates, {
-        tvdb: (lookupId) => resolveSeries(lookupId),
-      });
-      const showResponse: SonarrSeries | undefined = matchedResult?.result;
+      const matchedResult = await findMetadataLookupMatch<SonarrSeries | null>(
+        lookupCandidates,
+        {
+          tvdb: (lookupId) => resolveSeries(lookupId),
+        },
+      );
+      const showResponse: SonarrSeries | null | undefined =
+        matchedResult?.result;
+
+      if (showResponse === undefined) {
+        // The Sonarr lookup itself failed (or every candidate's lookup
+        // returned undefined) - could be a transient outage. Fail closed
+        // rather than substituting metadata-provider values, which would
+        // silently change rule evaluation while Sonarr is down.
+        return undefined;
+      }
 
       if (!showResponse?.id) {
+        // Sonarr confirmed the series isn't tracked. Fall back to the
+        // configured metadata provider for properties whose value doesn't
+        // depend on Sonarr's local state.
+        const fallback = await this.tryMetadataFallback(
+          libItem,
+          prop?.name,
+          dataType,
+          arrLookupCache,
+        );
+        if (fallback.handled) {
+          this.logger.debug(
+            `Sonarr-Getter - '${libItem.title}' not in Sonarr; serving '${prop?.name}' from metadata provider. Is the series intentionally absent from Sonarr?`,
+          );
+          return fallback.value;
+        }
+
         const attemptedIds = formatMetadataLookupCandidates(lookupCandidates);
 
         this.logger.warn(
-          `None of the resolved external IDs [${attemptedIds}] for '${libItem.title}' matched a series in Sonarr.`,
+          `None of the resolved external IDs [${attemptedIds}] for '${libItem.title}' matched a series in Sonarr. Is the series tracked in Sonarr?`,
         );
         return null;
       }
 
-      const season = seasonRatingKey
-        ? showResponse.seasons.find((el) => el.seasonNumber === seasonRatingKey)
-        : undefined;
+      // Season 0 is the specials season, so test for a number rather than
+      // truthiness - `0` would otherwise read as "no season".
+      const season =
+        seasonRatingKey != null
+          ? showResponse.seasons.find(
+              (el) => el.seasonNumber === seasonRatingKey,
+            )
+          : undefined;
 
       // Lazy-load episode / episodeFile only if a property actually needs them.
       let episodePromise: Promise<SonarrEpisode | undefined> | undefined;
@@ -164,17 +223,13 @@ export class SonarrGetterService {
         }
 
         episodePromise ??= (async () => {
-          const seasonNumber = origLibItem.grandparentId
-            ? origLibItem.parentIndex
-            : origLibItem.index;
-
           const episodeNumbers = [
             origLibItem.grandparentId ? origLibItem.index : 1,
           ];
 
           const episodes = await sonarrApiClient.getEpisodes(
             showResponse.id,
-            seasonNumber,
+            seasonRatingKey,
             episodeNumbers,
           );
 
@@ -185,8 +240,7 @@ export class SonarrGetterService {
       };
 
       let episodeFilePromise:
-        | Promise<SonarrEpisodeFile | undefined>
-        | undefined;
+        Promise<SonarrEpisodeFile | undefined> | undefined;
       const getEpisodeFile = async (): Promise<
         SonarrEpisodeFile | undefined
       > => {
@@ -207,8 +261,7 @@ export class SonarrGetterService {
       };
 
       let seasonEpisodesPromise:
-        | Promise<SonarrEpisode[] | undefined>
-        | undefined;
+        Promise<SonarrEpisode[] | undefined> | undefined;
       const getSeasonEpisodes = async (): Promise<
         SonarrEpisode[] | undefined
       > => {
@@ -226,14 +279,16 @@ export class SonarrGetterService {
 
         seasonEpisodesPromise ??= sonarrApiClient.getEpisodes(
           showResponse.id,
-          origLibItem.grandparentId
-            ? origLibItem.parentIndex
-            : origLibItem.index,
+          seasonRatingKey,
         );
 
         return seasonEpisodesPromise;
       };
 
+      // Run-scoped cache for the full series episode list: one fetch per
+      // show per rule-run (single-`get()` memo without the cache). Evicts on
+      // transient `undefined` so one failed fetch doesn't poison the run
+      // (matches `resolveSeries` above).
       let showEpisodesPromise: Promise<SonarrEpisode[] | undefined> | undefined;
       const getShowEpisodes = async (): Promise<
         SonarrEpisode[] | undefined
@@ -242,10 +297,110 @@ export class SonarrGetterService {
           return undefined;
         }
 
-        showEpisodesPromise ??= sonarrApiClient.getEpisodes(showResponse.id);
+        showEpisodesPromise ??= arrLookupCache
+          ? arrLookupCache.memoize(
+              `sonarr:${settingsId}:episodes-all:${showResponse.id}`,
+              () => sonarrApiClient.getEpisodes(showResponse.id),
+              (episodes) => episodes === undefined,
+            )
+          : sonarrApiClient.getEpisodes(showResponse.id);
 
         return showEpisodesPromise;
       };
+
+      // Rank maps for episodeFileRank / seasonFileRank. Identical for every
+      // item of the show within a run, so cache them - otherwise a long
+      // daily series re-sorts the pool once per item. The air-date cutoff is
+      // captured by the first build per show, so every item of the show
+      // ranks against one consistent cutoff within a run. The airDate map
+      // backs the daily-series fallback (Plex items with a date but no
+      // episode number); the season map ranks seasons by their newest
+      // downloaded episode.
+      const buildRankMaps = async (): Promise<
+        | {
+            rankByEpisode: Map<string, number>;
+            rankByAirDate: Map<string, number>;
+            rankBySeason: Map<number, number>;
+          }
+        | undefined
+      > => {
+        const episodes = await getShowEpisodes();
+        if (episodes === undefined) {
+          return undefined;
+        }
+
+        const nowMs = Date.now();
+        const pool = episodes
+          .map((e) => {
+            // Sonarr emits `'0001-01-01T00:00:00Z'` as the .NET null-date
+            // sentinel (see the `showResponse.added` checks above). It
+            // parses to a finite very-negative ms and would otherwise sneak
+            // into the pool with a bogus year-1 air date.
+            const airMs =
+              e.airDateUtc && e.airDateUtc !== '0001-01-01T00:00:00Z'
+                ? new Date(e.airDateUtc).getTime()
+                : NaN;
+            return {
+              seasonNumber: e.seasonNumber,
+              episodeNumber: e.episodeNumber,
+              hasFile: e.hasFile,
+              airMs,
+              // Sonarr ships `airDate` as the broadcast-day in the show's local
+              // calendar (YYYY-MM-DD). Plex's `originallyAvailableAt` parses to the
+              // same calendar date via ISO date-only semantics, so keying on the
+              // string aligns both sides without UTC-day math (which would slip a
+              // day for any primetime broadcast outside UTC).
+              airDayKey:
+                e.airDate && e.airDate !== '0001-01-01' ? e.airDate : null,
+            };
+          })
+          .filter(
+            (e) =>
+              e.hasFile === true &&
+              e.seasonNumber > 0 &&
+              Number.isFinite(e.airMs) &&
+              e.airMs <= nowMs,
+          );
+
+        pool.sort((a, b) => {
+          if (a.airMs !== b.airMs) return b.airMs - a.airMs;
+          if (b.seasonNumber !== a.seasonNumber) {
+            return b.seasonNumber - a.seasonNumber;
+          }
+          return b.episodeNumber - a.episodeNumber;
+        });
+
+        const rankByEpisode = new Map<string, number>();
+        const rankByAirDate = new Map<string, number>();
+        const rankBySeason = new Map<number, number>();
+        for (let i = 0; i < pool.length; i++) {
+          const e = pool[i];
+          const rank = i + 1;
+          rankByEpisode.set(`${e.seasonNumber}:${e.episodeNumber}`, rank);
+          // First-wins on same-day collisions: the newer episode of a
+          // same-day double already holds the slot, which is the
+          // conservative (keep) outcome when a daily-series Plex item
+          // carries only the date.
+          if (e.airDayKey !== null && !rankByAirDate.has(e.airDayKey)) {
+            rankByAirDate.set(e.airDayKey, rank);
+          }
+          // Seasons rank in order of first appearance in the newest-first
+          // pool, i.e. by the air date of their newest downloaded episode.
+          if (!rankBySeason.has(e.seasonNumber)) {
+            rankBySeason.set(e.seasonNumber, rankBySeason.size + 1);
+          }
+        }
+        return { rankByEpisode, rankByAirDate, rankBySeason };
+      };
+
+      const getRankMaps = () =>
+        arrLookupCache
+          ? arrLookupCache.memoize(
+              `sonarr:${settingsId}:rank-maps:${showResponse.id}`,
+              buildRankMaps,
+              (maps) => maps === undefined,
+            )
+          : buildRankMaps();
 
       switch (prop.name) {
         case 'addDate': {
@@ -286,6 +441,12 @@ export class SonarrGetterService {
           return (await sonarrApiClient.getTags())
             ?.filter((el) => tagIds.includes(el.id))
             .map((el) => el.label);
+        }
+        case 'seriesTitle': {
+          return showResponse.title ?? null;
+        }
+        case 'seriesId': {
+          return showResponse.id;
         }
         case 'qualityProfileId': {
           const episodeFile = await getEpisodeFile();
@@ -354,6 +515,9 @@ export class SonarrGetterService {
           // returns true if a season with unaired episodes is found in monitored seasons
           const data: SonarrSeason[] = [];
           if (dataType === 'season') {
+            if (!season) {
+              return undefined;
+            }
             data.push(season);
           } else {
             data.push(...showResponse.seasons.filter((el) => el.monitored));
@@ -385,17 +549,24 @@ export class SonarrGetterService {
         case 'part_of_latest_season': {
           // returns the true when this is the latest season or the episode is part of the latest season
           if (dataType === 'season' || dataType === 'episode') {
-            return season.seasonNumber && showResponse.seasons
-              ? +season.seasonNumber ===
-                  (
-                    await this.getLastAiredOrCurrentlyAiringSeason(
-                      showResponse.seasons,
-                      showResponse.id,
-                      sonarrApiClient,
-                    )
-                  )?.seasonNumber
-              : false;
+            // A season Sonarr does not list cannot be judged - skip the item
+            // rather than answer. Season 0 is a real season: specials compare
+            // like any other, and are the latest when only specials aired.
+            if (!season) {
+              return undefined;
+            }
+            return (
+              +season.seasonNumber ===
+              (
+                await this.getLastAiredOrCurrentlyAiringSeason(
+                  showResponse.seasons,
+                  showResponse.id,
+                  sonarrApiClient,
+                )
+              )?.seasonNumber
+            );
           }
+          return null;
         }
         case 'originalLanguage': {
           return showResponse.originalLanguage?.name
@@ -418,7 +589,7 @@ export class SonarrGetterService {
           );
         }
         case 'seasonNumber': {
-          return season.seasonNumber;
+          return season?.seasonNumber ?? null;
         }
         case 'rating': {
           return showResponse.ratings?.value ?? null;
@@ -462,6 +633,86 @@ export class SonarrGetterService {
                 showResponse.statistics.episodeFileCount
             : null;
         }
+        case 'seasonFileRank': {
+          // Rank a season within its show by the air date of its newest
+          // downloaded episode (newest season = 1). Seasons without any
+          // downloaded episode take no rank slot; specials (S00) are
+          // excluded. Out-of-pool seasons get rank `null` so the comparator
+          // stays fail-closed. Pair with a scope filter (`Sonarr.seriesId`)
+          // to avoid library-wide application.
+          if (dataType !== 'season') {
+            return null;
+          }
+
+          const rankMaps = await getRankMaps();
+          if (rankMaps === undefined) {
+            return undefined;
+          }
+
+          return rankMaps.rankBySeason.get(seasonRatingKey) ?? null;
+        }
+        case 'episodeFileRank': {
+          // Rank an episode within its show by air date (newest = 1) among
+          // the episodes currently on disk. Pool requires `hasFile === true`
+          // and excludes specials (S00), unaired, and null-airDate episodes;
+          // out-of-pool episodes get rank `null` so the comparator stays
+          // fail-closed. Pair with a scope filter (`Sonarr.tags` or
+          // `Sonarr.seriesTitle`) to avoid library-wide application.
+          if (dataType !== 'episode' || !origLibItem) {
+            return null;
+          }
+
+          const rankMaps = await getRankMaps();
+          if (rankMaps === undefined) {
+            return undefined;
+          }
+          const { rankByEpisode, rankByAirDate } = rankMaps;
+          if (rankByEpisode.size === 0) {
+            return null;
+          }
+
+          const targetSeasonNumber = seasonRatingKey;
+          const targetEpisodeNumber = origLibItem.grandparentId
+            ? origLibItem.index
+            : 1;
+
+          const directRank = rankByEpisode.get(
+            `${targetSeasonNumber}:${targetEpisodeNumber}`,
+          );
+          if (directRank !== undefined) {
+            return directRank;
+          }
+
+          // Daily-series fallback: Plex episodes for daily-air shows carry
+          // `parentIndex = <year>` but no `index`, so the season:episode
+          // lookup misses. Sonarr identifies these episodes by air date, so
+          // when there's no episode number to key by, fall back to the
+          // airDate map. `originallyAvailableAt` is mapped to a Date by the
+          // Plex/Jellyfin/Emby adapters; an invalid Date or the .NET null
+          // sentinel returns null (fail-closed).
+          if (targetEpisodeNumber === undefined) {
+            const target = origLibItem.originallyAvailableAt;
+            if (!(target instanceof Date)) {
+              return null;
+            }
+            const targetMs = target.getTime();
+            if (!Number.isFinite(targetMs)) {
+              return null;
+            }
+            // Reject the .NET null sentinel symmetrically with the pool side.
+            if (target.toISOString() === '0001-01-01T00:00:00.000Z') {
+              return null;
+            }
+            // ISO date-only parsing of Plex/Jellyfin/Emby `originallyAvailableAt`
+            // lands the Date at UTC-midnight of the broadcast date, so the leading
+            // 10 chars are the broadcast-day YYYY-MM-DD - matching Sonarr's
+            // `airDate` shape exactly.
+            const targetDayKey = target.toISOString().slice(0, 10);
+            return rankByAirDate.get(targetDayKey) ?? null;
+          }
+
+          return null;
+        }
       }
     } catch (error) {
       this.logger.warn(
@@ -480,14 +731,17 @@ export class SonarrGetterService {
    *
    * @param {SonarrSeason[]} seasons - The array of seasons to search through.
    * @param {number} showId - The ID of the show.
-   * @return {Promise<SonarrSeason>} The last season found, or undefined if none is found.
+   * @return {Promise<SonarrSeason | undefined>} The last season found, or undefined if none is found.
    */
   private async getLastAiredOrCurrentlyAiringSeason(
     seasons: SonarrSeason[],
     showId: number,
     apiClient: SonarrApi,
-  ): Promise<SonarrSeason> {
-    for (const s of seasons.reverse()) {
+  ): Promise<SonarrSeason | undefined> {
+    // `seasons` belongs to the run-shared memoized series; reversing in place
+    // corrupts season order for the show's other (concurrently evaluated)
+    // seasons (#3153). Reverse a copy.
+    for (const s of [...seasons].reverse()) {
       const epResp = await apiClient.getEpisodes(showId, s.seasonNumber, [1]);
 
       if (epResp[0]?.airDateUtc === undefined) {
@@ -509,10 +763,115 @@ export class SonarrGetterService {
 
   public async findLookupCandidatesFromMediaItem(
     libItem: MediaItem,
+    arrLookupCache?: ArrLookupCache,
   ): Promise<MetadataLookupCandidate[]> {
-    return this.metadataService.resolveLookupCandidatesFromMediaItemForService(
-      libItem,
-      'sonarr',
-    );
+    // Candidate resolution (media-server ids -> validated provider ids) is
+    // identical for an item across every condition in a run, yet ran once per
+    // condition - redundant CPU, response cloning and duplicate logs (#3285).
+    // Dedupe it through the same run-scoped memo the arr identity lookup uses.
+    // libItem here is already the parent show (season/episode items are resolved
+    // up to it above), so the key collapses every season/episode of a show onto
+    // one entry. Evict an empty result so a transient metadata-provider failure
+    // retries next condition instead of sticking (mirrors resolveSeries's
+    // evict-on-failure and keeps the #3125 fail-closed behaviour).
+    const resolve = () =>
+      this.metadataService.resolveLookupCandidatesFromMediaItemForService(
+        libItem,
+        'sonarr',
+      );
+
+    return arrLookupCache
+      ? arrLookupCache.memoize(
+          `metadata:sonarr:${libItem.id}`,
+          resolve,
+          (candidates) => candidates.length === 0,
+        )
+      : resolve();
+  }
+
+  // Sonarr properties whose semantics match cleanly across Sonarr / TMDB /
+  // TVDB. Deliberately excluded even though providers expose something
+  // similar: `status` (Sonarr lowercase enum vs provider free-form strings),
+  // `originalLanguage` (full name vs ISO 639-1 vs ISO 639-2/B), and `rating`
+  // (different scales / aggregations). Sonarr-only state (monitored, tags,
+  // filePath, diskSize, …) is also absent - providers can't supply it.
+  private static readonly METADATA_FALLBACK_SUPPORTED = new Set([
+    'ended',
+    'firstAirDate',
+    'seasons',
+  ]);
+
+  private async tryMetadataFallback(
+    libItem: MediaItem,
+    propName: string | undefined,
+    dataType: MediaItemType | undefined,
+    arrLookupCache?: ArrLookupCache,
+  ): Promise<
+    { handled: false } | { handled: true; value: number | string | Date | null }
+  > {
+    if (
+      !propName ||
+      !SonarrGetterService.METADATA_FALLBACK_SUPPORTED.has(propName)
+    ) {
+      return { handled: false };
+    }
+
+    // At season/episode scope these properties mean episode-specific values
+    // that a show-level provider record can't supply.
+    if (
+      (propName === 'firstAirDate' || propName === 'seasons') &&
+      (dataType === 'season' || dataType === 'episode')
+    ) {
+      return { handled: false };
+    }
+
+    // Same per-condition redundancy as findLookupCandidatesFromMediaItem
+    // (#3285): dedupe this resolution through the run-scoped memo. A DISTINCT key
+    // from the candidate memo - this fallback resolves under the default
+    // (all-provider) policy, not the Sonarr {tvdb} policy, so it can produce a
+    // different result for the same show id. Evict an unresolved / non-tv result
+    // so a transient metadata-provider failure retries next condition.
+    const resolveTvIds = () =>
+      this.metadataService.resolveIdsFromMediaItem(libItem);
+    const ids = await (arrLookupCache
+      ? arrLookupCache.memoize(
+          `metadata:sonarr:details:${libItem.id}`,
+          resolveTvIds,
+          (resolved) => !resolved || resolved.type !== 'tv',
+        )
+      : resolveTvIds());
+    if (!ids || ids.type !== 'tv') {
+      return { handled: false };
+    }
+
+    // Merge across every configured provider so a partial primary record
+    // doesn't mask a field a secondary could supply.
+    const details = await this.metadataService.getDetails(ids, 'tv', {
+      merge: true,
+    });
+    if (!details) {
+      return { handled: false };
+    }
+
+    switch (propName) {
+      case 'ended':
+        return {
+          handled: true,
+          value: details.ended === undefined ? null : details.ended ? 1 : 0,
+        };
+      case 'firstAirDate':
+        return {
+          handled: true,
+          value: details.firstAirDate ? new Date(details.firstAirDate) : null,
+        };
+      case 'seasons':
+        // Match the existing Sonarr-path truthiness check (0 → null).
+        return {
+          handled: true,
+          value: details.seasonCount ? details.seasonCount : null,
+        };
+    }
+
+    return { handled: false };
   }
 }

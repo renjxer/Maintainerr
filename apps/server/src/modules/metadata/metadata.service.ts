@@ -21,8 +21,16 @@ import {
   PersonDetails,
   ProviderIds,
   ResolvedMediaIds,
+  TvHierarchyRef,
 } from './interfaces/metadata.types';
 import { MetadataLookupCandidate } from './metadata-lookup.util';
+
+/** A provider's year that disagreed with the media server's, kept for agreement checks. */
+interface ProviderYearDisagreement {
+  providerName: string;
+  year: number;
+  details: MetadataDetails;
+}
 
 @Injectable()
 export class MetadataService {
@@ -85,7 +93,7 @@ export class MetadataService {
 
   /**
    * Validates policy provider keys against all registered providers (not just
-   * available ones). An unavailable provider key like 'tvdb' is still valid —
+   * available ones). An unavailable provider key like 'tvdb' is still valid -
    * it just means the provider isn't configured right now. The "unsupported"
    * warning only fires for completely unknown keys (e.g. a typo).
    */
@@ -222,6 +230,24 @@ export class MetadataService {
       this.getLookupPolicyForService(service),
       fallbackIds,
     );
+  }
+
+  /**
+   * Whether the item carries any external id a lookup could start from.
+   *
+   * Purely local - it reads what the media server already sent and makes no
+   * request - so a `false` here can never be an outage. Resolution answering
+   * `undefined` otherwise means two different things: "nothing to look up" and
+   * "the lookup failed", and only the second should pause rule evaluation.
+   *
+   * Note this is broader than "TMDB or TVDB can extract an id": an item with
+   * only an imdb id has neither, but is still resolvable online by
+   * cross-referencing, so it must not count as unresolvable.
+   */
+  public hasExternalIds(item: MediaItem): boolean {
+    const ids = this.extractDirectIds(item);
+
+    return Object.entries(ids).some(([key, value]) => key !== 'type' && value);
   }
 
   public async resolveLookupCandidatesFromMediaItemForService(
@@ -361,7 +387,17 @@ export class MetadataService {
     item: MediaItem,
     sourceMediaServerId?: string,
   ): Promise<MediaItem | undefined> {
-    const hierarchyTargetId = item.grandparentId ?? item.parentId;
+    // Only episodes/seasons resolve their ids from a parent (up to the show).
+    // A movie's (or show's) own provider ids live on the item itself, and on
+    // Emby/Jellyfin a movie's parentId points at an id-less library/container
+    // folder - walking up there discards the real ids and the lookup fails
+    // (#3065). Switch on item.type, never on parentId presence.
+    if (item.type !== 'season' && item.type !== 'episode') {
+      return item;
+    }
+
+    const hierarchyTargetId =
+      item.type === 'episode' ? item.grandparentId : item.parentId;
 
     if (!hierarchyTargetId) {
       return item;
@@ -495,53 +531,182 @@ export class MetadataService {
     );
   }
 
+  /**
+   * Returns metadata details for the given IDs.
+   *
+   * Default behavior (no options): walks providers in preference order and
+   * returns the first non-undefined record - the fast path that existing
+   * callers (poster/backdrop lookups, ID resolution) rely on.
+   *
+   * `{ merge: true }`: walks every available provider and fills any optional
+   * field the primary left undefined from later providers. Field-agnostic, so
+   * any new optional field on `MetadataDetails` is picked up automatically.
+   * Use this for fallback paths where it's worth doubling cold-cache API
+   * calls to avoid silent nulls when the primary returns a partial record.
+   */
   async getDetails(
     ids: ProviderIds,
     type: 'movie' | 'tv',
+    options: { merge?: boolean } = {},
   ): Promise<MetadataDetails | undefined> {
-    const providerResult = await this.withProviderFallbackDetailed(
-      ids,
-      (provider, id) => provider.getDetails(id, type),
-    );
+    if (!options.merge) {
+      const providerResult = await this.withProviderFallbackDetailed(
+        ids,
+        (provider, id) => provider.getDetails(id, type),
+      );
 
-    if (!providerResult) {
+      if (!providerResult) {
+        return undefined;
+      }
+
+      if (providerResult.result.externalIds) {
+        await this.applyIdCorrections(
+          ids,
+          providerResult.result.externalIds,
+          providerResult.provider,
+          type,
+        );
+      }
+
+      return providerResult.result;
+    }
+
+    let merged: MetadataDetails | undefined;
+    let primaryProviderName: string | undefined;
+
+    for (const provider of this.getOrderedProviders()) {
+      const id = provider.extractId(ids);
+      if (id === undefined) {
+        continue;
+      }
+
+      const details = await provider.getDetails(id, type);
+      if (!details) {
+        continue;
+      }
+
+      if (!merged) {
+        merged = { ...details };
+        primaryProviderName = provider.name;
+        continue;
+      }
+
+      // Safe write: optional MetadataDetails fields are the only ones that
+      // can be undefined on `merged`; required fields (id, title, type,
+      // externalIds) are always set by the primary, so the assignment only
+      // ever fills holes in optional slots.
+      const mergedRecord = merged as unknown as Record<string, unknown>;
+      const detailsRecord = details as unknown as Record<string, unknown>;
+      for (const key of Object.keys(detailsRecord)) {
+        if (
+          mergedRecord[key] === undefined &&
+          detailsRecord[key] !== undefined
+        ) {
+          mergedRecord[key] = detailsRecord[key];
+        }
+      }
+    }
+
+    if (!merged) {
       return undefined;
     }
 
-    if (providerResult.result.externalIds) {
-      this.applyIdCorrections(
+    if (merged.externalIds && primaryProviderName) {
+      await this.applyIdCorrections(
         ids,
-        providerResult.result.externalIds,
-        providerResult.provider,
+        merged.externalIds,
+        primaryProviderName,
+        type,
       );
     }
 
-    return providerResult.result;
+    return merged;
   }
 
-  private applyIdCorrections(
+  /**
+   * Media-server IDs are authoritative. A same-provider redirect is trusted; a
+   * cross-provider correction is applied only if it round-trips, so a wrong/dead
+   * cross-reference (#3010) can't overwrite a good ID.
+   */
+  private async applyIdCorrections(
     ids: ProviderIds,
     externalIds: ProviderIds,
     sourceProviderName: string,
+    type: 'movie' | 'tv',
     itemTitle?: string,
-  ): void {
+  ): Promise<void> {
+    const sourceProvider = this.providers.find(
+      (provider) => provider.name === sourceProviderName,
+    );
+    const sourceId = sourceProvider?.extractId(externalIds);
+    const target = itemTitle ? ` for "${itemTitle}"` : '';
+
     for (const provider of this.providers) {
       const currentId = provider.extractId(ids);
-      const correctId = provider.extractId(externalIds);
+      const proposedId = provider.extractId(externalIds);
 
       if (
         currentId === undefined ||
-        correctId === undefined ||
-        currentId === correctId
+        proposedId === undefined ||
+        currentId === proposedId
       ) {
         continue;
       }
 
-      const target = itemTitle ? ` for "${itemTitle}"` : '';
+      // Same-provider id is a redirect - authoritative, no lookup needed.
+      const isRedirect = provider === sourceProvider;
+
+      // Don't corroborate against an unconfigured provider: keep the id silently
+      // rather than fire an outbound request/warning on TMDB-only setups.
+      if (!isRedirect && !provider.isAvailable()) {
+        continue;
+      }
+
+      if (
+        isRedirect ||
+        (await this.crossReferenceRoundTrips(
+          provider,
+          proposedId,
+          sourceProvider,
+          sourceId,
+          type,
+        ))
+      ) {
+        this.logger.warn(
+          `Corrected ${provider.name} ID${target}: ${currentId} to ${proposedId} via ${sourceProviderName} cross-reference. The media server's original ID appears outdated.`,
+        );
+        provider.assignId(ids, proposedId);
+        continue;
+      }
+
       this.logger.warn(
-        `Corrected ${provider.name} ID${target}: ${currentId} to ${correctId} via ${sourceProviderName} cross-reference. The media server may have incorrect metadata for this item.`,
+        `Kept media-server ${provider.name} ID${target}: ${currentId}. ${sourceProviderName} cross-reference suggested ${proposedId}, but a direct ${provider.name} lookup did not corroborate it, so the original media-server ID was preserved.`,
       );
-      provider.assignId(ids, correctId);
+    }
+  }
+
+  /** Fail-closed: the proposed ID must resolve and point back at the source ID. */
+  private async crossReferenceRoundTrips(
+    provider: IMetadataProvider,
+    proposedId: number,
+    sourceProvider: IMetadataProvider | undefined,
+    sourceId: number | undefined,
+    type: 'movie' | 'tv',
+  ): Promise<boolean> {
+    if (!sourceProvider || sourceId === undefined) {
+      return false;
+    }
+
+    try {
+      const proposedDetails = await provider.getDetails(proposedId, type);
+      if (!proposedDetails?.externalIds) {
+        return false;
+      }
+
+      return sourceProvider.extractId(proposedDetails.externalIds) === sourceId;
+    } catch (error) {
+      this.logger.debug(error);
+      return false;
     }
   }
 
@@ -557,43 +722,86 @@ export class MetadataService {
     size = 'w500',
     mediaServerItemId?: string,
   ): Promise<{ url: string; provider: string; id: number } | undefined> {
-    const resolvedIds = await this.resolveShowIdsForImage(
+    const { ids: resolvedIds, hierarchy } = await this.resolveShowLookup(
       ids,
       type,
       mediaServerItemId,
     );
     return this.resolveImageUrl(resolvedIds, type, (provider, id) =>
-      provider.getPosterUrl(id, type, size),
+      provider.getPosterUrl(id, type, { sizeHint: size, ref: hierarchy }),
     );
   }
 
+  /**
+   * Episodes resolve to their own still. Seasons keep the show's backdrop -
+   * TMDB's season image set is posters-only, and TVDB's series record carries
+   * a single image per season, so neither offers a season background to use.
+   */
   async getBackdropUrl(
     ids: ProviderIds,
     type: 'movie' | 'tv',
     size = 'w1280',
     mediaServerItemId?: string,
   ): Promise<{ url: string; provider: string; id: number } | undefined> {
-    const resolvedIds = await this.resolveShowIdsForImage(
+    const { ids: resolvedIds, hierarchy } = await this.resolveShowLookup(
       ids,
       type,
       mediaServerItemId,
     );
     return this.resolveImageUrl(resolvedIds, type, (provider, id) =>
-      provider.getBackdropUrl(id, type, size),
+      provider.getBackdropUrl(id, type, { sizeHint: size, ref: hierarchy }),
     );
   }
 
   /**
-   * For season/episode items, resolve the parent show's provider IDs so that
-   * image lookups use show-level IDs instead of season-specific ones.
+   * Provider description for an item, used where the media server has none of
+   * its own. Seasons and episodes resolve to their own description and fall
+   * back to the show's when the provider only describes the series.
    */
-  private async resolveShowIdsForImage(
+  async getOverview(
     ids: ProviderIds,
     type: 'movie' | 'tv',
     mediaServerItemId?: string,
-  ): Promise<ProviderIds> {
+  ): Promise<string | undefined> {
+    const { ids: resolvedIds, hierarchy } = await this.resolveShowLookup(
+      ids,
+      type,
+      mediaServerItemId,
+    );
+
+    // Same ID resolution the image lookups run, so an item the media server
+    // only tagged with one provider's ID still reaches a configured provider.
+    const providerIds: ResolvedMediaIds = { ...resolvedIds, type };
+    await this.resolveAllIds(providerIds, this.getOrderedProviderKeys());
+
+    if (hierarchy) {
+      const hierarchyOverview = await this.withProviderFallback(
+        providerIds,
+        (provider, id) => provider.getHierarchyOverview(id, hierarchy),
+      );
+
+      if (hierarchyOverview) {
+        return hierarchyOverview;
+      }
+    }
+
+    const details = await this.getDetails(providerIds, type);
+    return details?.overview || undefined;
+  }
+
+  /**
+   * For season/episode items, resolve the parent show's provider IDs so that
+   * lookups use show-level IDs instead of season-specific ones, and report
+   * which season/episode the item is so providers can answer for it rather
+   * than for the show.
+   */
+  private async resolveShowLookup(
+    ids: ProviderIds,
+    type: 'movie' | 'tv',
+    mediaServerItemId?: string,
+  ): Promise<{ ids: ProviderIds; hierarchy?: TvHierarchyRef }> {
     if (!mediaServerItemId || type !== 'tv') {
-      return ids;
+      return { ids };
     }
 
     try {
@@ -601,20 +809,21 @@ export class MetadataService {
       const item = await mediaServer.getMetadata(mediaServerItemId);
 
       if (!item || (item.type !== 'season' && item.type !== 'episode')) {
-        return ids;
+        return { ids };
       }
 
+      const hierarchy = this.readHierarchyRef(item);
       const showId =
         item.type === 'episode' ? item.grandparentId : item.parentId;
 
       if (!showId) {
-        return ids;
+        return { ids, hierarchy };
       }
 
       const show = await mediaServer.getMetadata(showId);
 
       if (!show) {
-        return ids;
+        return { ids, hierarchy };
       }
 
       const showIds = this.extractDirectIds(show);
@@ -626,13 +835,31 @@ export class MetadataService {
         }
       }
 
-      return merged;
+      return { ids: merged, hierarchy };
     } catch (err) {
       this.logger.warn(
         `Failed to resolve show IDs for item ${mediaServerItemId}: ${err}`,
       );
-      return ids;
+      return { ids };
     }
+  }
+
+  /**
+   * A season is its own `index`; an episode is its `index` inside `parentIndex`.
+   * Season 0 (specials) is a real season, so guard on null, not truthiness.
+   */
+  private readHierarchyRef(item: MediaItem): TvHierarchyRef | undefined {
+    if (item.type === 'season') {
+      return item.index != null ? { seasonNumber: item.index } : undefined;
+    }
+
+    if (item.type === 'episode') {
+      return item.parentIndex != null
+        ? { seasonNumber: item.parentIndex, episodeNumber: item.index }
+        : undefined;
+    }
+
+    return undefined;
   }
 
   private hasRequiredIds(
@@ -794,7 +1021,7 @@ export class MetadataService {
    * configured providers in preference order. Each provider is asked for
    * details about whatever direct ID it can extract from the item, and
    * the first provider whose release year matches the media server's year
-   * "vouches" for the ID set — we return its details and use its external
+   * "vouches" for the ID set - we return its details and use its external
    * IDs to fill in the other provider slots.
    *
    * This is the ID-primary / year-sanity model:
@@ -805,7 +1032,7 @@ export class MetadataService {
    *     form, edition suffixes) is normal and comparing them caused the
    *     regressions in #2636 / #2638.
    *   - Cross-provider fallback gives the library a second opinion when
-   *     the preferred provider disagrees with the media server on year —
+   *     the preferred provider disagrees with the media server on year -
    *     the scenario the metadata settings description already promises
    *     users when they configure TVDB alongside TMDB.
    *
@@ -818,7 +1045,7 @@ export class MetadataService {
     ids: ResolvedMediaIds,
   ): Promise<MetadataDetails | undefined> {
     const itemYear = this.readItemYear(item);
-    const disagreements: string[] = [];
+    const disagreements: ProviderYearDisagreement[] = [];
     const consulted = new Set<IMetadataProvider>();
 
     const evaluate = async (
@@ -833,10 +1060,11 @@ export class MetadataService {
       if (!providerDetails) return undefined;
 
       if (providerDetails.externalIds) {
-        this.applyIdCorrections(
+        await this.applyIdCorrections(
           ids,
           providerDetails.externalIds,
           provider.name,
+          ids.type,
           item.title,
         );
         this.fillMissingIds(ids, providerDetails.externalIds);
@@ -849,13 +1077,13 @@ export class MetadataService {
       // in untagged libraries and stays at debug.
       if (providerDetails.year === undefined) {
         this.logger.warn(
-          `Accepted direct provider IDs for "${item.title}" via ${provider.name} without a year check — ${provider.name} returned no release year for this entry.`,
+          `Accepted direct provider IDs for "${item.title}" via ${provider.name} without a year check - ${provider.name} returned no release year for this entry.`,
         );
         return providerDetails;
       }
       if (itemYear === undefined) {
         this.logger.debug(
-          `Accepted direct provider IDs for "${item.title}" via ${provider.name} without a year check — media server item has no year.`,
+          `Accepted direct provider IDs for "${item.title}" via ${provider.name} without a year check - media server item has no year.`,
         );
         return providerDetails;
       }
@@ -865,7 +1093,9 @@ export class MetadataService {
       if (delta === 0) {
         if (disagreements.length > 0) {
           this.logger.debug(
-            `Direct provider IDs for "${item.title}" validated by ${provider.name} (${providerDetails.year}) after year disagreement from: ${disagreements.join(', ')}.`,
+            `Direct provider IDs for "${item.title}" validated by ${provider.name} (${providerDetails.year}) after year disagreement from: ${this.describeYearDisagreements(
+              disagreements,
+            ).join(', ')}.`,
           );
         }
         return providerDetails;
@@ -873,13 +1103,17 @@ export class MetadataService {
 
       // ±1 tolerance covers festival/theatrical release drift.
       if (delta === 1) {
-        this.logger.debug(
-          `Accepted direct provider IDs for "${item.title}" (${itemYear}) with a one-year drift from ${provider.name} (${providerDetails.year}).`,
+        this.logger.log(
+          `Accepted direct provider IDs for "${item.title}" (${itemYear}) with a one-year drift from ${provider.name} id ${id} "${providerDetails.title}" (${providerDetails.year}).`,
         );
         return providerDetails;
       }
 
-      disagreements.push(`${provider.name} returned ${providerDetails.year}`);
+      disagreements.push({
+        providerName: provider.name,
+        year: providerDetails.year,
+        details: providerDetails,
+      });
       return undefined;
     };
 
@@ -900,13 +1134,68 @@ export class MetadataService {
       }
     }
 
+    // Two providers agreeing on a year the media server disputes ⇒ the media
+    // server is the outlier. Accept rather than reject - we can't write its year
+    // back anyway, so rejecting would only block the rule.
+    const agreement = this.findProviderYearAgreement(disagreements);
+    if (agreement) {
+      this.logger.log(
+        `Accepted direct provider IDs for "${item.title}" on provider agreement: ${agreement.providerNames.join(
+          ' and ',
+        )} agree on ${agreement.year}, but the media server reports ${itemYear}. Treating the media server's year as incorrect.`,
+      );
+      return agreement.details;
+    }
+
     if (disagreements.length > 0) {
       this.logger.warn(
-        `Rejected direct provider IDs for media server item "${item.title}" (${itemYear}) because no configured metadata provider confirmed the release year. Disagreements: ${disagreements.join('; ')}. The media server likely has incorrect metadata for this item, so no external IDs will be returned from this resolution attempt.`,
+        `Rejected direct provider IDs for media server item "${item.title}" (${itemYear}) because no configured metadata provider confirmed the release year. Disagreements: ${this.describeYearDisagreements(
+          disagreements,
+        ).join(
+          '; ',
+        )}. The media server likely has incorrect metadata for this item, so no external IDs will be returned from this resolution attempt.`,
       );
     }
 
     return undefined;
+  }
+
+  /**
+   * A year ≥2 providers agree on. Disagreements are in preference order, so
+   * matches[0] is the preferred provider's details. Undefined if none agree.
+   */
+  private findProviderYearAgreement(
+    disagreements: ProviderYearDisagreement[],
+  ):
+    | { year: number; details: MetadataDetails; providerNames: string[] }
+    | undefined {
+    for (const candidate of disagreements) {
+      const matches = disagreements.filter(
+        (disagreement) => disagreement.year === candidate.year,
+      );
+      const providerNames = [
+        ...new Set(matches.map((match) => match.providerName)),
+      ];
+
+      if (providerNames.length >= 2) {
+        return {
+          year: candidate.year,
+          details: matches[0].details,
+          providerNames,
+        };
+      }
+    }
+
+    return undefined;
+  }
+
+  private describeYearDisagreements(
+    disagreements: ProviderYearDisagreement[],
+  ): string[] {
+    return disagreements.map(
+      (disagreement) =>
+        `${disagreement.providerName} returned ${disagreement.year}`,
+    );
   }
 
   private async bridgeMissingProviderIds(ids: ResolvedMediaIds): Promise<void> {

@@ -27,6 +27,11 @@ const getAirDateBucket = (item: MediaItem): number | undefined =>
 
 const getWatchCount = (item: MediaItem): number | undefined => item.viewCount
 
+const getStudio = (item: MediaItem): string | undefined => {
+  const studio = item.studios?.find((value) => value.trim().length > 0)
+  return studio?.trim()
+}
+
 export interface CompareMediaItemsOptions {
   /**
    * Override the timestamp used for the `deleteSoonest` sort. Collection
@@ -37,7 +42,7 @@ export interface CompareMediaItemsOptions {
    */
   deleteSoonestDate?: (item: MediaItem) => Date | string | undefined | null
   /**
-   * Anchor for `daysLeft` bucketing — pass `now - deleteAfterDays * dayMs`.
+   * Anchor for `daysLeft` bucketing - pass `now - deleteAfterDays * dayMs`.
    * When set, items with the same overlay countdown tie even if they
    * straddle UTC midnight (e.g. addedAt 23:00 vs. 01:00 the next day with
    * the same "Leaves in 3 days" label). When omitted, items bucket by UTC
@@ -61,7 +66,7 @@ const getDeleteSoonestDayBucket = (
   const value = options?.deleteSoonestDate?.(item) ?? item.addedAt
   const referenceMs = toReferenceMs(options?.deleteSoonestReferenceTime)
   if (referenceMs === undefined) {
-    // No collection context — bucket by UTC midnight.
+    // No collection context - bucket by UTC midnight.
     return toDayBucket(value)
   }
   const ms = value instanceof Date ? value.getTime() : new Date(value).getTime()
@@ -90,7 +95,7 @@ const compareByDisplayHierarchy = (
 }
 
 // Numeric sort with two invariants: (1) items missing the value sort to the
-// end regardless of direction — sorting "oldest air date first" must not put
+// end regardless of direction - sorting "oldest air date first" must not put
 // an item with no air date ahead of one from 1995; and (2) within-group ties
 // fall back to the show-aware title order so the listing stays stable A→Z.
 const compareNumericWithTitleFallback = (
@@ -108,6 +113,25 @@ const compareNumericWithTitleFallback = (
   if (rightValue === undefined) return -1
   return (
     (leftValue - rightValue) * direction ||
+    compareByDisplayHierarchy(leftItem, rightItem)
+  )
+}
+
+const compareTextWithTitleFallback = (
+  leftItem: MediaItem,
+  rightItem: MediaItem,
+  getValue: (item: MediaItem) => string | undefined,
+  direction: 1 | -1,
+): number => {
+  const leftValue = getValue(leftItem)
+  const rightValue = getValue(rightItem)
+  if (leftValue === undefined && rightValue === undefined) {
+    return compareByDisplayHierarchy(leftItem, rightItem)
+  }
+  if (leftValue === undefined) return 1
+  if (rightValue === undefined) return -1
+  return (
+    leftValue.localeCompare(rightValue) * direction ||
     compareByDisplayHierarchy(leftItem, rightItem)
   )
 }
@@ -159,6 +183,13 @@ export const compareMediaItemsBySort = (
         leftItem,
         rightItem,
         getWatchCount,
+        direction,
+      )
+    case 'studio':
+      return compareTextWithTitleFallback(
+        leftItem,
+        rightItem,
+        getStudio,
         direction,
       )
     case 'manual':

@@ -4,7 +4,7 @@
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Headers safe to log on every model response — quota/rate-limit signals only.
+// Headers safe to log on every model response - quota/rate-limit signals only.
 // Anything that could leak infra topology, trace IDs, or session state is
 // deliberately omitted.
 const RATE_LIMIT_HEADERS = [
@@ -29,7 +29,7 @@ const summariseRateHeaders = (headers) => {
   return parts.length ? parts.join(' ') : '(no rate-limit headers returned)';
 };
 
-// Factory for a throttled, retrying GitHub Models caller with a per-run
+// Factory for a throttled, retrying model caller with a per-run
 // budget. Returns { call, count, BudgetExhaustedError }.
 //
 // Observed runner-token limits (GitHub Actions GITHUB_TOKEN, models: read):
@@ -42,8 +42,12 @@ export const createModelCaller = ({
   endpoint,
   token,
   log,
-  minGapMs = 1000,
-  maxCalls = 800,
+  // Gemini's free tier allows 15 requests a minute and about 1000 a day.
+  // 4500ms gives roughly 13 a minute; 400 calls leaves the rest of the daily
+  // allowance for docs drift, release notes and translation review, which
+  // share the same key. Both are arguments, so a paid tier can raise them.
+  minGapMs = 4500,
+  maxCalls = 400,
   retryDelaysMs = [60000, 120000, 240000],
   // Cap on how long we'll honour a Retry-After header. Models can return
   // values measured in tens of thousands of seconds (~daily quota reset).
@@ -79,8 +83,6 @@ export const createModelCaller = ({
         headers: {
           Authorization: `Bearer ${token}`,
           'Content-Type': 'application/json',
-          Accept: 'application/vnd.github+json',
-          'X-GitHub-Api-Version': '2022-11-28',
         },
         body,
       });
@@ -94,19 +96,19 @@ export const createModelCaller = ({
       if (!transient || attempt >= retryDelaysMs.length) {
         const text = await res.text().catch(() => '');
         log(`models headers on final failure: ${summariseRateHeaders(res.headers)}`);
-        throw new Error(`GitHub Models ${res.status}: ${text}`);
+        throw new Error(`Model endpoint ${res.status}: ${text}`);
       }
       const retryAfterRaw = Number(res.headers.get('retry-after'));
       const retryAfterMs =
         Number.isFinite(retryAfterRaw) && retryAfterRaw > 0 ? retryAfterRaw * 1000 : 0;
       if (retryAfterMs > maxHonouredRetryAfterMs) {
         const text = await res.text().catch(() => '');
-        log(`models ${res.status} with retry-after=${retryAfterRaw}s exceeds ${Math.round(maxHonouredRetryAfterMs / 1000)}s cap — likely daily quota; giving up on this post`);
+        log(`models ${res.status} with retry-after=${retryAfterRaw}s exceeds ${Math.round(maxHonouredRetryAfterMs / 1000)}s cap - likely daily quota; giving up on this post`);
         log(`models headers on final failure: ${summariseRateHeaders(res.headers)}`);
-        throw new Error(`GitHub Models ${res.status}: retry-after ${retryAfterRaw}s; ${text}`);
+        throw new Error(`Model endpoint ${res.status}: retry-after ${retryAfterRaw}s; ${text}`);
       }
       const wait = retryAfterMs > 0 ? retryAfterMs : retryDelaysMs[attempt];
-      log(`models ${res.status}, retrying in ${Math.round(wait / 1000)}s (attempt ${attempt + 1}/${retryDelaysMs.length}) — ${summariseRateHeaders(res.headers)}`);
+      log(`models ${res.status}, retrying in ${Math.round(wait / 1000)}s (attempt ${attempt + 1}/${retryDelaysMs.length}) - ${summariseRateHeaders(res.headers)}`);
       await sleep(wait);
       attempt += 1;
     }
@@ -147,13 +149,13 @@ export const createFider = ({ host, apiKey }) => {
 };
 
 // Tags on a post are returned either as bare slug strings or as objects
-// depending on Fider version / endpoint — this handles both shapes.
+// depending on Fider version / endpoint - this handles both shapes.
 export const postHasTag = (post, slug) =>
   Array.isArray(post.tags) &&
   post.tags.some((t) => (typeof t === 'string' ? t === slug : t.slug === slug));
 
 // Idempotently create a set of Fider tags. Skips ones that already exist.
-// Tag creation requires Administrator role (per docs.fider.io/api/tags) — on
+// Tag creation requires Administrator role (per docs.fider.io/api/tags) - on
 // 403 we throw a clear instructional error instead of the raw HTTP failure
 // so the maintainer knows about the one-time promote/demote dance.
 export const ensureTags = async ({ fider, log, dryRun, host, tags }) => {
@@ -204,7 +206,7 @@ const DISCORD_COLOURS = {
 
 // Post a single embed to a Discord webhook. Silent no-op if webhookUrl is empty
 // so workflows without the secret configured still complete cleanly. Discord
-// webhook errors are logged but never thrown — Discord is best-effort, the
+// webhook errors are logged but never thrown - Discord is best-effort, the
 // Fider work has already happened by the time we notify.
 //
 // pingRoleId (optional): a Discord snowflake for a role to @-mention. Goes in
@@ -229,7 +231,7 @@ export const notifyDiscord = async ({ webhookUrl, log, host, kind, post, fields 
       : { parse: [] },
     embeds: [
       {
-        title: `Fider — ${kind}: #${post.number} ${post.title || ''}`.slice(0, 256),
+        title: `Fider - ${kind}: #${post.number} ${post.title || ''}`.slice(0, 256),
         url: postUrl || undefined,
         description: description ? description.slice(0, 4000) : undefined,
         color: DISCORD_COLOURS[kind] || 0x7f8c8d,

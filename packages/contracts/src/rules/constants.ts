@@ -25,32 +25,6 @@ export enum RulePossibility {
 }
 
 /**
- * Human-readable translations for rule possibilities
- */
-export const RulePossibilityTranslations: Record<RulePossibility, string> = {
-  [RulePossibility.BIGGER]: 'Bigger',
-  [RulePossibility.SMALLER]: 'Smaller',
-  [RulePossibility.EQUALS]: 'Equals',
-  [RulePossibility.NOT_EQUALS]: 'Not Equals',
-  [RulePossibility.CONTAINS]: 'Contains (Exact list match)',
-  [RulePossibility.BEFORE]: 'Before',
-  [RulePossibility.AFTER]: 'After',
-  [RulePossibility.IN_LAST]: 'In Last',
-  [RulePossibility.IN_NEXT]: 'In Next',
-  [RulePossibility.NOT_CONTAINS]: 'Not Contains (Exact list match)',
-  [RulePossibility.CONTAINS_PARTIAL]: 'Contains (Partial list match)',
-  [RulePossibility.NOT_CONTAINS_PARTIAL]: 'Not Contains (Partial list match)',
-  [RulePossibility.CONTAINS_ALL]: 'Contains (All items)',
-  [RulePossibility.NOT_CONTAINS_ALL]: 'Not Contains (All items)',
-  [RulePossibility.COUNT_EQUALS]: 'Count Equals',
-  [RulePossibility.COUNT_NOT_EQUALS]: 'Count Does Not Equal',
-  [RulePossibility.COUNT_BIGGER]: 'Count Is Bigger Than',
-  [RulePossibility.COUNT_SMALLER]: 'Count Is Smaller Than',
-  [RulePossibility.EXISTS]: 'Exists',
-  [RulePossibility.NOT_EXISTS]: 'Does Not Exist',
-}
-
-/**
  * Rule operators for combining rule conditions
  */
 export enum RuleOperators {
@@ -67,8 +41,11 @@ export enum Application {
   SONARR = 2,
   SEERR = 3,
   TAUTULLI = 4,
+  SPORTARR = 5,
   JELLYFIN = 6,
   EMBY = 7,
+  STREAMYSTATS = 8,
+  TRACEARR = 9,
 }
 
 /**
@@ -80,12 +57,15 @@ export const ApplicationNames: Record<Application, string> = {
   [Application.SONARR]: 'Sonarr',
   [Application.SEERR]: 'Seerr',
   [Application.TAUTULLI]: 'Tautulli',
+  [Application.SPORTARR]: 'Sportarr',
   [Application.JELLYFIN]: 'Jellyfin',
   [Application.EMBY]: 'Emby',
+  [Application.STREAMYSTATS]: 'Streamystats',
+  [Application.TRACEARR]: 'Tracearr',
 }
 
 /**
- * Media status for Overseerr/Jellyseerr requests
+ * Media status for Seerr requests
  */
 export enum RequestMediaStatus {
   UNKNOWN = 1,
@@ -97,3 +77,20 @@ export enum RequestMediaStatus {
 
 export const DISKSPACE_REMAINING_PROPERTY = 'diskspace_remaining_gb'
 export const DISKSPACE_TOTAL_PROPERTY = 'diskspace_total_gb'
+
+/**
+ * Properties scoped to the single user named by the rule's `username`. Shared
+ * by the watch-history companions (Streamystats, Tautulli, Tracearr).
+ */
+export const PER_USER_PROPERTIES = [
+  'viewCountByUser',
+  'watchTimeByUser',
+  'lastViewedAtByUser',
+] as const
+
+export type PerUserProperty = (typeof PER_USER_PROPERTIES)[number]
+
+export const isPerUserProperty = (
+  property: string | undefined,
+): property is PerUserProperty =>
+  PER_USER_PROPERTIES.includes(property as PerUserProperty)

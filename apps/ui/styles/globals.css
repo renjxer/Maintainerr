@@ -104,22 +104,6 @@
   transition-property: width;
 }
 
-/*
-  Tailwind CSS v4 changed the default border color to `currentColor`.
-  Preserve the v3 default so existing bordered elements look unchanged.
-  To drop this shim, add an explicit border-color utility wherever a border
-  relies on the old gray-200 default.
-*/
-@layer base {
-  *,
-  ::after,
-  ::before,
-  ::backdrop,
-  ::file-selector-button {
-    border-color: var(--color-gray-200, currentcolor);
-  }
-}
-
 :root {
   --toastify-color-success: var(--color-success);
   --toastify-color-error: var(--color-error);
@@ -143,6 +127,12 @@
 
 @layer base {
   html {
+    /*
+      The app is dark-only. `color-scheme: dark` tells the browser to render
+      native controls (date pickers, <select> dropdowns, scrollbars, autofill,
+      spin buttons) with their dark UA styling instead of the light default.
+    */
+    color-scheme: dark;
     min-height: calc(100% + env(safe-area-inset-top));
     padding: env(safe-area-inset-top) env(safe-area-inset-right)
       env(safe-area-inset-bottom) env(safe-area-inset-left);
@@ -184,12 +174,52 @@
     height: calc(4rem + env(safe-area-inset-top));
   }
 
+  /* Pins a page bar right below the fixed .searchbar - keep the offset equal
+     to that bar's height. */
+  .sticky-under-searchbar {
+    position: sticky;
+    top: calc(4rem + env(safe-area-inset-top));
+  }
+
+  /* The bar wears the .searchbar's glass, carried past the page padding (1rem
+     from the shell, 1rem from the page) so it lines up with that full-width
+     bar. Its own layer, so scrolling content repaints without it. */
+  .sticky-under-searchbar::before {
+    content: '';
+    position: absolute;
+    inset: 0 -2rem;
+    z-index: -1;
+    background-color: rgb(24 24 27 / 0.22);
+    /* -webkit- first: Lightning CSS (production only) keeps a hand written
+       prefix that follows the standard property and drops the standard one,
+       leaving Firefox with no blur at all. */
+    -webkit-backdrop-filter: blur(5.8px);
+    backdrop-filter: blur(5.8px);
+  }
+
+  /* Once pinned, that one panel reaches up behind the search bar and the bar
+     drops its own glass. A backdrop filter samples only what is inside its own
+     box, so two of them meeting edge to edge each blur a truncated kernel and
+     the join shows as a line however well their colours match. One panel over
+     both has no join to show. */
+  .sticky-under-searchbar[data-pinned]::before {
+    top: calc(-4rem - env(safe-area-inset-top));
+  }
+
+  body:has(.sticky-under-searchbar[data-pinned])
+    .searchbar
+    > .transparent-glass-bg {
+    background-color: transparent;
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+
   .transparent-glass-bg {
     --tw-bg-opacity: 0.22;
     background-color: rgb(24 24 27 / var(--tw-bg-opacity));
     box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1);
-    backdrop-filter: blur(5.8px);
     -webkit-backdrop-filter: blur(5.8px);
+    backdrop-filter: blur(5.8px);
   }
 
   .max-width-form {
@@ -317,7 +347,9 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  @media (min-width: 440px) {
+  /* Sizes to the nearest `@container` ancestor (see Overview/Content), so the
+     grid reflows by its own width rather than the viewport's. */
+  @container (min-width: 440px) {
     ul.cards-vertical {
       grid-template-columns: repeat(auto-fill, minmax(9.375rem, 1fr));
     }
@@ -542,7 +574,7 @@
 
   /*
     The single source of truth for checkboxes. Add `className="checkbox"` to any
-    `<input type="checkbox">` and it is fully and identically styled — nothing else
+    `<input type="checkbox">` and it is fully and identically styled - nothing else
     is needed. `focus:ring-0` + `focus:ring-offset-0` together remove the
     @tailwindcss/forms focus ring (its blue ring AND white offset ring); a subtle
     border change is the focus affordance instead.
@@ -551,13 +583,21 @@
     @apply h-6 w-6 rounded-md border-zinc-600 text-maintainerr-600 transition duration-150 ease-in-out hover:border-zinc-500 focus:border-zinc-500 focus:ring-0 focus:ring-offset-0 focus:outline-hidden;
   }
 
+  /*
+    Single source of truth for form field styling. Applies to every native
+    field element (raw or rendered by Forms/Input, Forms/Select, etc.), so
+    changing it here restyles all inputs, selects, and textareas at once. The
+    components only add element-specific deltas (select chevron, adornments,
+    error states) on top - they must not re-declare this base.
+  */
   input[type='text'],
   input[type='password'],
   input[type='number'],
   input[type='date'],
+  input[type='search'],
   select,
   textarea {
-    @apply block w-full min-w-0 flex-1 rounded-md border border-zinc-500 bg-zinc-700 text-white transition duration-150 ease-in-out sm:text-sm sm:leading-5;
+    @apply block w-full min-w-0 flex-1 rounded-md border border-zinc-500 bg-zinc-700 text-white shadow-xs transition duration-150 ease-in-out focus:border-maintainerr-600 focus:ring-0 focus:outline-hidden disabled:opacity-50 sm:text-sm sm:leading-5;
   }
 
   input.rounded-l-only,
@@ -632,84 +672,78 @@
   .prose a:hover {
     color: #8d4c1c;
   }
-  .react-select-container {
-    @apply w-full;
-  }
+}
 
-  .react-select-container .react-select__control {
-    @apply rounded-md border border-zinc-500 bg-zinc-700 text-white hover:border-zinc-500;
-  }
+/*
+  react-select's control/menu styles come from emotion, which is unlayered and
+  therefore wins over @layer components under Tailwind v4. Keep this theme
+  unlayered (like .prose above) so the dark field styling keeps winning;
+  otherwise the control falls back to react-select's white default.
+*/
+.react-select-container {
+  @apply w-full;
+}
 
-  .react-select-container-dark .react-select__control {
-    @apply border border-zinc-700 bg-zinc-800;
-  }
+/* Control mirrors the native field (the input/select rule in this file):
+   same border, background, radius, text size, and shadow. The :hover variant
+   matches the base so, like a native field, hovering never changes the border. */
+.react-select-container .react-select__control,
+.react-select-container .react-select__control:hover {
+  @apply rounded-md border border-zinc-500 bg-zinc-700 text-sm text-white shadow-xs;
+}
 
-  .react-select-container .react-select__control--is-focused {
-    @apply rounded-md border border-zinc-500 bg-zinc-700 text-white shadow-sm;
-  }
+/* Focus: maintainerr border, no ring (react-select paints a blue box-shadow
+   ring by default) - mirrors the field's focus:border-maintainerr-600 + ring-0.
+   The :hover variant keeps the focus colour while hovering. */
+.react-select-container .react-select__control--is-focused,
+.react-select-container .react-select__control--is-focused:hover {
+  @apply border-maintainerr-600 shadow-none;
+}
 
-  .react-select-container-dark .react-select__control--is-focused {
-    @apply border-zinc-600 bg-zinc-800;
-  }
+/* Selected value, placeholder, and typed input: same size/weight/colour as a
+   native field (not bold, muted placeholder). */
+.react-select-container .react-select__single-value,
+.react-select-container .react-select__input-container {
+  @apply text-sm text-white;
+}
 
-  .react-select-container .react-select__menu {
-    @apply bg-zinc-700 text-zinc-300;
-  }
+.react-select-container .react-select__placeholder {
+  @apply text-sm text-zinc-400;
+}
 
-  .react-select-container-dark .react-select__menu {
-    @apply bg-zinc-800;
-  }
+/* The inner <input> must stay borderless/ringless, otherwise the forms plugin
+   gives it its own nested field box. */
+.react-select-container .react-select__input,
+.react-select-container .react-select__input input,
+.react-select-container .react-select__input input:focus {
+  @apply border-none shadow-none ring-0;
+}
 
-  .react-select-container .react-select__option--is-focused {
-    @apply bg-zinc-600 text-white;
-  }
+/* Muted chevron, no separator (native selects have neither). */
+.react-select-container .react-select__indicator {
+  @apply text-zinc-400;
+}
 
-  .react-select-container-dark .react-select__option--is-focused {
-    @apply bg-zinc-700;
-  }
+.react-select-container .react-select__indicator-separator {
+  @apply hidden;
+}
 
-  .react-select-container .react-select__indicator-separator {
-    @apply bg-zinc-500;
-  }
+/* Menu is a step darker than the control (bg-zinc-800), matching the native
+   select dropdown in the rule settings: no border, just a shadow. */
+.react-select-container .react-select__menu {
+  @apply mt-1 rounded-md bg-zinc-800 text-sm text-white shadow-lg;
+}
 
-  .react-select-container .react-select__indicator {
-    @apply text-zinc-500;
-  }
+.react-select-container .react-select__option {
+  @apply text-zinc-200;
+}
 
-  .react-select-container .react-select__placeholder {
-    @apply text-zinc-400;
-  }
+.react-select-container .react-select__option--is-focused {
+  @apply bg-zinc-700 text-white;
+}
 
-  .react-select-container .react-select__multi-value {
-    @apply rounded-md border border-zinc-500 bg-zinc-800;
-  }
-
-  .react-select-container .react-select__multi-value__label {
-    @apply text-white;
-  }
-
-  .react-select-container .react-select__multi-value__remove {
-    @apply cursor-pointer rounded-r-md hover:bg-red-700 hover:text-red-100;
-  }
-
-  .react-select-container .react-select__input {
-    @apply border-none text-base shadow-xs ring-0;
-  }
-
-  .react-select-container .react-select__input input:focus {
-    @apply border-none;
-    box-shadow: none;
-  }
-
-  .react-select-container .react-select__input-container {
-    @apply text-white;
-  }
-
-  .react-select-container .react-select__input-container,
-  .react-select-container .react-select__placeholder,
-  .react-select-container .react-select__single-value {
-    @apply font-semibold text-white;
-  }
+.react-select-container .react-select__option--is-selected {
+  @apply bg-maintainerr-600 text-white;
 }
 
 @layer utilities {

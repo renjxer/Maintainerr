@@ -1,4 +1,10 @@
-import { type MediaProviderIds } from '@maintainerr/contracts'
+import { t } from '@lingui/core/macro'
+import {
+  SPORTARR_TVDB_ALIAS_LEAGUE_OFFSET,
+  SPORTARR_TVDB_ALIAS_RANGE,
+  type MediaItemType,
+  type MediaProviderIds,
+} from '@maintainerr/contracts'
 
 const mediaTypeBadgeColors: Record<string, string> = {
   movie: 'bg-zinc-900',
@@ -12,16 +18,14 @@ export function mediaTypeBgColor(mediaType: string): string {
 }
 
 export function toImageEndpointType(
-  mediaType: 'movie' | 'show' | 'season' | 'episode',
+  mediaType: MediaItemType,
 ): 'movie' | 'show' {
   return ['season', 'episode'].includes(mediaType)
     ? 'show'
     : (mediaType as 'movie' | 'show')
 }
 
-export function toApiMediaType(
-  mediaType: 'movie' | 'show' | 'season' | 'episode',
-): 'movie' | 'tv' {
+export function toApiMediaType(mediaType: MediaItemType): 'movie' | 'tv' {
   return ['show', 'season', 'episode'].includes(mediaType) ? 'tv' : 'movie'
 }
 
@@ -43,9 +47,39 @@ export function buildProviderIdParams(
   return params
 }
 
-export function buildMetadataImagePath(
-  kind: 'image' | 'backdrop',
-  mediaType: 'movie' | 'show' | 'season' | 'episode',
+/**
+ * Badge/chip label for a media type. Seasons and episodes carry their number so
+ * items of the same show stay distinguishable on the poster.
+ */
+export function mediaTypeLabel(
+  mediaType: MediaItemType,
+  numbers: { seasonNumber?: number; episodeNumber?: number } = {},
+): string {
+  if (mediaType === 'season' && numbers.seasonNumber != null) {
+    const itemNumber = numbers.seasonNumber
+    return t`season ${{ itemNumber }}`
+  }
+
+  if (mediaType === 'episode' && numbers.episodeNumber != null) {
+    const itemNumber = numbers.episodeNumber
+    return t`episode ${{ itemNumber }}`
+  }
+
+  switch (mediaType) {
+    case 'movie':
+      return t`movie`
+    case 'show':
+      return t`show`
+    case 'season':
+      return t`season`
+    default:
+      return t`episode`
+  }
+}
+
+export function buildMetadataPath(
+  kind: 'image' | 'backdrop' | 'overview',
+  mediaType: MediaItemType,
   providerIds: MediaProviderIds | undefined,
   itemId?: string | number,
 ): string | undefined {
@@ -60,6 +94,41 @@ export function buildMetadataImagePath(
   }
 
   return `/metadata/${kind}/${toImageEndpointType(mediaType)}?${params.toString()}`
+}
+
+/**
+ * TMDB and TheTVDB split movies from series; TheTVDB goes through its
+ * dereferrer, which resolves a numeric id to the right slug. Sportarr stamps
+ * numeric aliases into the tvdb namespace that have no page at all, so those
+ * resolve to nothing rather than a dead link.
+ */
+export function buildProviderUrl(
+  provider: keyof MediaProviderIds,
+  providerId: string,
+  mediaType: MediaItemType,
+): string | undefined {
+  const id = encodeURIComponent(providerId)
+  const isMovie = toApiMediaType(mediaType) === 'movie'
+
+  switch (provider) {
+    case 'tmdb':
+      return `https://themoviedb.org/${isMovie ? 'movie' : 'tv'}/${id}`
+    case 'imdb':
+      return `https://www.imdb.com/title/${id}/`
+    case 'tvdb': {
+      const numericId = Number(providerId)
+      if (
+        numericId >= SPORTARR_TVDB_ALIAS_LEAGUE_OFFSET &&
+        numericId <
+          SPORTARR_TVDB_ALIAS_LEAGUE_OFFSET + SPORTARR_TVDB_ALIAS_RANGE
+      ) {
+        return undefined
+      }
+      return `https://thetvdb.com/dereferrer/${isMovie ? 'movie' : 'series'}/${id}`
+    }
+    default:
+      return undefined
+  }
 }
 
 export function toProviderIds(ids: {

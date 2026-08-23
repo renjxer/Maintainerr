@@ -1,11 +1,14 @@
 import { CONNECTION_TEST_TIMEOUT_MS } from '../../../../utils/connection-error';
 import { MaintainerrLogger } from '../../../logging/logs.service';
-import { ServarrApi } from '../common/servarr-api.service';
 import {
+  ServarrApi,
+  SLOW_INSTANCE_TIMEOUT_MS,
+} from '../common/servarr-api.service';
+import {
+  DownloadHistoryItem,
   SonarrEpisode,
   SonarrEpisodeFile,
   SonarrInfo,
-  SonarrSeason,
   SonarrSeries,
 } from '../interfaces/sonarr.interface';
 
@@ -29,9 +32,16 @@ export class SonarrApi extends ServarrApi<{
     this.logger.setContext(SonarrApi.name);
   }
 
+  /**
+   * Every tracked series. Uncached: its only caller fences a filesystem delete
+   * on the other series' folders, and a series added since the last read would
+   * be missing from a cached snapshot - so the fence would not see it.
+   */
   public async getSeries(): Promise<SonarrSeries[]> {
     try {
-      const response = await this.get<SonarrSeries[]>('/series');
+      const response = await this.getWithoutCache<SonarrSeries[]>('/series', {
+        timeout: SLOW_INSTANCE_TIMEOUT_MS,
+      });
 
       return response;
     } catch (error) {
@@ -71,6 +81,22 @@ export class SonarrApi extends ServarrApi<{
       throw error;
     }
   }
+  /**
+   * The series' episode files, each carrying its `seasonNumber` and on-disk
+   * `path`. Uncached, and the Sonarr counterpart of {@link RadarrApi.getMovieFiles}:
+   * callers read it right before deleting those files, so a stale snapshot
+   * would point at paths that have since moved. Returns undefined when the
+   * listing itself failed, which callers must treat as "unknown", not "none".
+   */
+  public async getEpisodeFiles(
+    seriesId: number,
+  ): Promise<SonarrEpisodeFile[] | undefined> {
+    return this.getWithoutCache<SonarrEpisodeFile[]>(
+      `/episodefile?seriesId=${seriesId}`,
+      { timeout: SLOW_INSTANCE_TIMEOUT_MS },
+    );
+  }
+
   public async getEpisodeFile(
     episodeFileId: number,
   ): Promise<SonarrEpisodeFile> {
@@ -107,28 +133,70 @@ export class SonarrApi extends ServarrApi<{
 
   // Intentionally uncached: this endpoint is read straight after mutations
   // (unmonitor + file deletes) by the empty-show cleanup, and also drives
-  // rule evaluation — both need Sonarr's current truth, not a snapshot that
+  // rule evaluation - both need Sonarr's current truth, not a snapshot that
   // can be up to DEFAULT_TTL stale (see issue #2757 / #2891).
-  public async getSeriesByTvdbId(id: number): Promise<SonarrSeries> {
+  // Returns `null` when Sonarr confirms the series isn't tracked (empty
+  // response) and `undefined` when the lookup itself failed (transport, auth,
+  // 5xx). Callers must keep these distinct: a confirmed miss is safe to fall
+  // back from, a failure must fail closed so a transient Sonarr outage can't
+  // silently change rule evaluation.
+  public async getSeriesByTvdbId(
+    id: number,
+  ): Promise<SonarrSeries | null | undefined> {
     try {
       const response = await this.getWithoutCache<SonarrSeries[]>(
         `/series?tvdbId=${id}`,
+        { timeout: SLOW_INSTANCE_TIMEOUT_MS },
       );
 
-      if (!response?.[0]) {
-        this.logger.warn(`Could not retrieve show by tvdb ID ${id}`);
+      // getWithoutCache swallows transport/auth/5xx into `undefined` (it never
+      // throws), so the catch below can't see those failures. Distinguish them
+      // here and fail closed (undefined), rather than letting the empty check
+      // collapse a transient outage into `null` ("not tracked"). (#3125)
+      if (response === undefined) {
+        this.logger.warn(`Error retrieving show by tvdb ID ${id}`);
         return undefined;
+      }
+
+      if (!response[0]) {
+        // Not an error: #3125 made "not tracked" a normal outcome, and an
+        // exclusion tag fans out over every instance, so most answer this.
+        this.logger.debug(`Could not retrieve show by tvdb ID ${id}`);
+        return null;
       }
 
       return response[0];
     } catch (error) {
       this.logger.warn(`Error retrieving show by tvdb ID ${id}`);
       this.logger.debug(error);
+      return undefined;
     }
   }
 
   public async updateSeries(series: SonarrSeries): Promise<boolean> {
     return this.runPut('series', JSON.stringify(series));
+  }
+
+  /**
+   * Add or remove a single tag on a batch of series via the series editor.
+   * `applyTags: 'add' | 'remove'` only - never 'replace', which would wipe every
+   * other tag the user has on those series. Best-effort: returns false on failure
+   * (callers treat tagging as non-fatal). No-ops on an empty id list. Sonarr tags
+   * are series-level; there is no per-season tag.
+   */
+  public async setSeriesTags(
+    seriesIds: number[],
+    tagId: number,
+    mode: 'add' | 'remove',
+  ): Promise<boolean> {
+    if (seriesIds.length === 0) {
+      return true;
+    }
+
+    return this.runPut(
+      'series/editor',
+      JSON.stringify({ seriesIds, tags: [tagId], applyTags: mode }),
+    );
   }
 
   public async searchSeries(seriesId: number): Promise<void> {
@@ -144,6 +212,41 @@ export class SonarrApi extends ServarrApi<{
       );
       this.logger.debug(error);
     }
+  }
+
+  /**
+   * The distinct torrent infohashes that produced this series' files, for a
+   * whole-show delete. Derived from the same grab/import-filtered history as the
+   * coverage path, so a torrent that only ever failed for this series isn't
+   * removed.
+   */
+  public async getDownloadIdsForSeries(seriesId: number): Promise<string[]> {
+    const history = await this.getSeriesDownloadHistory(seriesId);
+    return [...new Set(history.map((item) => item.hash))];
+  }
+
+  /**
+   * Per-torrent episode coverage from a series' Sonarr history: one item per
+   * grab/import event, giving the torrent infohash and the episode it backed.
+   * Used by season/episode deletes to remove only torrents whose every backed
+   * episode is being deleted. Never throws (returns [] on failure).
+   */
+  public async getSeriesDownloadHistory(
+    seriesId: number,
+  ): Promise<DownloadHistoryItem[]> {
+    const records = await this.getHistoryRecords(
+      `/history/series?seriesId=${seriesId}`,
+    );
+
+    const items: DownloadHistoryItem[] = [];
+    for (const record of records) {
+      const hash = this.downloadProducingHash(record);
+      if (hash) {
+        items.push({ hash, episodeId: record.episodeId });
+      }
+    }
+
+    return items;
   }
 
   public async deleteShow(
@@ -172,6 +275,16 @@ export class SonarrApi extends ServarrApi<{
     deleteFiles = true,
     airDate?: string | Date,
   ): Promise<boolean> {
+    // Without a season number the episode read below drops its season filter,
+    // so an episode number would match - and delete - that episode in every
+    // season of the show. Same widening as #3415, one scope down.
+    if (!Number.isInteger(seasonNumber)) {
+      this.logger.warn(
+        `Couldn't remove/unmonitor episodes for series ID ${seriesId}: no valid season number was provided.`,
+      );
+      return false;
+    }
+
     const validEpisodeIds = this.filterDefinedEpisodeNumbers(episodeIds);
 
     if (!validEpisodeIds.length && !airDate) {
@@ -203,24 +316,13 @@ export class SonarrApi extends ServarrApi<{
         } episode(s) from show with ID ${seriesId} from Sonarr.`,
       );
 
+      let success = true;
       for (const e of matchedEpisodes) {
-        if (
-          !(await this.runPut(
-            `episode/${e.id}`,
-            JSON.stringify({ ...e, monitored: false }),
-          ))
-        ) {
-          return false;
-        }
-
-        if (deleteFiles && e.episodeFileId) {
-          if (!(await this.runDelete(`episodefile/${e.episodeFileId}`))) {
-            return false;
-          }
-        }
+        success =
+          (await this.unmonitorAndDeleteEpisode(e, deleteFiles)) && success;
       }
 
-      return true;
+      return success;
     } catch (error) {
       this.logger.warn(
         `Couldn't remove/unmonitor episodes: ${this.formatEpisodeLookup(validEpisodeIds, airDate)} for series ID: ${seriesId}`,
@@ -230,12 +332,26 @@ export class SonarrApi extends ServarrApi<{
     }
   }
 
+  /**
+   * @param type the scope to act on: `all` seasons, only the seasons holding
+   *   files (`existing`), or a single season number. Required - there is no
+   *   whole-show default, since an unresolved season number reaching here as
+   *   `undefined` matched no season branch below yet still fell into the
+   *   "delete every episode file" arm of the delete loop (#3415).
+   */
   public async unmonitorSeasons(
     seriesId: number | string,
-    type: 'all' | number | 'existing' = 'all',
+    type: 'all' | number | 'existing',
     deleteFiles = true,
     forceExisting = false,
   ): Promise<SonarrSeries | undefined> {
+    if (type !== 'all' && type !== 'existing' && !Number.isInteger(type)) {
+      this.logger.warn(
+        `Couldn't unmonitor/delete seasons for series ID ${seriesId}: '${type}' is not a valid season scope. No action was taken.`,
+      );
+      return undefined;
+    }
+
     try {
       const data: SonarrSeries = (await this.axios.get(`series/${seriesId}`))
         .data;
@@ -272,7 +388,10 @@ export class SonarrApi extends ServarrApi<{
       );
       success = (await this.runPut(`series/`, JSON.stringify(data))) && success;
 
-      if (deleteFiles) {
+      // Skip the file deletes when an unmonitor failed: the content may still
+      // be monitored and Sonarr would re-download it (#3228). The action
+      // reports failure and is retried next run.
+      if (deleteFiles && success) {
         for (const e of episodes) {
           if (typeof type === 'number') {
             if (e.seasonNumber === type && e.episodeFileId) {
@@ -308,31 +427,6 @@ export class SonarrApi extends ServarrApi<{
     }
   }
 
-  private buildSeasonList(
-    seasons: number[],
-    existingSeasons?: SonarrSeason[],
-  ): SonarrSeason[] {
-    if (existingSeasons) {
-      const newSeasons = existingSeasons.map((season) => {
-        if (seasons.includes(season.seasonNumber)) {
-          season.monitored = true;
-        }
-        return season;
-      });
-
-      return newSeasons;
-    }
-
-    const newSeasons = seasons.map(
-      (seasonNumber): SonarrSeason => ({
-        seasonNumber,
-        monitored: true,
-      }),
-    );
-
-    return newSeasons;
-  }
-
   public async info(): Promise<SonarrInfo> {
     try {
       const info: SonarrInfo = (
@@ -346,6 +440,47 @@ export class SonarrApi extends ServarrApi<{
       this.logger.debug(error);
       return null;
     }
+  }
+
+  private async unmonitorAndDeleteEpisode(
+    episode: SonarrEpisode,
+    deleteFiles: boolean,
+  ): Promise<boolean> {
+    let episodeFileId = episode.episodeFileId;
+
+    if (
+      !(await this.runPut(
+        `episode/${episode.id}`,
+        JSON.stringify({ ...episode, monitored: false }),
+      ))
+    ) {
+      // A slow PUT can time out client-side even though Sonarr applied it
+      // (#3228): re-read the live state before deciding. Fail closed -
+      // deleting a still-monitored episode's file would trigger a re-download.
+      const live = await this.getWithoutCache<SonarrEpisode>(
+        `/episode/${episode.id}`,
+        { timeout: SLOW_INSTANCE_TIMEOUT_MS },
+      );
+
+      if (live?.monitored !== false) {
+        this.logger.warn(
+          `Could not confirm episode ${episode.id} was unmonitored${
+            deleteFiles ? '; leaving its file in place' : ''
+          }.`,
+        );
+        return false;
+      }
+
+      episodeFileId = live.episodeFileId;
+    }
+
+    if (deleteFiles && episodeFileId) {
+      if (!(await this.runDelete(`episodefile/${episodeFileId}`))) {
+        return false;
+      }
+    }
+
+    return true;
   }
 
   private normalizeAirDate(airDate?: string | Date): string | undefined {

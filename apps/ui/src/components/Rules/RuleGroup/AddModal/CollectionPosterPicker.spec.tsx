@@ -1,10 +1,9 @@
 import {
-  cleanup,
   fireEvent,
   render,
   screen,
   waitFor,
-} from '@testing-library/react'
+} from '../../../../test-utils/render'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createDeferred } from '../../../../test-utils/createDeferred'
 import {
@@ -36,7 +35,6 @@ describe('CollectionPosterPicker', () => {
   })
 
   afterEach(() => {
-    cleanup()
     vi.unstubAllGlobals()
   })
 
@@ -52,13 +50,7 @@ describe('CollectionPosterPicker', () => {
       pushed: false,
     })
 
-    render(
-      <CollectionPosterPicker
-        collectionId={42}
-        collectionTerm="collection"
-        mediaServerName="Plex"
-      />,
-    )
+    render(<CollectionPosterPicker collectionId={42} mediaServerName="Plex" />)
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledTimes(1)
@@ -120,13 +112,7 @@ describe('CollectionPosterPicker', () => {
       refreshRequested: true,
     })
 
-    render(
-      <CollectionPosterPicker
-        collectionId={42}
-        collectionTerm="collection"
-        mediaServerName="Plex"
-      />,
-    )
+    render(<CollectionPosterPicker collectionId={42} mediaServerName="Plex" />)
 
     await waitFor(() => {
       expect(screen.getByText('Clear')).toBeTruthy()
@@ -140,7 +126,7 @@ describe('CollectionPosterPicker', () => {
 
     expect(
       screen.getByText(
-        'Custom poster cleared. Plex metadata refresh requested — artwork may update depending on Plex behavior and configured agents.',
+        'Custom poster cleared. Plex metadata refresh requested - artwork may update depending on Plex behavior and configured agents.',
       ),
     ).toBeTruthy()
   })
@@ -159,13 +145,7 @@ describe('CollectionPosterPicker', () => {
       refreshRequested: false,
     })
 
-    render(
-      <CollectionPosterPicker
-        collectionId={42}
-        collectionTerm="collection"
-        mediaServerName="Plex"
-      />,
-    )
+    render(<CollectionPosterPicker collectionId={42} mediaServerName="Plex" />)
 
     await waitFor(() => {
       expect(screen.getByText('Clear')).toBeTruthy()
@@ -179,7 +159,7 @@ describe('CollectionPosterPicker', () => {
 
     expect(
       screen.getByText(
-        'Custom poster cleared. The artwork on Plex is unchanged — refresh metadata there if you want the original back.',
+        'Custom poster cleared. The artwork on Plex is unchanged - refresh metadata there if you want the original back.',
       ),
     ).toBeTruthy()
   })

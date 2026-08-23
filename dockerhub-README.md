@@ -67,12 +67,15 @@ services:
           - type: bind
             source: ./data
             target: /opt/data
+#          - type: bind # uncomment for the leftover-folder cleanup: your library, at the same path Radarr/Sonarr report it at
+#            source: /path/to/media
+#            target: /path/to/media
         environment:
           - TZ=Europe/Brussels
-#      - BASE_PATH=/maintainerr # uncomment if you're serving maintainerr from a subdirectory
-#      - UI_HOSTNAME=:: # uncomment if you want to listen on IPv6 instead (default 0.0.0.0)
-#      - UI_PORT=6247 # uncomment to change the UI port (default 6246)
-#      - GITHUB_TOKEN=ghp_yourtoken # Optional: GitHub Personal Access Token for higher API rate limits (60/hr without, 5000/hr with token)
+#          - BASE_PATH=/maintainerr # uncomment if you're serving maintainerr from a subdirectory
+#          - UI_HOSTNAME=:: # uncomment if you want to listen on IPv6 instead (default 0.0.0.0)
+#          - UI_PORT=6247 # uncomment to change the UI port (default 6246)
+#          - GITHUB_TOKEN=ghp_yourtoken # Optional: GitHub Personal Access Token for higher API rate limits (60/hr without, 5000/hr with token)
         ports:
           - 6246:6246
         restart: unless-stopped
@@ -96,25 +99,25 @@ A list of all available environment variables are below. No other env variables 
 | UI_PORT | 6246 | The listen port of the web server. |
 | BASE_PATH | (*none*) | If reverse proxying with a subfolder you'll want to set this. Must be in the format of `/subfolder` |
 | GITHUB_TOKEN | (*none*) | GitHub Personal Access Token for higher API rate limits |
+| CORS_ALLOWED_ORIGINS | (*none*) | Comma-separated list of origins allowed to call the API cross-origin, e.g. `https://maintainerr.example.com`. The bundled UI is served from the same origin as the API and does not need this; only set it if a separate front end calls the API. |
 
 # Features
 
-- Configure rules specific to your needs, based on several available options from Plex, Overseerr, Jellyseerr, Radarr, Sonarr and Tautulli.
+- Configure rules specific to your needs, based on several available options from Plex, Seerr, Radarr, Sonarr and Tautulli.
 - Manually add media to a collection, in case it's not included after rule execution. (one-off items that don't match a rule set)
 - Selectively exclude media from being added to a collection, even if it matches a rule.
 - Show a collection, containing rule matched media, on the Plex home screen for a specific duration before deletion. Think "Leaving soon".
 - Optionally, use a manual Plex collection, in case you don't want <b>Maintainerr</b> to add & remove Plex collections at will.
 - Manage media straight from the collection within Plex. <b>Maintainerr</b> will sync and add or exclude media to/from the internal collection.
 - Remove or unmonitor media from \*arr
-- Clear requests from Overseerr
+- Clear requests from Seerr
 - Delete files from disk
 
 <br />
 Currently, <b>Maintainerr</b> supports rule parameters from these apps :
 
 - Plex
-- Overseerr
-- Jellyseerr
+- Seerr
 - Radarr
 - Sonarr
 - Tautulli
@@ -122,5 +125,5 @@ Currently, <b>Maintainerr</b> supports rule parameters from these apps :
 # Preview
 
 <p align="center">
-  <img src="https://github.com/maintainerr/maintainerr/blob/development/apps/ui/public/screenshots/collections_screenshot.png?raw=true" alt="Maintainerr's overview"/>
+  <img src="https://raw.githubusercontent.com/Maintainerr/maintainerr_site/main/src/assets/screenshots/Collections.png" alt="Maintainerr collections"/>
 </p>

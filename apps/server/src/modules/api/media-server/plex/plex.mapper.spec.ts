@@ -11,6 +11,7 @@ import {
   PlexSeenBy,
   PlexUserAccount,
 } from '../../plex-api/interfaces/library.interfaces';
+import { PlexMetadata } from '../../plex-api/interfaces/media.interface';
 import { PlexMapper } from './plex.mapper';
 
 describe('PlexMapper', () => {
@@ -64,6 +65,32 @@ describe('PlexMapper', () => {
     });
   });
 
+  describe('extractPlexAgentId', () => {
+    it.each([
+      ['plex://movie/5d776830880197001ec7f3eb', '5d776830880197001ec7f3eb'],
+      ['plex://show/5d9c07f4705e7a001e6e59a2', '5d9c07f4705e7a001e6e59a2'],
+      ['plex://episode/5d9c1176e264b7001fef1d0e', '5d9c1176e264b7001fef1d0e'],
+    ])('reads the agent id out of %s', (guid, expected) => {
+      expect(PlexMapper.extractPlexAgentId(guid)).toBe(expected);
+    });
+
+    // Watchlist entries are keyed on the Plex agent id, so anything without one
+    // has to come back undefined rather than a partial match.
+    it.each([
+      ['a legacy agent guid', 'com.plexapp.agents.imdb://tt1234567?lang=en'],
+      ['a provider guid', 'tmdb://12345'],
+      ['personal media', 'local://12345'],
+      ['a guid that only looks like one', 'notplex://movie/5d7768308801'],
+      ['a missing type segment', 'plex://5d776830880197001ec7f3eb'],
+      ['an empty type segment', 'plex:///5d776830880197001ec7f3eb'],
+      ['a trailing separator', 'plex://movie/'],
+      ['an id with unexpected characters', 'plex://movie/5d7768-30?lang=en'],
+      ['nothing at all', undefined],
+    ])('returns undefined for %s', (label, guid) => {
+      expect(PlexMapper.extractPlexAgentId(guid)).toBeUndefined();
+    });
+  });
+
   describe('extractProviderIds', () => {
     it('should extract IMDB id from guid', () => {
       const guids = [{ id: 'imdb://tt1234567' }];
@@ -93,6 +120,40 @@ describe('PlexMapper', () => {
       expect(result.imdb).toEqual(['tt1234567']);
       expect(result.tmdb).toEqual(['12345']);
       expect(result.tvdb).toEqual(['67890']);
+    });
+
+    it('should extract provider ids from legacy Plex agent guids', () => {
+      const guids = [
+        { id: 'com.plexapp.agents.imdb://tt1234567?lang=en' },
+        { id: 'com.plexapp.agents.themoviedb://12345?lang=en' },
+        { id: 'com.plexapp.agents.thetvdb://67890?lang=en' },
+      ];
+      const result = PlexMapper.extractProviderIds(guids);
+      expect(result.imdb).toEqual(['tt1234567']);
+      expect(result.tmdb).toEqual(['12345']);
+      expect(result.tvdb).toEqual(['67890']);
+    });
+
+    it('should drop the season and episode a legacy agent appends to the series id', () => {
+      const guids = [{ id: 'com.plexapp.agents.thetvdb://73141/1/1?lang=en' }];
+      const result = PlexMapper.extractProviderIds(guids);
+      expect(result.tvdb).toEqual(['73141']);
+    });
+
+    it('should read the fallback guid when the item carries no Guid list', () => {
+      const result = PlexMapper.extractProviderIds(
+        undefined,
+        'com.plexapp.agents.imdb://tt1234567?lang=en',
+      );
+      expect(result.imdb).toEqual(['tt1234567']);
+    });
+
+    it('should ignore a fallback guid the agent owns rather than a provider', () => {
+      const result = PlexMapper.extractProviderIds(
+        [{ id: 'tvdb://900000278' }],
+        'tv.plex.agents.nfo.series://show/tvdb_900000278',
+      );
+      expect(result).toEqual({ imdb: [], tmdb: [], tvdb: ['900000278'] });
     });
 
     it('should ignore plex:// guids', () => {
@@ -209,6 +270,31 @@ describe('PlexMapper', () => {
       expect(result.providerIds.tmdb).toEqual(['12345']);
     });
 
+    it('should extract provider IDs from the top-level guid', () => {
+      const result = PlexMapper.toMediaItem({
+        ...basePlexItem,
+        guid: 'com.plexapp.agents.imdb://tt7654321?lang=en',
+        Guid: [],
+      });
+
+      expect(result.providerIds.imdb).toEqual(['tt7654321']);
+    });
+
+    it('lists the single studio Plex sends', () => {
+      expect(
+        PlexMapper.toMediaItem({ ...basePlexItem, studio: 'Studio A' }).studios,
+      ).toEqual(['Studio A']);
+    });
+
+    it.each([undefined, '', '   '])(
+      'leaves studios unset when Plex sends %p',
+      (studio) => {
+        expect(
+          PlexMapper.toMediaItem({ ...basePlexItem, studio }).studios,
+        ).toBeUndefined();
+      },
+    );
+
     it('should convert media sources correctly', () => {
       const result = PlexMapper.toMediaItem(basePlexItem);
 
@@ -262,6 +348,28 @@ describe('PlexMapper', () => {
         type: 'audience',
       });
       expect(result.userRating).toBe(10);
+    });
+  });
+
+  describe('metadataToMediaItem', () => {
+    const baseMetadata = {
+      ratingKey: '1',
+      guid: 'plex://movie/abc',
+      type: 'movie',
+      title: 'Test Movie',
+      addedAt: 1600000000,
+      Guid: [],
+    } as unknown as PlexMetadata;
+
+    it('carries the library section the item reports', () => {
+      const result = PlexMapper.metadataToMediaItem({
+        ...baseMetadata,
+        librarySectionID: 1,
+        librarySectionTitle: 'Movies',
+      });
+
+      expect(result.library.id).toBe('1');
+      expect(result.library.title).toBe('Movies');
     });
   });
 

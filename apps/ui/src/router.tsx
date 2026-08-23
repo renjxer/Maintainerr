@@ -5,7 +5,7 @@ import Layout, { LayoutErrorBoundary } from './components/Layout'
 import MediaServerSetupGuard from './components/Layout/MediaServerSetupGuard'
 import LoadingSpinner from './components/Common/LoadingSpinner'
 import Overview from './components/Overview'
-// Settings is kept eager because it wraps an <Outlet /> — making it lazy
+// Settings is kept eager because it wraps an <Outlet /> - making it lazy
 // would cause two sequential fetches (wrapper then child) on every settings navigation.
 import Overlays from './components/Overlays'
 import Settings from './components/Settings'
@@ -82,6 +82,9 @@ const settingsEmbyRoute = createLazyRoute(
 const settingsSonarrRoute = createLazyRoute(
   () => import('./components/Settings/Sonarr'),
 )
+const settingsSportarrRoute = createLazyRoute(
+  () => import('./components/Settings/Sportarr'),
+)
 const settingsMetadataRoute = createLazyRoute(
   () => import('./components/Settings/Metadata'),
 )
@@ -96,6 +99,12 @@ const settingsTautulliRoute = createLazyRoute(
 )
 const settingsStreamystatsRoute = createLazyRoute(
   () => import('./components/Settings/Streamystats'),
+)
+const settingsTracearrRoute = createLazyRoute(
+  () => import('./components/Settings/Tracearr'),
+)
+const settingsDownloadClientRoute = createLazyRoute(
+  () => import('./components/Settings/DownloadClient'),
 )
 const settingsNotificationsRoute = createLazyRoute(
   () => import('./components/Settings/Notifications'),
@@ -120,7 +129,7 @@ const overlayTemplateEditorRoute = createLazyRoute(
 )
 
 /**
- * Preloadable route definition — single source of truth for both
+ * Preloadable route definition - single source of truth for both
  * the React Router config and the prefetch system. Routes that use
  * createLazyRoute carry both `lazy` (for the router) and `preload`
  * (for hover-prefetching) from the same object, so they can't drift.
@@ -272,6 +281,11 @@ const appRoutes: AppRoute[] = [
         preload: settingsSonarrRoute.preload,
       },
       {
+        path: 'sportarr',
+        lazy: settingsSportarrRoute.lazy,
+        preload: settingsSportarrRoute.preload,
+      },
+      {
         path: 'metadata',
         lazy: settingsMetadataRoute.lazy,
         preload: settingsMetadataRoute.preload,
@@ -295,6 +309,16 @@ const appRoutes: AppRoute[] = [
         path: 'streamystats',
         lazy: settingsStreamystatsRoute.lazy,
         preload: settingsStreamystatsRoute.preload,
+      },
+      {
+        path: 'tracearr',
+        lazy: settingsTracearrRoute.lazy,
+        preload: settingsTracearrRoute.preload,
+      },
+      {
+        path: 'download-client',
+        lazy: settingsDownloadClientRoute.lazy,
+        preload: settingsDownloadClientRoute.preload,
       },
       {
         path: 'notifications',
@@ -392,7 +416,7 @@ const collectPreloaders = (
 
       const rest = remaining.slice(routeSegments.length)
       if (rest.length === 0) {
-        // Exact match — also preload the index child if present
+        // Exact match - also preload the index child if present
         const indexChild = route.children?.find(
           (child): child is AppRoute => child.index === true,
         )

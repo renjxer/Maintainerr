@@ -1,7 +1,8 @@
 import axios, { AxiosError, AxiosInstance, AxiosRequestConfig } from 'axios';
-import axiosRetry from 'axios-retry';
 import { PlexLibraryResponse } from '../plex-api/interfaces/library.interfaces';
+import { PLEX_PAGE_SIZE } from '../plex-api/plex-api.constants';
 import cacheManager, { Cache } from './cache';
+import { applyHttpRetry } from './httpRetry';
 import { describeRequestTarget } from './requestLogging';
 
 type PlexApiOptions = {
@@ -15,6 +16,7 @@ type PlexApiOptions = {
 type RequestOptions = {
   uri: string;
   extraHeaders?: Record<string, string>;
+  signal?: AbortSignal;
 };
 
 class PlexApi {
@@ -37,10 +39,7 @@ class PlexApi {
         'X-Plex-Token': this.options.token,
       },
     });
-    axiosRetry(this.axios, {
-      retries: 3,
-      retryDelay: axiosRetry.exponentialDelay,
-    });
+    applyHttpRetry(this.axios);
   }
 
   async query<T>(
@@ -69,46 +68,74 @@ class PlexApi {
    *
    * @param {RequestOptions} options - The options for the query.
    * @param {boolean} [useCache=true] - Whether to use the cache for the query.
+   * @param {AbortSignal} [signal] - Aborts the paginated sweep between pages.
+   * @param {function} [onProgress] - Called after each page with the running
+   *   count of items fetched so far and Plex's reported totalSize, so callers
+   *   can surface progress on long sweeps. Not invoked when totalSize is absent.
+   * @param {number} [pageSize] - Rows to request per page. Raise it on long
+   *   sweeps to cut round trips; Plex is free to return fewer and the loop
+   *   corrects for that.
    * @return {Promise<T[]>} - A promise that resolves to an array of T.
    */
   async queryAll<T>(
     options: RequestOptions,
     useCache: boolean = true,
+    signal?: AbortSignal,
+    onProgress?: (progress: { fetched: number; totalSize: number }) => void,
+    pageSize: number = PLEX_PAGE_SIZE.QUERY_ALL,
   ): Promise<T> {
     // vars
     let result = undefined;
     let next = true;
-    let page = 0;
-    const size = 120;
+    let offset = 0;
+    let fetched = 0;
+    const requestSignal = signal ?? options.signal;
     options = {
       ...options,
       extraHeaders: {
         ...options.extraHeaders,
-        'X-Plex-Container-Start': `${page}`,
-        'X-Plex-Container-Size': `${size}`,
+        'X-Plex-Container-Start': `${offset}`,
+        'X-Plex-Container-Size': `${pageSize}`,
       },
+      signal: requestSignal,
     };
 
     // loop responses
     while (next) {
+      requestSignal?.throwIfAborted();
       const query: PlexLibraryResponse = await this.query(options, useCache);
+      const items = query?.MediaContainer
+        ? this.getDataValue(query.MediaContainer)
+        : undefined;
+
       if (result === undefined) {
         // if first response, replace result
         result = query;
-      } else {
+      } else if (items) {
         // if next response, add to previous result
-        const items = this.getDataValue(query.MediaContainer);
-
-        // if response is an array
-        if (items) {
-          this.appendToData(result.MediaContainer, items as any[]);
-        }
+        this.appendToData(result.MediaContainer, items as any[]);
       }
 
-      // fetch all if more than 120
-      if (query?.MediaContainer?.totalSize > size * (page + 1)) {
-        options.extraHeaders['X-Plex-Container-Start'] = `${size * (page + 1)}`;
-        page++;
+      const received = Array.isArray(items) ? items.length : 0;
+      fetched += received;
+      const totalSize = query?.MediaContainer?.totalSize;
+      if (onProgress && typeof totalSize === 'number') {
+        onProgress({ fetched, totalSize });
+      }
+
+      // Advance by what Plex actually returned, never by what we asked for.
+      // Plex may hand back a shorter page than X-Plex-Container-Size, and
+      // stepping by the requested size would skip every row it withheld - a
+      // silent truncation for callers that have no totalSize check of their
+      // own. Stepping by `received` also makes an empty page terminate the
+      // sweep instead of looping to the end of totalSize.
+      if (
+        received > 0 &&
+        typeof totalSize === 'number' &&
+        fetched < totalSize
+      ) {
+        offset += received;
+        options.extraHeaders['X-Plex-Container-Start'] = `${offset}`;
       } else {
         next = false;
       }
@@ -117,19 +144,19 @@ class PlexApi {
   }
 
   private getQuery<T>(options: RequestOptions) {
-    return this._request<T>('GET', options);
+    return this.request<T>('GET', options);
   }
 
   deleteQuery(options: RequestOptions) {
-    return this._request('DELETE', options);
+    return this.request('DELETE', options);
   }
 
   postQuery<T>(options: RequestOptions) {
-    return this._request<T>('POST', options);
+    return this.request<T>('POST', options);
   }
 
   putQuery<T>(options: RequestOptions) {
-    return this._request<T>('PUT', options);
+    return this.request<T>('PUT', options);
   }
 
   private getServerScheme() {
@@ -139,11 +166,12 @@ class PlexApi {
     return this.options.port === 443 ? 'https://' : 'http://';
   }
 
-  private async _request<T>(method: string, options: RequestOptions) {
+  private async request<T>(method: string, options: RequestOptions) {
     const requestConfig: AxiosRequestConfig = {
       url: options.uri,
       method,
       headers: options.extraHeaders,
+      signal: options.signal,
     };
 
     try {
@@ -156,6 +184,13 @@ class PlexApi {
       );
 
       if (error instanceof AxiosError) {
+        if (error.code === 'ERR_CANCELED') {
+          const reason = options.signal?.reason;
+          throw reason instanceof DOMException
+            ? reason
+            : new DOMException('The operation was aborted.', 'AbortError');
+        }
+
         if (error.response?.status === 403) {
           throw new Error(
             `${requestConfig.method} ${url} failed: Plex Server denied request due to lack of managed user permissions! In case of a delete request, delete content must be allowed in plex-media-server options.`,
@@ -245,8 +280,10 @@ class PlexApi {
 
   public async getStatus(): Promise<boolean> {
     try {
+      // `/identity` (not `/`): returns the server MediaContainer without the
+      // 401 that bare `/` gives behind reverse proxies.
       const status: { MediaContainer: any } = await this.query(
-        { uri: `/` },
+        { uri: `/identity` },
         false,
       );
       return status?.MediaContainer ? true : false;

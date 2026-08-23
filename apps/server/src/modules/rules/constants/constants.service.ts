@@ -1,4 +1,6 @@
+import { MediaServerType } from '@maintainerr/contracts';
 import { Injectable } from '@nestjs/common';
+import { resolveValueApplication } from '../helpers/media-server-application.helper';
 import { Property, RuleConstants, RuleType } from './rules.constants';
 
 /**
@@ -15,10 +17,17 @@ import { Property, RuleConstants, RuleType } from './rules.constants';
 const buildDynamicNullReason = (
   property: Property,
   applicationName?: string,
+  lookupFailed?: boolean,
 ): string => {
   const cleanHuman = stripHumanNamePrefix(property.humanName);
   const noun = cleanHuman || property.name;
   const label = applicationName ? `${applicationName} ${noun}` : noun;
+
+  // A getter answering `undefined` never established the value, so reporting
+  // it as empty/unset sends the user looking for the wrong problem.
+  if (lookupFailed) {
+    return `${label} could not be read for this item`;
+  }
 
   switch (property.type) {
     case RuleType.DATE:
@@ -64,25 +73,48 @@ export class RuleConstanstService {
     return this.ruleConstants;
   }
 
-  public getValueIdentifier(location: [number, number]) {
+  /**
+   * Build the `App.property` identifier for a rule value, or return null when
+   * the application/property no longer exists in the constants (e.g. a rule
+   * authored on an older version referencing a since-removed property). Callers
+   * must skip such values rather than emit `App.undefined`, which produces YAML
+   * that cannot be decoded again.
+   */
+  public getValueIdentifier(location: [number, number]): string | null {
     const application = this.ruleConstants.applications.find(
       (el) => el.id === location[0],
-    )?.name;
+    );
 
-    const rule = this.ruleConstants.applications
-      .find((el) => el.id === location[0])
-      ?.props.find((el) => el.id === location[1])?.name;
+    const rule = application?.props.find((el) => el.id === location[1]);
 
-    return application + '.' + rule;
+    if (!application || !rule) {
+      return null;
+    }
+
+    return application.name + '.' + rule.name;
   }
 
-  public getValueHumanName(location: [number, number]) {
-    return `${
-      this.ruleConstants.applications.find((el) => el.id === location[0])?.name
-    } - ${
-      this.ruleConstants.applications
-        .find((el) => el.id === location[0])
-        ?.props.find((el) => el.id === location[1])?.humanName
+  /**
+   * @param configuredServerType - Names the value after the server that will
+   *   actually be read. A rule stores the app it was authored against, but the
+   *   getter routes every media-server app to the configured server and looks
+   *   the property id up there; property ids do not line up across servers, so
+   *   naming it from the stored app can describe a different property than the
+   *   one that produced the value. Omit to name it exactly as stored.
+   */
+  public getValueHumanName(
+    location: [number, number],
+    configuredServerType?: MediaServerType | null,
+  ) {
+    const applicationId = resolveValueApplication(
+      location[0],
+      configuredServerType,
+    );
+    const application = this.ruleConstants.applications.find(
+      (el) => el.id === applicationId,
+    );
+    return `${application?.name} - ${
+      application?.props.find((el) => el.id === location[1])?.humanName
     }`;
   }
 
@@ -90,30 +122,50 @@ export class RuleConstanstService {
    * Translate a (null) rule value into a human-readable explanation of why
    * it was missing. Surfaces in the Test Media YAML output so users stop
    * seeing bare "null" values and can tell the field has no data for this
-   * item. Derived dynamically from the property's existing metadata — no
+   * item. Derived dynamically from the property's existing metadata - no
    * static table to maintain. Rules comparisons still fail closed; this is
    * purely diagnostic.
    */
-  public getValueNullReason(location: [number, number]): string {
+  public getValueNullReason(
+    location: [number, number],
+    configuredServerType?: MediaServerType | null,
+    options?: { lookupFailed?: boolean },
+  ): string {
     const application = this.ruleConstants.applications.find(
-      (el) => el.id === location[0],
+      (el) =>
+        el.id === resolveValueApplication(location[0], configuredServerType),
     );
     const prop = application?.props.find((el) => el.id === location[1]);
     if (!prop) return 'Value unavailable';
-    return buildDynamicNullReason(prop, application?.name);
+    return buildDynamicNullReason(
+      prop,
+      application?.name,
+      options?.lookupFailed,
+    );
   }
 
-  public getValueFromIdentifier(identifier: string): [number, number] {
+  /**
+   * Resolve an `App.property` identifier back to its `[appId, propId]` pair, or
+   * return null when either part is unknown. Callers must skip the rule rather
+   * than crash the whole import, so a single stale identifier (e.g. from an
+   * older export) doesn't reject an otherwise-valid YAML document.
+   */
+  public getValueFromIdentifier(identifier: string): [number, number] | null {
     const application = identifier.split('.')[0];
     const rule = identifier.split('.')[1];
 
     const applicationConstant = this.ruleConstants.applications.find(
-      (el) => el.name.toLowerCase() === application.toLowerCase(),
+      (el) => el.name.toLowerCase() === application?.toLowerCase(),
     );
 
-    const ruleConstant = applicationConstant.props.find(
-      (el) => el.name.toLowerCase() === rule.toLowerCase(),
+    const ruleConstant = applicationConstant?.props.find(
+      (el) => el.name.toLowerCase() === rule?.toLowerCase(),
     );
+
+    if (!applicationConstant || !ruleConstant) {
+      return null;
+    }
+
     return [applicationConstant.id, ruleConstant.id];
   }
 
@@ -163,7 +215,11 @@ export class RuleConstanstService {
     let ruleType: RuleType;
     let value: string;
 
-    switch (identifier.type.toUpperCase()) {
+    // The encoder writes the RuleType humanName (e.g. TEXT_LIST -> "text list"),
+    // so normalise spaces to underscores before matching - otherwise "TEXT LIST"
+    // misses the 'TEXT_LIST' case, leaving ruleType undefined and throwing on the
+    // return's .toString(), which fails the whole YAML import.
+    switch (identifier.type.toUpperCase().split(' ').join('_')) {
       case 'NUMBER':
         ruleType = RuleType.NUMBER;
         value = identifier.value.toString();

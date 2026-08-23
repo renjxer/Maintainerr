@@ -1,21 +1,33 @@
-import { MediaServerFeature, MediaServerType } from '@maintainerr/contracts';
+import {
+  ECollectionLogType,
+  MaintainerrEvent,
+  MediaCollection,
+  MediaServerFeature,
+  MediaServerType,
+} from '@maintainerr/contracts';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { Mocked, TestBed } from '@suites/unit';
-import { DataSource, Repository } from 'typeorm';
+import { DataSource, FindOperator, Repository } from 'typeorm';
 import {
   createCollection,
   createCollectionMedia,
   createMediaItem,
 } from '../../../test/utils/data';
+import { MediaItemEnrichmentService } from '../api/media-server/media-item-enrichment.service';
 import { MediaServerFactory } from '../api/media-server/media-server.factory';
 import { IMediaServerService } from '../api/media-server/media-server.interface';
+import { MaintainerrLogger } from '../logging/logs.service';
 import { MetadataService } from '../metadata/metadata.service';
+import { OverlayProcessorService } from '../overlays/overlay-processor.service';
 import { Exclusion } from '../rules/entities/exclusion.entities';
 import { RuleGroup } from '../rules/entities/rule-group.entities';
 import { SettingsDataService } from '../settings/settings-data.service';
 import { CollectionPosterService } from './collection-poster.service';
 import { CollectionsService } from './collections.service';
 import { Collection } from './entities/collection.entities';
+import { CollectionLog } from './entities/collection_log.entities';
+import { CollectionMediaRuleRemoval } from './entities/collection_media_rule_removal.entities';
 import {
   CollectionMedia,
   CollectionMediaManualMembershipSource,
@@ -30,9 +42,15 @@ describe('CollectionsService', () => {
   let collectionMediaRepo: Mocked<Repository<CollectionMedia>>;
   let ruleGroupRepo: Mocked<Repository<RuleGroup>>;
   let exclusionRepo: Mocked<Repository<Exclusion>>;
+  let collectionLogRepo: Mocked<Repository<CollectionLog>>;
+  let ruleRemovalRepo: Mocked<Repository<CollectionMediaRuleRemoval>>;
   let metadataService: Mocked<MetadataService>;
+  let mediaItemEnrichmentService: Mocked<MediaItemEnrichmentService>;
   let settingsDataService: Mocked<SettingsDataService>;
   let collectionPosterService: Mocked<CollectionPosterService>;
+  let overlayProcessor: Mocked<OverlayProcessorService>;
+  let eventEmitter: Mocked<EventEmitter2>;
+  let logger: Mocked<MaintainerrLogger>;
 
   beforeEach(async () => {
     const { unit, unitRef } =
@@ -47,9 +65,22 @@ describe('CollectionsService', () => {
     );
     ruleGroupRepo = unitRef.get(getRepositoryToken(RuleGroup) as string);
     exclusionRepo = unitRef.get(getRepositoryToken(Exclusion) as string);
+    collectionLogRepo = unitRef.get(
+      getRepositoryToken(CollectionLog) as string,
+    );
+    ruleRemovalRepo = unitRef.get(
+      getRepositoryToken(CollectionMediaRuleRemoval) as string,
+    );
     metadataService = unitRef.get(MetadataService);
+    mediaItemEnrichmentService = unitRef.get(MediaItemEnrichmentService);
+    mediaItemEnrichmentService.enrichItems.mockImplementation(
+      async (items) => items,
+    );
     settingsDataService = unitRef.get(SettingsDataService);
     collectionPosterService = unitRef.get(CollectionPosterService);
+    overlayProcessor = unitRef.get(OverlayProcessorService);
+    eventEmitter = unitRef.get(EventEmitter2);
+    logger = unitRef.get(MaintainerrLogger);
     metadataService.resolveIds.mockResolvedValue({
       tmdb: 1,
       type: 'movie',
@@ -65,16 +96,27 @@ describe('CollectionsService', () => {
         .fn()
         .mockResolvedValue({ id: 'remote-collection' }),
       addBatchToCollection: jest.fn().mockResolvedValue([]),
+      removeBatchFromCollection: jest.fn().mockResolvedValue([]),
       getCollection: jest.fn().mockResolvedValue(undefined),
+      getCollections: jest.fn().mockResolvedValue([]),
       getCollectionChildren: jest.fn().mockResolvedValue([]),
+      getAllIdsForContextAction: jest.fn().mockResolvedValue([]),
+      getLibraries: jest.fn().mockResolvedValue([{ id: 'library-1' }]),
       getMetadata: jest.fn().mockResolvedValue(undefined),
+      getMetadataBatch: jest.fn().mockResolvedValue([]),
+      getChildrenMetadata: jest.fn().mockResolvedValue([]),
+      itemExists: jest.fn().mockResolvedValue(true),
       removeFromCollection: jest.fn().mockResolvedValue(undefined),
       deleteCollection: jest.fn().mockResolvedValue(undefined),
+      updateCollection: jest.fn().mockResolvedValue(undefined),
     } as unknown as Mocked<IMediaServerService>;
 
     collectionMediaRepo.create.mockImplementation((entityLike) =>
       Object.assign(new CollectionMedia(), entityLike),
     );
+    // TypeORM's find always resolves an array; without a default the sibling
+    // lookups read undefined and fail in a way production never can.
+    collectionRepo.find.mockResolvedValue([]);
 
     mediaServerFactory.getService.mockResolvedValue(mediaServer);
     mediaServerFactory.getConfiguredServerType.mockResolvedValue(
@@ -84,6 +126,299 @@ describe('CollectionsService', () => {
     jest
       .spyOn(service, 'updateCollectionTotalSize')
       .mockResolvedValue(undefined);
+  });
+
+  describe('postponeCollectionMedia', () => {
+    it('pushes the deadline out by whole days and normalises addDate to midnight', async () => {
+      jest.useFakeTimers().setSystemTime(new Date(2026, 6, 1, 9, 0, 0));
+      try {
+        const collection = createCollection({ id: 1, deleteAfterDays: 30 });
+        const media = createCollectionMedia(collection, {
+          id: 5,
+          mediaServerId: 'item-5',
+          // deliberately mid-day, to prove normalisation to midnight
+          addDate: new Date(2026, 5, 24, 16, 12, 49),
+        });
+        collectionRepo.findOne.mockResolvedValue(collection);
+        collectionMediaRepo.findOne.mockResolvedValue(media);
+        const logSpy = jest
+          .spyOn(service, 'addLogRecord')
+          .mockResolvedValue(undefined);
+
+        const result = await service.postponeCollectionMedia(1, 'item-5', 14);
+
+        // The log is the caller's second step, outside the execution lock.
+        expect(logSpy).not.toHaveBeenCalled();
+
+        // June 24 + 14 days = July 8 2026, at local midnight
+        expect(collectionMediaRepo.update).toHaveBeenCalledWith(5, {
+          addDate: new Date(2026, 6, 8),
+        });
+        expect(result).toEqual({
+          collectionId: 1,
+          mediaServerId: 'item-5',
+          addDate: new Date(2026, 6, 8),
+          deleteAfterDays: 30,
+          // July 8 + 30 days = Aug 7 2026
+          deletionDate: new Date(2026, 7, 7),
+        });
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('counts the days from today when the deadline has already passed', async () => {
+      jest.useFakeTimers().setSystemTime(new Date(2026, 6, 27, 15, 30, 0));
+      try {
+        const collection = createCollection({ id: 1, deleteAfterDays: 30 });
+        const media = createCollectionMedia(collection, {
+          id: 5,
+          mediaServerId: 'item-5',
+          // due on May 31, so 57 days overdue by now
+          addDate: new Date(2026, 4, 1),
+        });
+        collectionRepo.findOne.mockResolvedValue(collection);
+        collectionMediaRepo.findOne.mockResolvedValue(media);
+        jest.spyOn(service, 'addLogRecord').mockResolvedValue(undefined);
+
+        const result = await service.postponeCollectionMedia(1, 'item-5', 2);
+
+        // Shifting the stored May 1 addDate would land the deadline back in
+        // June and the next handler run would delete the item regardless.
+        expect(collectionMediaRepo.update).toHaveBeenCalledWith(5, {
+          addDate: new Date(2026, 5, 29),
+        });
+        // June 29 + 30 days = July 29, two days from today
+        expect(result?.deletionDate).toEqual(new Date(2026, 6, 29));
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('logs the resolved media title when the media server can supply it', async () => {
+      const collection = createCollection({ id: 1, deleteAfterDays: 30 });
+      const media = createCollectionMedia(collection, {
+        id: 5,
+        mediaServerId: 'item-5',
+        addDate: new Date(2026, 5, 24),
+      });
+      collectionRepo.findOne.mockResolvedValue(collection);
+      collectionMediaRepo.findOne.mockResolvedValue(media);
+      mediaServer.getMetadata.mockResolvedValue({
+        type: 'movie',
+        title: 'Sample Movie',
+      } as never);
+      const logSpy = jest
+        .spyOn(service, 'addLogRecord')
+        .mockResolvedValue(undefined);
+
+      await service.logPostponedCollectionMedia(1, 'item-5', 7);
+
+      expect(logSpy).toHaveBeenCalledWith(
+        collection,
+        'Postponed deletion of "Sample Movie" by 7 day(s)',
+        ECollectionLogType.MEDIA,
+      );
+    });
+
+    it('falls back to the media id when the title cannot be resolved', async () => {
+      const collection = createCollection({ id: 1, deleteAfterDays: 30 });
+      collectionRepo.findOne.mockResolvedValue(collection);
+      mediaServer.getMetadata.mockRejectedValue(new Error('unreachable'));
+      const logSpy = jest
+        .spyOn(service, 'addLogRecord')
+        .mockResolvedValue(undefined);
+
+      await service.logPostponedCollectionMedia(1, 'item-5');
+
+      expect(logSpy).toHaveBeenCalledWith(
+        collection,
+        'Reset deletion timer for "item-5"',
+        ECollectionLogType.MEDIA,
+      );
+    });
+
+    it('never throws when the log record cannot be written', async () => {
+      const collection = createCollection({ id: 1, deleteAfterDays: 30 });
+      collectionRepo.findOne.mockResolvedValue(collection);
+      jest
+        .spyOn(service, 'addLogRecord')
+        .mockRejectedValue(new Error('database is locked'));
+
+      await expect(
+        service.logPostponedCollectionMedia(1, 'item-5', 7),
+      ).resolves.toBeUndefined();
+    });
+
+    it('resets the full window to today at midnight when days is omitted', async () => {
+      jest.useFakeTimers().setSystemTime(new Date(2026, 6, 19, 15, 30, 0));
+      try {
+        const collection = createCollection({ id: 1, deleteAfterDays: 30 });
+        const media = createCollectionMedia(collection, {
+          id: 5,
+          mediaServerId: 'item-5',
+          addDate: new Date(2026, 4, 1),
+        });
+        collectionRepo.findOne.mockResolvedValue(collection);
+        collectionMediaRepo.findOne.mockResolvedValue(media);
+
+        const result = await service.postponeCollectionMedia(1, 'item-5');
+
+        expect(collectionMediaRepo.update).toHaveBeenCalledWith(5, {
+          addDate: new Date(2026, 6, 19),
+        });
+        expect(result?.addDate).toEqual(new Date(2026, 6, 19));
+        // today + 30 days = Aug 18 2026
+        expect(result?.deletionDate).toEqual(new Date(2026, 7, 18));
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('returns undefined and does not write when the item is not in the collection', async () => {
+      collectionRepo.findOne.mockResolvedValue(createCollection({ id: 1 }));
+      collectionMediaRepo.findOne.mockResolvedValue(null);
+
+      const result = await service.postponeCollectionMedia(1, 'missing', 14);
+
+      expect(result).toBeUndefined();
+      expect(collectionMediaRepo.update).not.toHaveBeenCalled();
+    });
+
+    it('returns undefined when the collection does not exist', async () => {
+      collectionRepo.findOne.mockResolvedValue(null);
+
+      const result = await service.postponeCollectionMedia(999, 'item-5', 14);
+
+      expect(result).toBeUndefined();
+      expect(collectionMediaRepo.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('removeMediaFromOtherCollections', () => {
+    it('prunes the item from sibling collections, deduped and excluding the source', async () => {
+      collectionMediaRepo.find.mockResolvedValue([
+        { collectionId: 1, mediaServerId: 'item-1' },
+        { collectionId: 2, mediaServerId: 'item-1' },
+        { collectionId: 2, mediaServerId: 'item-1' },
+        { collectionId: 3, mediaServerId: 'item-1' },
+      ] as CollectionMedia[]);
+      collectionRepo.find.mockResolvedValue([
+        createCollection({ id: 2, mediaServerId: 'remote-collection-2' }),
+        createCollection({ id: 3, mediaServerId: 'remote-collection-3' }),
+      ] as Collection[]);
+
+      const removeSpy = jest
+        .spyOn(service as never, 'removeFromCollectionInternal')
+        .mockResolvedValue(createCollection() as never);
+
+      const pruned = await service.removeMediaFromOtherCollections('item-1', 1);
+
+      expect(collectionMediaRepo.find).toHaveBeenCalledWith({
+        where: { mediaServerId: 'item-1' },
+      });
+      expect(collectionRepo.find).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            id: expect.anything(),
+          }),
+        }),
+      );
+      // Collection 1 is the source (excluded); 2 (deduped to one call) and 3
+      // are the siblings that still listed the now-deleted item.
+      expect(mediaServer.removeBatchFromCollection).toHaveBeenCalledTimes(2);
+      expect(mediaServer.removeBatchFromCollection).toHaveBeenCalledWith(
+        'remote-collection-2',
+        ['item-1'],
+      );
+      expect(mediaServer.removeBatchFromCollection).toHaveBeenCalledWith(
+        'remote-collection-3',
+        ['item-1'],
+      );
+      expect(removeSpy).toHaveBeenCalledTimes(2);
+      expect(removeSpy).toHaveBeenCalledWith(
+        2,
+        [{ mediaServerId: 'item-1' }],
+        false,
+        'all',
+        true,
+      );
+      expect(removeSpy).toHaveBeenCalledWith(
+        3,
+        [{ mediaServerId: 'item-1' }],
+        false,
+        'all',
+        true,
+      );
+      // Returns the pruned sibling ids so the caller can suppress re-adds.
+      expect(pruned).toEqual([2, 3]);
+    });
+
+    it('removes a shared media-server collection only once before pruning each local sibling', async () => {
+      collectionMediaRepo.find.mockResolvedValue([
+        { collectionId: 1, mediaServerId: 'item-1' },
+        { collectionId: 2, mediaServerId: 'item-1' },
+        { collectionId: 3, mediaServerId: 'item-1' },
+      ] as CollectionMedia[]);
+      collectionRepo.find.mockResolvedValue([
+        createCollection({ id: 2, mediaServerId: 'shared-remote-collection' }),
+        createCollection({ id: 3, mediaServerId: 'shared-remote-collection' }),
+      ] as Collection[]);
+
+      const removeSpy = jest
+        .spyOn(service as never, 'removeFromCollectionInternal')
+        .mockResolvedValue(createCollection() as never);
+
+      const pruned = await service.removeMediaFromOtherCollections('item-1', 1);
+
+      expect(mediaServer.removeBatchFromCollection).toHaveBeenCalledTimes(1);
+      expect(mediaServer.removeBatchFromCollection).toHaveBeenCalledWith(
+        'shared-remote-collection',
+        ['item-1'],
+      );
+      expect(removeSpy).toHaveBeenCalledTimes(2);
+      expect(pruned).toEqual([2, 3]);
+    });
+
+    it('skips local pruning when the shared media-server removal fails', async () => {
+      collectionMediaRepo.find.mockResolvedValue([
+        { collectionId: 1, mediaServerId: 'item-1' },
+        { collectionId: 2, mediaServerId: 'item-1' },
+        { collectionId: 3, mediaServerId: 'item-1' },
+      ] as CollectionMedia[]);
+      collectionRepo.find.mockResolvedValue([
+        createCollection({ id: 2, mediaServerId: 'shared-remote-collection' }),
+        createCollection({ id: 3, mediaServerId: 'shared-remote-collection' }),
+      ] as Collection[]);
+      mediaServer.removeBatchFromCollection.mockResolvedValue(['item-1']);
+
+      const removeSpy = jest
+        .spyOn(service as never, 'removeFromCollectionInternal')
+        .mockResolvedValue(createCollection() as never);
+
+      await expect(
+        service.removeMediaFromOtherCollections('item-1', 1),
+      ).resolves.toEqual([]);
+
+      expect(removeSpy).not.toHaveBeenCalled();
+    });
+
+    it('does nothing when no other collection lists the item', async () => {
+      collectionMediaRepo.find.mockResolvedValue([
+        { collectionId: 1, mediaServerId: 'item-1' },
+      ] as CollectionMedia[]);
+
+      const removeSpy = jest
+        .spyOn(service as never, 'removeFromCollectionInternal')
+        .mockResolvedValue(createCollection() as never);
+
+      await expect(
+        service.removeMediaFromOtherCollections('item-1', 1),
+      ).resolves.toEqual([]);
+
+      expect(removeSpy).not.toHaveBeenCalled();
+      expect(collectionRepo.find).not.toHaveBeenCalled();
+    });
   });
 
   it('persists overlay settings when creating a collection', async () => {
@@ -166,6 +501,33 @@ describe('CollectionsService', () => {
     await expect(
       (service as any).RemoveCollectionFromDB(createCollection({ id: 78 })),
     ).resolves.toEqual({ status: 'OK', code: 1, message: 'Success' });
+  });
+
+  // The state rows cascade away with the collection row, so a poster not
+  // restored here stays overlaid with nothing left pointing at it.
+  it('restores the overlays of a collection before deleting it, and deletes it either way', async () => {
+    const deleteWithRevert = async (id: number, revert: Promise<unknown>) => {
+      const collection = createCollection({ id, mediaServerId: null });
+      collectionRepo.findOne.mockResolvedValue(collection);
+      collectionRepo.delete.mockResolvedValue({} as any);
+      jest
+        .spyOn(service as any, 'checkAutomaticMediaServerLink')
+        .mockResolvedValue(collection);
+      overlayProcessor.revertCollection.mockReturnValue(revert as any);
+
+      return service.deleteCollection(id);
+    };
+
+    expect(await deleteWithRevert(90, Promise.resolve(1))).toMatchObject({
+      code: 1,
+    });
+    expect(overlayProcessor.revertCollection).toHaveBeenCalledWith(90);
+    expect(collectionRepo.delete).toHaveBeenCalledWith(90);
+
+    expect(
+      await deleteWithRevert(91, Promise.reject(new Error('server down'))),
+    ).toMatchObject({ code: 1 });
+    expect(collectionRepo.delete).toHaveBeenCalledWith(91);
   });
 
   it('does not delete a collection when some removals fail', async () => {
@@ -306,6 +668,181 @@ describe('CollectionsService', () => {
 
     expect(mediaServer.deleteCollection).not.toHaveBeenCalled();
     expect(result.mediaServerId).toBe('remote-collection');
+  });
+
+  // Sibling recovery after a shared-collection heal depends on this
+  // clearing: the surviving rule group must drop its dead link so the
+  // next add pass recreates the collection.
+  it('clears the automatic link when the collection is gone and no title match exists', async () => {
+    const collection = createCollection({
+      id: 28,
+      mediaServerId: 'deleted-remote-collection',
+      manualCollection: false,
+      title: 'Healed Sibling',
+      libraryId: 'library-1',
+    });
+
+    mediaServer.getCollection.mockResolvedValue(undefined);
+    collectionRepo.save.mockImplementation(async (c) => c as Collection);
+    jest
+      .spyOn(service as any, 'findMediaServerCollection')
+      .mockResolvedValue(undefined);
+
+    const result = await service.checkAutomaticMediaServerLink(collection);
+
+    expect(result.mediaServerId).toBeNull();
+    expect(collectionRepo.save).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 28, mediaServerId: null }),
+    );
+    expect(mediaServer.deleteCollection).not.toHaveBeenCalled();
+  });
+
+  // #3344 on the save path: a media server hiccup while a rule group is saved
+  // must not drop the link or delete the collection either.
+  it('keeps the link and skips the media server update when the save-time lookup fails', async () => {
+    const dbCollection = createCollection({
+      id: 32,
+      mediaServerId: 'live-collection',
+      manualCollection: false,
+      title: 'Old Title',
+      libraryId: 'library-1',
+      type: 'movie',
+    });
+
+    const logQueryBuilder = {
+      insert: jest.fn(),
+      into: jest.fn(),
+      values: jest.fn(),
+      execute: jest.fn().mockResolvedValue({ generatedMaps: [{ id: 1 }] }),
+    };
+    logQueryBuilder.insert.mockReturnValue(logQueryBuilder);
+    logQueryBuilder.into.mockReturnValue(logQueryBuilder);
+    logQueryBuilder.values.mockReturnValue(logQueryBuilder);
+    dataSource.createQueryBuilder.mockReturnValue(logQueryBuilder as any);
+
+    collectionRepo.findOne.mockResolvedValue(dbCollection);
+    collectionRepo.save.mockImplementation(async (c) => c as Collection);
+    mediaServer.getCollection.mockRejectedValue(new Error('Plex unreachable'));
+
+    const result = await service.updateCollection({
+      ...dbCollection,
+      title: 'New Title',
+    });
+
+    expect(mediaServer.updateCollection).not.toHaveBeenCalled();
+    expect(mediaServer.deleteCollection).not.toHaveBeenCalled();
+    expect(result?.dbCollection?.mediaServerId).toBe('live-collection');
+  });
+
+  // #3344: unlinking on a failed lookup orphans the real collection - the next
+  // add creates a second one beside it, with the same title and the same media.
+  it('keeps the automatic link when the collection cannot be verified', async () => {
+    const collection = createCollection({
+      id: 31,
+      mediaServerId: 'live-collection',
+      manualCollection: false,
+      title: 'Unverifiable',
+      libraryId: 'library-1',
+    });
+
+    mediaServer.getCollection.mockRejectedValue(new Error('Plex unreachable'));
+    const findMediaServerCollection = jest.spyOn(
+      service as any,
+      'findMediaServerCollection',
+    );
+
+    const result = await service.checkAutomaticMediaServerLink(collection);
+
+    expect(result.mediaServerId).toBe('live-collection');
+    expect(findMediaServerCollection).not.toHaveBeenCalled();
+    expect(collectionRepo.save).not.toHaveBeenCalled();
+    expect(mediaServer.deleteCollection).not.toHaveBeenCalled();
+  });
+
+  // #3203: a 404 on the collections lookup means the target library is gone,
+  // not that the collection is merely empty. The cleared-link log must say so
+  // rather than falsely promising automatic recreation.
+  it('reports a missing target library when clearing the link, instead of promising recreation', async () => {
+    const collection = createCollection({
+      id: 29,
+      mediaServerId: null,
+      manualCollection: false,
+      title: 'Presto non disponibile',
+      libraryId: 'library-removed',
+    });
+
+    mediaServer.getCollection.mockResolvedValue(undefined);
+    mediaServer.getLibraries.mockResolvedValue([{ id: 'library-1' }] as any);
+    collectionRepo.save.mockImplementation(async (c) => c as Collection);
+    jest
+      .spyOn(service as any, 'findMediaServerCollection')
+      .mockResolvedValue(undefined);
+
+    const result = await service.checkAutomaticMediaServerLink(collection);
+
+    expect(result.mediaServerId).toBeNull();
+    expect(logger.debug).toHaveBeenCalledWith(
+      expect.stringContaining('no longer exists on the media server'),
+    );
+    expect(logger.debug).not.toHaveBeenCalledWith(
+      expect.stringContaining('will be created automatically'),
+    );
+  });
+
+  // The common, genuinely-empty case (valid library, no matches yet) must keep
+  // the reassuring auto-create message and never claim the library is missing.
+  it('keeps the auto-create message when the target library still exists', async () => {
+    const collection = createCollection({
+      id: 30,
+      mediaServerId: null,
+      manualCollection: false,
+      title: 'Empty But Valid',
+      libraryId: 'library-1',
+    });
+
+    mediaServer.getCollection.mockResolvedValue(undefined);
+    mediaServer.getLibraries.mockResolvedValue([{ id: 'library-1' }] as any);
+    collectionRepo.save.mockImplementation(async (c) => c as Collection);
+    jest
+      .spyOn(service as any, 'findMediaServerCollection')
+      .mockResolvedValue(undefined);
+
+    const result = await service.checkAutomaticMediaServerLink(collection);
+
+    expect(result.mediaServerId).toBeNull();
+    expect(logger.debug).toHaveBeenCalledWith(
+      expect.stringContaining('will be created automatically'),
+    );
+    expect(logger.debug).not.toHaveBeenCalledWith(
+      expect.stringContaining('no longer exists on the media server'),
+    );
+  });
+
+  // A transient failure to fetch the library list must not abort the reconcile
+  // or mislabel the library as missing - clear the stale link with the neutral
+  // auto-create message, exactly like an empty-but-valid library.
+  it('treats a throwing library fetch as inconclusive and clears the link neutrally', async () => {
+    const collection = createCollection({
+      id: 31,
+      mediaServerId: null,
+      manualCollection: false,
+      title: 'Transient Library Blip',
+      libraryId: 'library-1',
+    });
+
+    mediaServer.getCollection.mockResolvedValue(undefined);
+    mediaServer.getLibraries.mockRejectedValue(new Error('network blip'));
+    collectionRepo.save.mockImplementation(async (c) => c as Collection);
+    jest
+      .spyOn(service as any, 'findMediaServerCollection')
+      .mockResolvedValue(undefined);
+
+    const result = await service.checkAutomaticMediaServerLink(collection);
+
+    expect(result.mediaServerId).toBeNull();
+    expect(logger.debug).not.toHaveBeenCalledWith(
+      expect.stringContaining('no longer exists on the media server'),
+    );
   });
 
   it('repopulates a shared empty automatic collection from local rule-owned items', async () => {
@@ -477,6 +1014,125 @@ describe('CollectionsService', () => {
     expect(mediaServer.addBatchToCollection).not.toHaveBeenCalled();
   });
 
+  it('deletes and unlinks a shared empty automatic collection that rejects every resynced item', async () => {
+    const collection = createCollection({
+      id: 17,
+      mediaServerId: 'remote-collection',
+      manualCollection: false,
+      title: 'Shared Empty Rejecting',
+      libraryId: 'library-1',
+    });
+
+    mediaServer.getCollection.mockResolvedValue({
+      id: 'remote-collection',
+      title: 'Shared Empty Rejecting',
+      childCount: 0,
+    } as any);
+    mediaServer.getCollectionChildren.mockResolvedValue([]);
+    mediaServer.addBatchToCollection.mockResolvedValue([
+      'rule-owned-1',
+      'rule-owned-2',
+    ]);
+    collectionMediaRepo.find.mockResolvedValue([
+      createCollectionMedia(collection, {
+        mediaServerId: 'rule-owned-1',
+        includedByRule: true,
+        manualMembershipSource: null,
+      }),
+      createCollectionMedia(collection, {
+        mediaServerId: 'rule-owned-2',
+        includedByRule: true,
+        manualMembershipSource: null,
+      }),
+    ]);
+    collectionRepo.save.mockImplementation(async (c) => c as Collection);
+    jest
+      .spyOn(service, 'isMediaServerCollectionShared')
+      .mockResolvedValue(true);
+
+    const result = await service.checkAutomaticMediaServerLink(collection);
+
+    expect(mediaServer.deleteCollection).toHaveBeenCalledWith(
+      'remote-collection',
+    );
+    expect(result.mediaServerId).toBeNull();
+  });
+
+  it('keeps a shared empty automatic collection when only some resynced items are rejected', async () => {
+    const collection = createCollection({
+      id: 18,
+      mediaServerId: 'remote-collection',
+      manualCollection: false,
+      title: 'Shared Empty Partial Reject',
+      libraryId: 'library-1',
+    });
+
+    mediaServer.getCollection.mockResolvedValue({
+      id: 'remote-collection',
+      title: 'Shared Empty Partial Reject',
+      childCount: 0,
+    } as any);
+    mediaServer.getCollectionChildren.mockResolvedValue([]);
+    mediaServer.addBatchToCollection.mockResolvedValue(['rule-owned-2']);
+    collectionMediaRepo.find.mockResolvedValue([
+      createCollectionMedia(collection, {
+        mediaServerId: 'rule-owned-1',
+        includedByRule: true,
+        manualMembershipSource: null,
+      }),
+      createCollectionMedia(collection, {
+        mediaServerId: 'rule-owned-2',
+        includedByRule: true,
+        manualMembershipSource: null,
+      }),
+    ]);
+    jest
+      .spyOn(service, 'isMediaServerCollectionShared')
+      .mockResolvedValue(true);
+
+    const result = await service.checkAutomaticMediaServerLink(collection);
+
+    expect(mediaServer.deleteCollection).not.toHaveBeenCalled();
+    expect(result.mediaServerId).toBe('remote-collection');
+  });
+
+  it('keeps the shared collection when emptiness cannot be confirmed at heal time', async () => {
+    const collection = createCollection({
+      id: 19,
+      mediaServerId: 'remote-collection',
+      manualCollection: false,
+      title: 'Shared Empty Unconfirmed',
+      libraryId: 'library-1',
+    });
+
+    // Link check sees the collection; the heal's verification read fails
+    // (e.g. the server went unreachable), so deletion must not proceed.
+    mediaServer.getCollection
+      .mockResolvedValueOnce({
+        id: 'remote-collection',
+        title: 'Shared Empty Unconfirmed',
+        childCount: 0,
+      } as any)
+      .mockResolvedValue(undefined);
+    mediaServer.getCollectionChildren.mockResolvedValue([]);
+    mediaServer.addBatchToCollection.mockResolvedValue(['rule-owned-1']);
+    collectionMediaRepo.find.mockResolvedValue([
+      createCollectionMedia(collection, {
+        mediaServerId: 'rule-owned-1',
+        includedByRule: true,
+        manualMembershipSource: null,
+      }),
+    ]);
+    jest
+      .spyOn(service, 'isMediaServerCollectionShared')
+      .mockResolvedValue(true);
+
+    const result = await service.checkAutomaticMediaServerLink(collection);
+
+    expect(mediaServer.deleteCollection).not.toHaveBeenCalled();
+    expect(result.mediaServerId).toBe('remote-collection');
+  });
+
   it('getSiblingRuleOwnedMediaServerIds excludes manual sibling collections', async () => {
     const collection = createCollection({
       id: 20,
@@ -508,6 +1164,210 @@ describe('CollectionsService', () => {
     await expect(
       service.getSiblingRuleOwnedMediaServerIds(collection),
     ).rejects.toThrow('db down');
+  });
+
+  const makeRuleRemovalQb = (markers: { mediaServerId: string }[]) => ({
+    select: jest.fn().mockReturnThis(),
+    where: jest.fn().mockReturnThis(),
+    andWhere: jest.fn().mockReturnThis(),
+    getRawMany: jest.fn().mockResolvedValue(markers),
+    delete: jest.fn().mockReturnThis(),
+    execute: jest.fn().mockResolvedValue({ affected: 0 }),
+  });
+
+  it('reconcileRuleRemovedOrphans skips manual collections', async () => {
+    const result = await service.reconcileRuleRemovedOrphans(
+      createCollection({
+        id: 5,
+        mediaServerId: 'coll',
+        manualCollection: true,
+      }),
+      [{ id: 'x' }] as any,
+      new Set(),
+      true,
+    );
+
+    expect(result).toEqual(new Set());
+    expect(ruleRemovalRepo.createQueryBuilder).not.toHaveBeenCalled();
+  });
+
+  it('reconcileRuleRemovedOrphans self-heals a lingering orphan and clears its marker once removed', async () => {
+    const qb = makeRuleRemovalQb([{ mediaServerId: 'orphan' }]);
+    ruleRemovalRepo.createQueryBuilder.mockReturnValue(qb as any);
+    collectionMediaRepo.find.mockResolvedValue([]); // no current members
+    mediaServer.removeBatchFromCollection.mockResolvedValue([]); // removed ok
+
+    const result = await service.reconcileRuleRemovedOrphans(
+      createCollection({
+        id: 5,
+        mediaServerId: 'coll',
+        manualCollection: false,
+      }),
+      [{ id: 'orphan' }] as any,
+      new Set(),
+      true,
+    );
+
+    expect(result).toEqual(new Set(['orphan']));
+    expect(mediaServer.removeBatchFromCollection).toHaveBeenCalledWith('coll', [
+      'orphan',
+    ]);
+    // The marker exists to retry a FAILED removal. Carrying a succeeded one
+    // into the next run means a hand re-add is removed again instead of
+    // adopted as the manual member #3298 says a manual re-add should produce.
+    expect(qb.delete).toHaveBeenCalled();
+  });
+
+  // #3298 scoped the shared-collection protection to rule-owned sibling ids, so
+  // a sibling's manual-only member was unprotected - the self-heal deleted it
+  // out of the shared collection the sibling still lists it in.
+  it('reconcileRuleRemovedOrphans leaves an item a sibling holds as a manual member', async () => {
+    const qb = makeRuleRemovalQb([{ mediaServerId: 'sibling-manual' }]);
+    ruleRemovalRepo.createQueryBuilder.mockReturnValue(qb as any);
+    collectionRepo.find.mockResolvedValue([
+      createCollection({ id: 9, mediaServerId: 'coll' }),
+    ]);
+    // Keyed on the query rather than call order: this collection has no
+    // members, the sibling holds the item.
+    collectionMediaRepo.find.mockImplementation(async (options?: any) =>
+      options?.where?.collectionId === 5
+        ? []
+        : [
+            createCollectionMedia(undefined, {
+              collectionId: 9,
+              mediaServerId: 'sibling-manual',
+              isManual: true,
+              includedByRule: false,
+            }),
+          ],
+    );
+
+    const result = await service.reconcileRuleRemovedOrphans(
+      createCollection({
+        id: 5,
+        mediaServerId: 'coll',
+        manualCollection: false,
+      }),
+      [{ id: 'sibling-manual' }] as any,
+      new Set(), // not rule-owned by the sibling - manual only
+      true,
+    );
+
+    expect(result).toEqual(new Set());
+    expect(mediaServer.removeBatchFromCollection).not.toHaveBeenCalled();
+  });
+
+  it('reconcileRuleRemovedOrphans still returns the orphan when self-heal removal throws', async () => {
+    const qb = makeRuleRemovalQb([{ mediaServerId: 'orphan' }]);
+    ruleRemovalRepo.createQueryBuilder.mockReturnValue(qb as any);
+    collectionMediaRepo.find.mockResolvedValue([]); // no current members
+    // A side-effect failure must not drop orphanIds - otherwise a just-removed
+    // orphan would be re-adopted as a manual member by the caller.
+    mediaServer.removeBatchFromCollection.mockRejectedValue(new Error('boom'));
+
+    const result = await service.reconcileRuleRemovedOrphans(
+      createCollection({
+        id: 5,
+        mediaServerId: 'coll',
+        manualCollection: false,
+      }),
+      [{ id: 'orphan' }] as any,
+      new Set(),
+      true,
+    );
+
+    expect(result).toEqual(new Set(['orphan']));
+  });
+
+  it('reconcileRuleRemovedOrphans does not self-heal an item that is a current member (stale marker)', async () => {
+    const qb = makeRuleRemovalQb([{ mediaServerId: 'member' }]);
+    ruleRemovalRepo.createQueryBuilder.mockReturnValue(qb as any);
+    // The marked item is back as a collection member (a stale marker whose
+    // clear-on-add didn't land): it must not be removed from the server.
+    collectionMediaRepo.find.mockResolvedValue([
+      { mediaServerId: 'member' },
+    ] as any);
+
+    const result = await service.reconcileRuleRemovedOrphans(
+      createCollection({
+        id: 5,
+        mediaServerId: 'coll',
+        manualCollection: false,
+      }),
+      [{ id: 'member' }] as any,
+      new Set(),
+      true,
+    );
+
+    expect(result).toEqual(new Set());
+    expect(mediaServer.removeBatchFromCollection).not.toHaveBeenCalled();
+    expect(qb.delete).toHaveBeenCalled(); // stale marker cleared
+  });
+
+  it('reconcileRuleRemovedOrphans leaves a sibling-owned item in place and clears its marker', async () => {
+    const qb = makeRuleRemovalQb([{ mediaServerId: 'shared' }]);
+    ruleRemovalRepo.createQueryBuilder.mockReturnValue(qb as any);
+    collectionMediaRepo.find.mockResolvedValue([]); // no current members
+
+    const result = await service.reconcileRuleRemovedOrphans(
+      createCollection({
+        id: 5,
+        mediaServerId: 'coll',
+        manualCollection: false,
+      }),
+      [{ id: 'shared' }] as any,
+      new Set(['shared']), // owned by a sibling rule group
+      true,
+    );
+
+    // Not an orphan: never removed from the server, marker cleared.
+    expect(result).toEqual(new Set());
+    expect(mediaServer.removeBatchFromCollection).not.toHaveBeenCalled();
+    expect(qb.delete).toHaveBeenCalled();
+  });
+
+  it('reconcileRuleRemovedOrphans clears the marker once the item is gone from the server', async () => {
+    const qb = makeRuleRemovalQb([{ mediaServerId: 'gone' }]);
+    ruleRemovalRepo.createQueryBuilder.mockReturnValue(qb as any);
+    collectionMediaRepo.find.mockResolvedValue([]); // no current members
+
+    const result = await service.reconcileRuleRemovedOrphans(
+      createCollection({
+        id: 5,
+        mediaServerId: 'coll',
+        manualCollection: false,
+      }),
+      [{ id: 'other' }] as any,
+      new Set(),
+      true,
+    );
+
+    expect(result).toEqual(new Set());
+    expect(mediaServer.removeBatchFromCollection).not.toHaveBeenCalled();
+    expect(qb.delete).toHaveBeenCalled();
+    expect(qb.execute).toHaveBeenCalled();
+  });
+
+  it('reconcileRuleRemovedOrphans keeps a marker when the child read is not trustworthy (ambiguous empty)', async () => {
+    const qb = makeRuleRemovalQb([{ mediaServerId: 'maybe-gone' }]);
+    ruleRemovalRepo.createQueryBuilder.mockReturnValue(qb as any);
+    collectionMediaRepo.find.mockResolvedValue([]);
+
+    const result = await service.reconcileRuleRemovedOrphans(
+      createCollection({
+        id: 5,
+        mediaServerId: 'coll',
+        manualCollection: false,
+      }),
+      [] as any, // empty snapshot...
+      new Set(),
+      false, // ...that is NOT trustworthy (e.g. Jellyfin/Emby transient [])
+    );
+
+    // Absent under an untrustworthy read: neither self-healed nor cleared.
+    expect(result).toEqual(new Set());
+    expect(mediaServer.removeBatchFromCollection).not.toHaveBeenCalled();
+    expect(qb.delete).not.toHaveBeenCalled();
   });
 
   it('isMediaServerCollectionShared filters siblings by manualCollection', async () => {
@@ -552,6 +1412,322 @@ describe('CollectionsService', () => {
     expect(result.mediaServerId).toBe('remote-collection');
   });
 
+  it('repopulates a drained Jellyfin automatic collection from local rule-owned items', async () => {
+    settingsDataService.media_server_type = MediaServerType.JELLYFIN;
+    const collection = createCollection({
+      id: 40,
+      mediaServerId: 'remote-collection',
+      manualCollection: false,
+      title: 'Jellyfin Drained',
+      libraryId: 'library-1',
+    });
+
+    mediaServer.getCollection.mockResolvedValue({
+      id: 'remote-collection',
+      title: 'Jellyfin Drained',
+      childCount: 0,
+    } as any);
+    mediaServer.getCollectionChildren.mockResolvedValue([]);
+    collectionMediaRepo.find.mockResolvedValue([
+      createCollectionMedia(collection, {
+        mediaServerId: 'rule-owned-1',
+        includedByRule: true,
+        manualMembershipSource: null,
+      }),
+      createCollectionMedia(collection, {
+        mediaServerId: 'rule-owned-2',
+        includedByRule: true,
+        manualMembershipSource: null,
+      }),
+      createCollectionMedia(collection, {
+        mediaServerId: 'manual-only',
+        includedByRule: false,
+        manualMembershipSource: CollectionMediaManualMembershipSource.LOCAL,
+      }),
+    ]);
+
+    const result = await service.checkAutomaticMediaServerLink(collection);
+
+    // Empty BoxSets are not auto-deleted; repopulate in place, never delete.
+    expect(mediaServer.deleteCollection).not.toHaveBeenCalled();
+    expect(result.mediaServerId).toBe('remote-collection');
+    expect(mediaServer.addBatchToCollection).toHaveBeenCalledWith(
+      'remote-collection',
+      ['rule-owned-1', 'rule-owned-2'],
+    );
+  });
+
+  it('re-adds only the items a partially-drained Jellyfin collection is missing', async () => {
+    settingsDataService.media_server_type = MediaServerType.JELLYFIN;
+    const collection = createCollection({
+      id: 41,
+      mediaServerId: 'remote-collection',
+      manualCollection: false,
+      title: 'Jellyfin Partial',
+      libraryId: 'library-1',
+    });
+
+    mediaServer.getCollection.mockResolvedValue({
+      id: 'remote-collection',
+      title: 'Jellyfin Partial',
+      childCount: 1,
+    } as any);
+    mediaServer.getCollectionChildren.mockResolvedValue([
+      { id: 'rule-owned-still-present' },
+    ] as any);
+    collectionMediaRepo.find.mockResolvedValue([
+      createCollectionMedia(collection, {
+        mediaServerId: 'rule-owned-still-present',
+        includedByRule: true,
+        manualMembershipSource: null,
+      }),
+      createCollectionMedia(collection, {
+        mediaServerId: 'rule-owned-missing',
+        includedByRule: true,
+        manualMembershipSource: null,
+      }),
+    ]);
+
+    await service.checkAutomaticMediaServerLink(collection);
+
+    expect(mediaServer.deleteCollection).not.toHaveBeenCalled();
+    expect(mediaServer.addBatchToCollection).toHaveBeenCalledWith(
+      'remote-collection',
+      ['rule-owned-missing'],
+    );
+  });
+
+  it('does not re-add when a Jellyfin collection already holds all rule-owned items', async () => {
+    settingsDataService.media_server_type = MediaServerType.JELLYFIN;
+    const collection = createCollection({
+      id: 42,
+      mediaServerId: 'remote-collection',
+      manualCollection: false,
+      title: 'Jellyfin In Sync',
+      libraryId: 'library-1',
+    });
+
+    mediaServer.getCollection.mockResolvedValue({
+      id: 'remote-collection',
+      title: 'Jellyfin In Sync',
+      childCount: 2,
+    } as any);
+    mediaServer.getCollectionChildren.mockResolvedValue([
+      { id: 'rule-owned-1' },
+      { id: 'rule-owned-2' },
+    ] as any);
+    collectionMediaRepo.find.mockResolvedValue([
+      createCollectionMedia(collection, {
+        mediaServerId: 'rule-owned-1',
+        includedByRule: true,
+        manualMembershipSource: null,
+      }),
+      createCollectionMedia(collection, {
+        mediaServerId: 'rule-owned-2',
+        includedByRule: true,
+        manualMembershipSource: null,
+      }),
+    ]);
+
+    await service.checkAutomaticMediaServerLink(collection);
+
+    expect(mediaServer.addBatchToCollection).not.toHaveBeenCalled();
+    expect(mediaServer.deleteCollection).not.toHaveBeenCalled();
+  });
+
+  it('skips the drift resync and keeps the link when Jellyfin children cannot be enumerated', async () => {
+    settingsDataService.media_server_type = MediaServerType.JELLYFIN;
+    const collection = createCollection({
+      id: 43,
+      mediaServerId: 'remote-collection',
+      manualCollection: false,
+      title: 'Jellyfin Unreadable',
+      libraryId: 'library-1',
+    });
+
+    mediaServer.getCollection.mockResolvedValue({
+      id: 'remote-collection',
+      title: 'Jellyfin Unreadable',
+      childCount: 117,
+    } as any);
+    mediaServer.getCollectionChildren.mockRejectedValue(
+      new Error('Request failed with status code 500'),
+    );
+    collectionMediaRepo.find.mockResolvedValue([
+      createCollectionMedia(collection, {
+        mediaServerId: 'rule-owned-1',
+        includedByRule: true,
+        manualMembershipSource: null,
+      }),
+    ]);
+
+    const result = await service.checkAutomaticMediaServerLink(collection);
+
+    // A failed read is not an empty BoxSet - no blind re-add, link intact.
+    expect(mediaServer.addBatchToCollection).not.toHaveBeenCalled();
+    expect(mediaServer.deleteCollection).not.toHaveBeenCalled();
+    expect(result.mediaServerId).toBe('remote-collection');
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining(
+        'Could not enumerate media server collection remote-collection',
+      ),
+    );
+  });
+
+  it('skips the shared-collection drift resync when Plex children cannot be enumerated', async () => {
+    const collection = createCollection({
+      id: 17,
+      mediaServerId: 'remote-collection',
+      manualCollection: false,
+      title: 'Shared Unreadable',
+      libraryId: 'library-1',
+    });
+
+    mediaServer.getCollection.mockResolvedValue({
+      id: 'remote-collection',
+      title: 'Shared Unreadable',
+      childCount: 3,
+    } as any);
+    mediaServer.getCollectionChildren.mockRejectedValue(
+      new Error('Plex api communication failure'),
+    );
+    collectionMediaRepo.find.mockResolvedValue([
+      createCollectionMedia(collection, {
+        mediaServerId: 'rule-owned-1',
+        includedByRule: true,
+        manualMembershipSource: null,
+      }),
+    ]);
+    jest
+      .spyOn(service, 'isMediaServerCollectionShared')
+      .mockResolvedValue(true);
+
+    const result = await service.checkAutomaticMediaServerLink(collection);
+
+    expect(mediaServer.addBatchToCollection).not.toHaveBeenCalled();
+    expect(mediaServer.deleteCollection).not.toHaveBeenCalled();
+    expect(result.mediaServerId).toBe('remote-collection');
+  });
+
+  it('keeps a Plex collection when both its child count and children read are inconclusive', async () => {
+    const collection = createCollection({
+      id: 18,
+      mediaServerId: 'remote-collection',
+      manualCollection: false,
+      title: 'Unknown Count',
+      libraryId: 'library-1',
+    });
+
+    // No usable childCount metadata, and the children read fails: the
+    // empty-delete must not run on an unconfirmed 0.
+    mediaServer.getCollection.mockResolvedValue({
+      id: 'remote-collection',
+      title: 'Unknown Count',
+      childCount: undefined,
+    } as any);
+    mediaServer.getCollectionChildren.mockRejectedValue(
+      new Error('Plex api communication failure'),
+    );
+    jest
+      .spyOn(service, 'isMediaServerCollectionShared')
+      .mockResolvedValue(false);
+
+    const result = await service.checkAutomaticMediaServerLink(collection);
+
+    expect(mediaServer.deleteCollection).not.toHaveBeenCalled();
+    expect(result.mediaServerId).toBe('remote-collection');
+  });
+
+  it.each([
+    { serverType: MediaServerType.JELLYFIN, name: 'Jellyfin' },
+    { serverType: MediaServerType.EMBY, name: 'Emby' },
+  ])(
+    'keeps an empty $name automatic collection with no rule-owned items',
+    async ({ serverType, name }) => {
+      settingsDataService.media_server_type = serverType;
+      const collection = createCollection({
+        id: 45,
+        mediaServerId: 'remote-collection',
+        manualCollection: false,
+        title: `${name} Empty NoLocal`,
+        libraryId: 'library-1',
+      });
+
+      mediaServer.getCollection.mockResolvedValue({
+        id: 'remote-collection',
+        title: `${name} Empty NoLocal`,
+        childCount: 0,
+      } as any);
+      mediaServer.getCollectionChildren.mockResolvedValue([]);
+      collectionMediaRepo.find.mockResolvedValue([]);
+
+      const result = await service.checkAutomaticMediaServerLink(collection);
+
+      expect(result.mediaServerId).toBe('remote-collection');
+      expect(mediaServer.addBatchToCollection).not.toHaveBeenCalled();
+      expect(mediaServer.deleteCollection).not.toHaveBeenCalled();
+    },
+  );
+
+  it('does not resync a Jellyfin collection that was only just linked by title', async () => {
+    settingsDataService.media_server_type = MediaServerType.JELLYFIN;
+    // mediaServerId null on entry → freshly linked this run; the server may not
+    // have finished indexing, so the resync must not fire yet.
+    const collection = createCollection({
+      id: 43,
+      mediaServerId: null,
+      manualCollection: false,
+      title: 'Jellyfin Fresh Link',
+      libraryId: 'library-1',
+    });
+
+    collectionRepo.save.mockImplementation(async (c) => c as Collection);
+    jest.spyOn(service as any, 'findMediaServerCollection').mockResolvedValue({
+      id: 'remote-collection',
+      title: 'Jellyfin Fresh Link',
+      childCount: 0,
+    });
+
+    const result = await service.checkAutomaticMediaServerLink(collection);
+
+    expect(result.mediaServerId).toBe('remote-collection');
+    expect(mediaServer.getCollectionChildren).not.toHaveBeenCalled();
+    expect(mediaServer.addBatchToCollection).not.toHaveBeenCalled();
+  });
+
+  it('repopulates a drained Emby automatic collection from local rule-owned items', async () => {
+    settingsDataService.media_server_type = MediaServerType.EMBY;
+    const collection = createCollection({
+      id: 44,
+      mediaServerId: 'remote-collection',
+      manualCollection: false,
+      title: 'Emby Drained',
+      libraryId: 'library-1',
+    });
+
+    mediaServer.getCollection.mockResolvedValue({
+      id: 'remote-collection',
+      title: 'Emby Drained',
+      childCount: 0,
+    } as any);
+    mediaServer.getCollectionChildren.mockResolvedValue([]);
+    collectionMediaRepo.find.mockResolvedValue([
+      createCollectionMedia(collection, {
+        mediaServerId: 'rule-owned-1',
+        includedByRule: true,
+        manualMembershipSource: null,
+      }),
+    ]);
+
+    await service.checkAutomaticMediaServerLink(collection);
+
+    expect(mediaServer.deleteCollection).not.toHaveBeenCalled();
+    expect(mediaServer.addBatchToCollection).toHaveBeenCalledWith(
+      'remote-collection',
+      ['rule-owned-1'],
+    );
+  });
+
   it('rolls back a remote add when local bookkeeping fails', async () => {
     const collection = createCollection({
       id: 2,
@@ -577,6 +1753,235 @@ describe('CollectionsService', () => {
       'remote-collection',
       'item-1',
     );
+    expect(eventEmitter.emit).not.toHaveBeenCalledWith(
+      MaintainerrEvent.CollectionMedia_Added,
+      expect.anything(),
+    );
+    expect(mediaServer.deleteCollection).not.toHaveBeenCalled();
+  });
+
+  it('emits CollectionMedia_Added only for items the media server accepted', async () => {
+    const collection = createCollection({
+      id: 20,
+      mediaServerId: 'remote-collection',
+      manualCollection: false,
+      title: 'Partial Add',
+    });
+
+    collectionRepo.findOne.mockResolvedValue(collection);
+    collectionMediaRepo.find.mockResolvedValue([]);
+    mediaServer.addBatchToCollection.mockResolvedValue(['item-2']);
+    jest
+      .spyOn(service as any, 'checkAutomaticMediaServerLink')
+      .mockResolvedValue(collection);
+    jest
+      .spyOn(service as any, 'insertCollectionMediaMembership')
+      .mockResolvedValue(undefined);
+
+    await service.addToCollection(collection.id, [
+      { mediaServerId: 'item-1' },
+      { mediaServerId: 'item-2' },
+    ]);
+
+    expect(eventEmitter.emit).toHaveBeenCalledWith(
+      MaintainerrEvent.CollectionMedia_Added,
+      expect.objectContaining({
+        mediaItems: [expect.objectContaining({ mediaServerId: 'item-1' })],
+      }),
+    );
+    expect(mediaServer.deleteCollection).not.toHaveBeenCalled();
+  });
+
+  it('heals an empty automatic collection when the media server rejects every add', async () => {
+    const collection = createCollection({
+      id: 21,
+      mediaServerId: 'remote-collection',
+      manualCollection: false,
+      title: 'Rejecting Collection',
+    });
+
+    collectionRepo.findOne.mockResolvedValue(collection);
+    collectionMediaRepo.find.mockResolvedValue([]);
+    collectionRepo.save.mockImplementation(async (c) => c as Collection);
+    mediaServer.addBatchToCollection.mockResolvedValue(['item-1', 'item-2']);
+    mediaServer.getCollection.mockResolvedValue({
+      id: 'remote-collection',
+      title: 'Rejecting Collection',
+      childCount: 0,
+    } as any);
+    jest
+      .spyOn(service as any, 'checkAutomaticMediaServerLink')
+      .mockResolvedValue(collection);
+
+    await service.addToCollection(collection.id, [
+      { mediaServerId: 'item-1' },
+      { mediaServerId: 'item-2' },
+    ]);
+
+    expect(eventEmitter.emit).not.toHaveBeenCalledWith(
+      MaintainerrEvent.CollectionMedia_Added,
+      expect.anything(),
+    );
+    expect(mediaServer.deleteCollection).toHaveBeenCalledWith(
+      'remote-collection',
+    );
+    expect(collectionRepo.save).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 21, mediaServerId: null }),
+    );
+  });
+
+  it('does not heal when the rejecting collection still has children', async () => {
+    const collection = createCollection({
+      id: 22,
+      mediaServerId: 'remote-collection',
+      manualCollection: false,
+      title: 'Rejecting Populated Collection',
+    });
+
+    collectionRepo.findOne.mockResolvedValue(collection);
+    collectionMediaRepo.find.mockResolvedValue([]);
+    mediaServer.addBatchToCollection.mockResolvedValue(['item-1']);
+    mediaServer.getCollection.mockResolvedValue({
+      id: 'remote-collection',
+      title: 'Rejecting Populated Collection',
+      childCount: 3,
+    } as any);
+    jest
+      .spyOn(service as any, 'checkAutomaticMediaServerLink')
+      .mockResolvedValue(collection);
+
+    await service.addToCollection(collection.id, [{ mediaServerId: 'item-1' }]);
+
+    expect(mediaServer.deleteCollection).not.toHaveBeenCalled();
+  });
+
+  it('does not heal on Jellyfin even when an empty collection rejects every add', async () => {
+    const collection = createCollection({
+      id: 26,
+      mediaServerId: 'remote-collection',
+      manualCollection: false,
+      title: 'Rejecting Jellyfin Collection',
+    });
+
+    mediaServerFactory.getConfiguredServerType.mockResolvedValue(
+      MediaServerType.JELLYFIN,
+    );
+    settingsDataService.media_server_type = MediaServerType.JELLYFIN;
+    collectionRepo.findOne.mockResolvedValue(collection);
+    collectionMediaRepo.find.mockResolvedValue([]);
+    mediaServer.addBatchToCollection.mockResolvedValue(['item-1']);
+    mediaServer.getCollection.mockResolvedValue({
+      id: 'remote-collection',
+      title: 'Rejecting Jellyfin Collection',
+      childCount: 0,
+    } as any);
+    jest
+      .spyOn(service as any, 'checkAutomaticMediaServerLink')
+      .mockResolvedValue(collection);
+
+    await service.addToCollection(collection.id, [{ mediaServerId: 'item-1' }]);
+
+    expect(mediaServer.deleteCollection).not.toHaveBeenCalled();
+  });
+
+  it('does not heal a manual collection that rejects every add', async () => {
+    const collection = createCollection({
+      id: 27,
+      mediaServerId: 'remote-collection',
+      manualCollection: true,
+      title: 'Rejecting Manual Collection',
+    });
+
+    collectionRepo.findOne.mockResolvedValue(collection);
+    collectionMediaRepo.find.mockResolvedValue([]);
+    mediaServer.addBatchToCollection.mockResolvedValue(['item-1']);
+    mediaServer.getCollection.mockResolvedValue({
+      id: 'remote-collection',
+      title: 'Rejecting Manual Collection',
+      childCount: 0,
+    } as any);
+    jest
+      .spyOn(service as any, 'checkAutomaticMediaServerLink')
+      .mockResolvedValue(collection);
+
+    await service.addToCollection(
+      collection.id,
+      [{ mediaServerId: 'item-1' }],
+      true,
+    );
+
+    expect(mediaServer.deleteCollection).not.toHaveBeenCalled();
+  });
+
+  it('does not heal the same collection twice without an accepted add in between', async () => {
+    const collection = createCollection({
+      id: 23,
+      mediaServerId: 'remote-collection',
+      manualCollection: false,
+      title: 'Repeat Rejecting Collection',
+    });
+
+    collectionRepo.findOne.mockResolvedValue(collection);
+    collectionMediaRepo.find.mockResolvedValue([]);
+    collectionRepo.save.mockImplementation(async (c) => c as Collection);
+    mediaServer.addBatchToCollection.mockResolvedValue(['item-1']);
+    mediaServer.getCollection.mockResolvedValue({
+      id: 'remote-collection',
+      title: 'Repeat Rejecting Collection',
+      childCount: 0,
+    } as any);
+    jest
+      .spyOn(service as any, 'checkAutomaticMediaServerLink')
+      .mockResolvedValue(collection);
+
+    await service.addToCollection(collection.id, [{ mediaServerId: 'item-1' }]);
+    expect(mediaServer.deleteCollection).toHaveBeenCalledTimes(1);
+
+    // Relinked to a recreated collection that also rejects everything.
+    collection.mediaServerId = 'remote-collection-2';
+    await service.addToCollection(collection.id, [{ mediaServerId: 'item-1' }]);
+
+    expect(mediaServer.deleteCollection).toHaveBeenCalledTimes(1);
+  });
+
+  it('heals again once the media server has accepted adds in between', async () => {
+    const collection = createCollection({
+      id: 24,
+      mediaServerId: 'remote-collection',
+      manualCollection: false,
+      title: 'Recovering Collection',
+    });
+
+    collectionRepo.findOne.mockResolvedValue(collection);
+    collectionMediaRepo.find.mockResolvedValue([]);
+    collectionRepo.save.mockImplementation(async (c) => c as Collection);
+    mediaServer.getCollection.mockResolvedValue({
+      id: 'remote-collection',
+      title: 'Recovering Collection',
+      childCount: 0,
+    } as any);
+    jest
+      .spyOn(service as any, 'checkAutomaticMediaServerLink')
+      .mockResolvedValue(collection);
+    jest
+      .spyOn(service as any, 'insertCollectionMediaMembership')
+      .mockResolvedValue(undefined);
+
+    // First pass: everything rejected → heal.
+    mediaServer.addBatchToCollection.mockResolvedValueOnce(['item-1']);
+    await service.addToCollection(collection.id, [{ mediaServerId: 'item-1' }]);
+    expect(mediaServer.deleteCollection).toHaveBeenCalledTimes(1);
+
+    // Recreated collection accepts the add → guard resets.
+    collection.mediaServerId = 'remote-collection-2';
+    mediaServer.addBatchToCollection.mockResolvedValueOnce([]);
+    await service.addToCollection(collection.id, [{ mediaServerId: 'item-1' }]);
+    expect(mediaServer.deleteCollection).toHaveBeenCalledTimes(1);
+
+    // A later total rejection may heal again.
+    mediaServer.addBatchToCollection.mockResolvedValueOnce(['item-2']);
+    await service.addToCollection(collection.id, [{ mediaServerId: 'item-2' }]);
+    expect(mediaServer.deleteCollection).toHaveBeenCalledTimes(2);
   });
 
   it('recreates collections empty and resyncs existing items separately', async () => {
@@ -1096,10 +2501,10 @@ describe('CollectionsService', () => {
 
     await service.createCollectionWithChildren(collection, media);
 
+    // Seeded with the first item so Emby can create it (#3075); the full set is
+    // still added via the batched path below.
     expect(mediaServer.createCollection).toHaveBeenCalledWith(
-      expect.not.objectContaining({
-        initialItemIds: expect.anything(),
-      }),
+      expect.objectContaining({ initialItemId: 'item-1' }),
     );
     expect(addChildrenToCollectionSpy).toHaveBeenCalledWith(
       {
@@ -1110,6 +2515,31 @@ describe('CollectionsService', () => {
       false,
       false,
     );
+  });
+
+  it('creates the DB row only (no remote collection) when no media is provided', async () => {
+    // No items to seed → the remote collection would be empty (pointless
+    // everywhere, a hard 500 on Emby, #3075), so defer it to the first add.
+    const collection = createCollection({
+      id: 41,
+      mediaServerId: null,
+      manualCollection: false,
+      libraryId: 'library-1',
+      title: 'Empty Collection',
+    });
+
+    jest.spyOn(service as any, 'addCollectionToDB').mockResolvedValue({
+      id: collection.id,
+      mediaServerId: null,
+    });
+    const addChildrenToCollectionSpy = jest
+      .spyOn(service as any, 'addChildrenToCollection')
+      .mockResolvedValue(undefined);
+
+    await service.createCollectionWithChildren(collection, []);
+
+    expect(mediaServer.createCollection).not.toHaveBeenCalled();
+    expect(addChildrenToCollectionSpy).not.toHaveBeenCalled();
   });
 
   it('returns undefined without adding media when collection creation fails', async () => {
@@ -1166,13 +2596,9 @@ describe('CollectionsService', () => {
         grandparentTitle: undefined,
       }),
     ]);
-    mediaServer.getMetadata.mockImplementation(async (itemId: string) => {
-      if (itemId === 'show-1') {
-        return showMetadata;
-      }
-
-      return undefined;
-    });
+    mediaServer.getMetadataBatch.mockImplementation(async (ids: string[]) =>
+      ids.includes('show-1') ? [showMetadata] : [],
+    );
 
     const result = await (service as any).hydrateCollectionMediaWithMetadata(
       items,
@@ -1182,10 +2608,80 @@ describe('CollectionsService', () => {
     expect(mediaServer.getCollectionChildren).toHaveBeenCalledWith(
       'remote-collection',
     );
-    expect(mediaServer.getMetadata).toHaveBeenCalledTimes(1);
+    // Two episodes of one show: the shared parent is asked for once, in one read.
+    expect(mediaServer.getMetadataBatch).toHaveBeenCalledTimes(1);
+    expect(mediaServer.getMetadataBatch).toHaveBeenCalledWith(['show-1']);
+    expect(mediaServer.getMetadata).not.toHaveBeenCalled();
     expect(result).toHaveLength(2);
     expect(result[0].mediaData?.parentItem?.id).toBe('show-1');
     expect(result[0].mediaData?.grandparentTitle).toBe('Shared Show');
+  });
+
+  // Emby and Jellyfin put a movie under its library folder, so a collection
+  // stored one folder per film has about as many parents as it has rows.
+  it('reads many distinct parents in one request', async () => {
+    const collection = createCollection({
+      id: 31,
+      mediaServerId: 'remote-collection',
+      type: 'movie',
+    });
+    const entities = Array.from({ length: 25 }, (unused, index) =>
+      createCollectionMedia(collection, { mediaServerId: `movie-${index}` }),
+    );
+    collectionRepo.findOne.mockResolvedValue(collection);
+    mediaServer.getCollectionChildren.mockResolvedValue(
+      entities.map((entity, index) =>
+        createMediaItem({
+          id: entity.mediaServerId,
+          type: 'movie',
+          parentId: `folder-${index}`,
+        }),
+      ),
+    );
+    mediaServer.getMetadataBatch.mockImplementation(async (ids: string[]) =>
+      ids.map((id) => createMediaItem({ id, title: id })),
+    );
+
+    const result = await (service as any).hydrateCollectionMediaWithMetadata(
+      entities,
+      mediaServer,
+    );
+
+    expect(mediaServer.getMetadataBatch).toHaveBeenCalledTimes(1);
+    expect(mediaServer.getMetadataBatch.mock.calls[0][0]).toHaveLength(25);
+    expect(mediaServer.getMetadata).not.toHaveBeenCalled();
+    expect(result[0].mediaData?.parentItem?.id).toBe('folder-0');
+  });
+
+  it('keeps a row whose parent the server did not answer for', async () => {
+    const collection = createCollection({
+      id: 32,
+      mediaServerId: 'remote-collection',
+      type: 'episode',
+    });
+    const entity = createCollectionMedia(collection, {
+      mediaServerId: 'episode-1',
+    });
+    collectionRepo.findOne.mockResolvedValue(collection);
+    mediaServer.getCollectionChildren.mockResolvedValue([
+      createMediaItem({
+        id: 'episode-1',
+        type: 'episode',
+        grandparentId: 'show-gone',
+      }),
+    ]);
+    mediaServer.getMetadataBatch.mockResolvedValue([]);
+
+    const result = await (service as any).hydrateCollectionMediaWithMetadata(
+      [entity],
+      mediaServer,
+    );
+
+    expect(result).toHaveLength(1);
+    expect(result[0].mediaData?.parentItem).toBeUndefined();
+    expect(logger.debug).toHaveBeenCalledWith(
+      'No metadata for 1 of 1 collection media parents',
+    );
   });
 
   it('hydrates only the requested page after sorting collection media', async () => {
@@ -1264,7 +2760,7 @@ describe('CollectionsService', () => {
     // `deleteSoonest` is equivalent to ordering by `collection_media.addDate`
     // because `deleteAfterDays` is constant across a collection. SQL does the
     // pagination so we don't have to hydrate every row in the collection
-    // before slicing — critical for collections with hundreds of items where
+    // before slicing - critical for collections with hundreds of items where
     // hydrating all rows would block the UI for minutes.
     const collection = createCollection({
       id: 9,
@@ -1424,6 +2920,112 @@ describe('CollectionsService', () => {
       totalSize: 2,
       items: hydratedPage,
     });
+  });
+
+  // Without the status lookup these had nothing to order by at all.
+  it.each(['manual', 'excluded'] as const)(
+    'orders a %s sort by state the media server does not report',
+    async (sort) => {
+      const collection = createCollection({
+        id: 12,
+        mediaServerId: 'remote-collection',
+        type: 'movie',
+      });
+      const ruleEntity = createCollectionMedia(collection, {
+        mediaServerId: 'movie-rule',
+      });
+      const manualEntity = createCollectionMedia(collection, {
+        mediaServerId: 'movie-manual',
+      });
+      const entities = [ruleEntity, manualEntity];
+      const metadataByMediaServerId = new Map([
+        ['movie-rule', createMediaItem({ id: 'movie-rule', title: 'Alpha' })],
+        [
+          'movie-manual',
+          createMediaItem({ id: 'movie-manual', title: 'Zulu' }),
+        ],
+      ]);
+      const queryBuilder = {
+        where: jest.fn().mockReturnThis(),
+        getCount: jest.fn().mockResolvedValue(entities.length),
+        clone: jest.fn(),
+      };
+      const cloneBuilder = {
+        orderBy: jest.fn().mockReturnThis(),
+        addOrderBy: jest.fn().mockReturnThis(),
+        getRawAndEntities: jest.fn().mockResolvedValue({ entities }),
+      };
+      queryBuilder.clone.mockReturnValue(cloneBuilder);
+      collectionMediaRepo.createQueryBuilder.mockReturnValue(
+        queryBuilder as any,
+      );
+      jest
+        .spyOn(service as any, 'getCollectionMediaMetadata')
+        .mockResolvedValue(metadataByMediaServerId);
+      const hydrateSpy = jest
+        .spyOn(service as any, 'hydrateCollectionMediaWithMetadata')
+        .mockImplementation(async (page) => page as any);
+      mediaItemEnrichmentService.enrichItems.mockImplementation(async (items) =>
+        items.map((item) =>
+          item.id === 'movie-manual'
+            ? { ...item, maintainerrIsManual: true, maintainerrExclusionId: 7 }
+            : item,
+        ),
+      );
+
+      await (service as any).getCollectionMediaWithServerDataAndPaging(
+        collection.id,
+        { size: 2, sort, sortOrder: 'desc' },
+      );
+
+      expect(mediaItemEnrichmentService.enrichItems).toHaveBeenCalled();
+      // Zulu sorts last by title, so leading means the state decided the order.
+      expect(hydrateSpy.mock.calls[0][0]).toEqual([manualEntity, ruleEntity]);
+      // The state is for comparing only: which fields the response carries must
+      // not depend on how it was sorted.
+      expect(hydrateSpy.mock.calls[0][2]).toBe(metadataByMediaServerId);
+      expect(metadataByMediaServerId.get('movie-manual')).not.toHaveProperty(
+        'maintainerrIsManual',
+      );
+    },
+  );
+
+  it('does not pay for the status lookup on a sort that never reads it', async () => {
+    const collection = createCollection({
+      id: 13,
+      mediaServerId: 'remote-collection',
+      type: 'movie',
+    });
+    const entities = [
+      createCollectionMedia(collection, { mediaServerId: 'movie-1' }),
+    ];
+    const queryBuilder = {
+      where: jest.fn().mockReturnThis(),
+      getCount: jest.fn().mockResolvedValue(1),
+      clone: jest.fn(),
+    };
+    const cloneBuilder = {
+      orderBy: jest.fn().mockReturnThis(),
+      addOrderBy: jest.fn().mockReturnThis(),
+      getRawAndEntities: jest.fn().mockResolvedValue({ entities }),
+    };
+    queryBuilder.clone.mockReturnValue(cloneBuilder);
+    collectionMediaRepo.createQueryBuilder.mockReturnValue(queryBuilder as any);
+    jest
+      .spyOn(service as any, 'getCollectionMediaMetadata')
+      .mockResolvedValue(
+        new Map([['movie-1', createMediaItem({ id: 'movie-1' })]]),
+      );
+    jest
+      .spyOn(service as any, 'hydrateCollectionMediaWithMetadata')
+      .mockResolvedValue([]);
+
+    await (service as any).getCollectionMediaWithServerDataAndPaging(
+      collection.id,
+      { size: 2, sort: 'title', sortOrder: 'asc' },
+    );
+
+    expect(mediaItemEnrichmentService.enrichItems).not.toHaveBeenCalled();
   });
 
   it('uses hydrated exclusion count for sorted exclusion totals', async () => {
@@ -1708,9 +3310,9 @@ describe('CollectionsService', () => {
     );
     // getCollection confirms the collection is truly gone
     mediaServer.getCollection.mockResolvedValue(undefined);
-    mediaServer.getMetadata.mockResolvedValue(
+    mediaServer.getMetadataBatch.mockResolvedValue([
       createMediaItem({ id: 'movie-1', title: 'Fallback Movie' }),
-    );
+    ]);
 
     const result = await (service as any).hydrateCollectionMediaWithMetadata(
       items,
@@ -1724,8 +3326,8 @@ describe('CollectionsService', () => {
     expect(collectionRepo.save).toHaveBeenCalledWith(
       expect.objectContaining({ mediaServerId: null }),
     );
-    // Fallback per-item lookup still works
-    expect(mediaServer.getMetadata).toHaveBeenCalledWith('movie-1');
+    // The batched fallback read still answers for the row
+    expect(mediaServer.getMetadataBatch).toHaveBeenCalledWith(['movie-1']);
     expect(result).toHaveLength(1);
     expect(result[0].mediaData?.title).toBe('Fallback Movie');
   });
@@ -1751,9 +3353,9 @@ describe('CollectionsService', () => {
       childCount: 1,
       smart: false,
     });
-    mediaServer.getMetadata.mockResolvedValue(
+    mediaServer.getMetadataBatch.mockResolvedValue([
       createMediaItem({ id: 'movie-1', title: 'Fallback Movie' }),
-    );
+    ]);
 
     const result = await (service as any).hydrateCollectionMediaWithMetadata(
       items,
@@ -1787,9 +3389,9 @@ describe('CollectionsService', () => {
       new Error('Request failed with status code 400'),
     );
     mediaServer.getCollection.mockRejectedValue(new Error('status code 502'));
-    mediaServer.getMetadata.mockResolvedValue(
+    mediaServer.getMetadataBatch.mockResolvedValue([
       createMediaItem({ id: 'movie-1', title: 'Fallback Movie' }),
-    );
+    ]);
 
     const result = await (service as any).hydrateCollectionMediaWithMetadata(
       items,
@@ -1802,12 +3404,16 @@ describe('CollectionsService', () => {
     );
     expect(collectionRepo.save).not.toHaveBeenCalled();
     expect(collection.mediaServerId).toBe('verification-failure-collection');
-    expect(mediaServer.getMetadata).toHaveBeenCalledWith('movie-1');
+    expect(mediaServer.getMetadataBatch).toHaveBeenCalledWith(['movie-1']);
     expect(result).toHaveLength(1);
     expect(result[0].mediaData?.title).toBe('Fallback Movie');
   });
 
-  it('passes initial item ids on create for servers that support seeded collection creation', async () => {
+  it('creates a new media server collection seeded with one item, then batch-adds the rest', async () => {
+    // The create request carries a single item id (the first), not the whole set
+    // (the full set in the query string → HTTP 414 at scale, #3001). One item is
+    // required so Emby can create the collection at all (#3075); the full set is
+    // then added via the batched path.
     const collection = createCollection({
       id: 21,
       mediaServerId: null,
@@ -1820,9 +3426,6 @@ describe('CollectionsService', () => {
     collectionRepo.save.mockImplementation(async (entity) => entity as any);
     collectionMediaRepo.find.mockResolvedValue([]);
     collectionPosterService.loadStoredPoster.mockResolvedValue(null);
-    mediaServer.supportsFeature.mockImplementation(
-      (feature) => feature === MediaServerFeature.BULK_COLLECTION_CREATE,
-    );
     jest
       .spyOn(service as any, 'checkAutomaticMediaServerLink')
       .mockResolvedValue(collection);
@@ -1836,16 +3439,15 @@ describe('CollectionsService', () => {
     ]);
 
     expect(mediaServer.createCollection).toHaveBeenCalledWith(
-      expect.objectContaining({
-        initialItemIds: ['episode-1', 'episode-2'],
-      }),
+      expect.objectContaining({ initialItemId: 'episode-1' }),
     );
-    expect(mediaServer.addBatchToCollection).not.toHaveBeenCalled();
+    // The full set is still added via the batched path (skipMediaServerAdd=false);
+    // re-adding the seeded item there is an idempotent no-op.
     expect(addChildrenToCollection).toHaveBeenCalledWith(
       { mediaServerId: 'remote-collection', dbId: collection.id },
       [{ mediaServerId: 'episode-1' }, { mediaServerId: 'episode-2' }],
       false,
-      true,
+      false,
       CollectionMediaManualMembershipSource.LOCAL,
     );
   });
@@ -1890,17 +3492,19 @@ describe('CollectionsService', () => {
       childCount: rows.length,
     } as any);
 
-    // Hand back metadata where every item has the same library addedAt —
+    // Hand back metadata where every item has the same library addedAt -
     // if the comparator falls through to MediaItem.addedAt (the bug) the
     // ordering becomes whatever Map iteration gives us; the assertion
     // below would fail.
-    mediaServer.getMetadata.mockImplementation(async (id: string) =>
-      createMediaItem({
-        id,
-        title: id,
-        type: 'movie',
-        addedAt: libraryAddDate,
-      }),
+    mediaServer.getMetadataBatch.mockImplementation(async (ids: string[]) =>
+      ids.map((id) =>
+        createMediaItem({
+          id,
+          title: id,
+          type: 'movie',
+          addedAt: libraryAddDate,
+        }),
+      ),
     );
 
     mediaServer.reorderCollectionItems = jest.fn().mockResolvedValue(undefined);
@@ -1911,5 +3515,743 @@ describe('CollectionsService', () => {
       'remote-99',
       ['leaves-soonest', 'leaves-middle', 'leaves-latest'],
     );
+  });
+
+  describe('getCollectionMediaMetadata per-item fallback', () => {
+    const collection = () =>
+      createCollection({
+        id: 21,
+        mediaServerId: 'remote-collection',
+        type: 'movie',
+      });
+
+    // Every row falls through to this read when the collection read above it
+    // failed, which is exactly when the server is least able to answer a
+    // request each.
+    it('reads the rows the collection did not answer for in one batch', async () => {
+      const col = collection();
+      const entities = Array.from({ length: 25 }, (unused, index) =>
+        createCollectionMedia(col, { mediaServerId: `movie-${index}` }),
+      );
+      collectionRepo.findOne.mockResolvedValue(col);
+      mediaServer.getCollectionChildren.mockRejectedValue(new Error('503'));
+      mediaServer.getCollection.mockResolvedValue({
+        id: 'remote-collection',
+      } as MediaCollection);
+      mediaServer.getMetadataBatch.mockImplementation(async (ids: string[]) =>
+        ids.map((id) => createMediaItem({ id })),
+      );
+
+      const metadata = await (service as any).getCollectionMediaMetadata(
+        entities,
+        mediaServer,
+      );
+
+      expect(mediaServer.getMetadataBatch).toHaveBeenCalledTimes(1);
+      expect(mediaServer.getMetadata).not.toHaveBeenCalled();
+      expect(metadata.size).toBe(25);
+    });
+
+    it('skips a row the server answered nothing for rather than dropping it', async () => {
+      const col = collection();
+      const entities = [
+        createCollectionMedia(col, { mediaServerId: 'movie-1' }),
+        createCollectionMedia(col, { mediaServerId: 'gone' }),
+      ];
+      collectionRepo.findOne.mockResolvedValue(col);
+      mediaServer.getCollectionChildren.mockResolvedValue([]);
+      mediaServer.getMetadataBatch.mockResolvedValue([
+        createMediaItem({ id: 'movie-1' }),
+      ]);
+
+      const metadata = await (service as any).getCollectionMediaMetadata(
+        entities,
+        mediaServer,
+      );
+
+      expect(metadata.has('movie-1')).toBe(true);
+      expect(metadata.has('gone')).toBe(false);
+      expect(logger.debug).toHaveBeenCalledWith(
+        expect.stringContaining('No metadata for 1 of 2 collection media rows'),
+      );
+    });
+  });
+
+  describe('removeStaleCollectionMedia', () => {
+    const buildMedia = (id: number, mediaServerId: string) =>
+      Object.assign(new CollectionMedia(), { id, mediaServerId });
+
+    it('removes only the rows the server confirms are gone', async () => {
+      collectionMediaRepo.find.mockResolvedValue([
+        buildMedia(1, 'present'),
+        buildMedia(2, 'gone'),
+      ]);
+      mediaServer.itemExists.mockImplementation(async (id) => id !== 'gone');
+
+      await service.removeStaleCollectionMedia();
+
+      expect(collectionMediaRepo.delete).toHaveBeenCalledTimes(1);
+      expect(collectionMediaRepo.delete).toHaveBeenCalledWith(2);
+    });
+
+    it('keeps the row when the existence check is inconclusive (throws)', async () => {
+      collectionMediaRepo.find.mockResolvedValue([buildMedia(1, 'maybe')]);
+      // A transient failure must never be read as "gone".
+      mediaServer.itemExists.mockRejectedValue(new Error('media server down'));
+
+      await service.removeStaleCollectionMedia();
+
+      expect(collectionMediaRepo.delete).not.toHaveBeenCalled();
+    });
+
+    it('does not check a row the batched read already answered for', async () => {
+      collectionMediaRepo.find.mockResolvedValue([
+        buildMedia(1, 'present'),
+        buildMedia(2, 'gone'),
+      ]);
+      mediaServer.getMetadataBatch.mockResolvedValue([
+        createMediaItem({ id: 'present' }),
+      ]);
+      mediaServer.itemExists.mockResolvedValue(false);
+
+      await service.removeStaleCollectionMedia();
+
+      expect(mediaServer.itemExists).toHaveBeenCalledTimes(1);
+      expect(mediaServer.itemExists).toHaveBeenCalledWith('gone');
+      expect(collectionMediaRepo.delete).toHaveBeenCalledWith(2);
+    });
+  });
+
+  // Both used to answer 201 with an empty body, which is the same silent
+  // success the manual add was reporting for a rejected item.
+  describe('MediaCollectionActionWithContext failures', () => {
+    const context = { type: 'show' as const, id: '7' };
+    const media = { mediaServerId: '7' };
+
+    it('reports an add naming a collection that does not exist', async () => {
+      collectionRepo.findOne.mockResolvedValue(null);
+
+      await expect(
+        service.MediaCollectionActionWithContext(999, context, media, 'add'),
+      ).rejects.toThrow('Collection 999 not found');
+    });
+
+    it('reports a remove naming a collection that does not exist', async () => {
+      collectionRepo.findOne.mockResolvedValue(null);
+
+      await expect(
+        service.MediaCollectionActionWithContext(999, context, media, 'remove'),
+      ).rejects.toThrow('Collection 999 not found');
+    });
+
+    // addToCollectionInternal swallows its own failures so a rule run survives
+    // one bad collection; the interactive path must not read that as done.
+    it('reports an add whose internal work failed', async () => {
+      collectionRepo.findOne.mockResolvedValue({ id: 1, type: 'show' } as any);
+      mediaServer.getAllIdsForContextAction.mockResolvedValue(['7']);
+      jest
+        .spyOn(service as any, 'addToCollectionInternal')
+        .mockResolvedValue({ collection: undefined, serverRejectedIds: [] });
+
+      await expect(
+        service.MediaCollectionActionWithContext(1, context, media, 'add'),
+      ).rejects.toThrow('could not be updated');
+    });
+
+    it('reports a remove whose internal work failed', async () => {
+      collectionRepo.findOne.mockResolvedValue({ id: 1, type: 'show' } as any);
+      mediaServer.getAllIdsForContextAction.mockResolvedValue(['7']);
+      jest.spyOn(service, 'removeFromCollection').mockResolvedValue(undefined);
+
+      await expect(
+        service.MediaCollectionActionWithContext(1, context, media, 'remove'),
+      ).rejects.toThrow('could not be updated');
+    });
+
+    it('still allows a global remove, which names no collection', async () => {
+      mediaServer.getAllIdsForContextAction.mockResolvedValue(['7']);
+      const removeAll = jest
+        .spyOn(service, 'removeFromAllCollections')
+        .mockResolvedValue(undefined as never);
+
+      await expect(
+        service.MediaCollectionActionWithContext(
+          undefined,
+          context,
+          media,
+          'remove',
+        ),
+      ).resolves.toMatchObject({ resolvedCount: 1 });
+      expect(removeAll).toHaveBeenCalled();
+    });
+
+    it('reports a context the media server could not resolve', async () => {
+      collectionRepo.findOne.mockResolvedValue({
+        id: 1,
+        type: 'season',
+      } as any);
+      mediaServer.getAllIdsForContextAction.mockRejectedValue(
+        new Error('plex unreachable'),
+      );
+
+      await expect(
+        service.MediaCollectionActionWithContext(1, context, media, 'add'),
+      ).rejects.toThrow('plex unreachable');
+    });
+  });
+
+  describe('bulkMediaCollectionAction', () => {
+    beforeEach(() => {
+      collectionRepo.findOne.mockResolvedValue({ id: 7, type: 'movie' } as any);
+      mediaServer.itemExists.mockResolvedValue(true);
+      mediaServer.getAllIdsForContextAction.mockImplementation(
+        async (_type, _context, mediaId) => [mediaId],
+      );
+    });
+
+    // Parallel first adds each create their own media server collection.
+    it('writes the whole selection in one batched call, never one per item', async () => {
+      const addInternal = jest
+        .spyOn(service as any, 'addToCollectionInternal')
+        .mockResolvedValue({
+          collection: createCollection(),
+          serverRejectedIds: [],
+        });
+
+      await expect(
+        service.bulkMediaCollectionAction(
+          ['movie-1', 'movie-2', 'movie-1'],
+          7,
+          'add',
+          'movie',
+        ),
+      ).resolves.toEqual({
+        results: [
+          { mediaId: 'movie-1', code: 1 },
+          { mediaId: 'movie-2', code: 1 },
+        ],
+      });
+      expect(addInternal).toHaveBeenCalledTimes(1);
+      expect(addInternal).toHaveBeenCalledWith(
+        7,
+        [{ mediaServerId: 'movie-1' }, { mediaServerId: 'movie-2' }],
+        true,
+      );
+    });
+
+    it('reports only the items the media server refused', async () => {
+      jest.spyOn(service as any, 'addToCollectionInternal').mockResolvedValue({
+        collection: createCollection(),
+        serverRejectedIds: ['movie-2'],
+      });
+
+      await expect(
+        service.bulkMediaCollectionAction(
+          ['movie-1', 'movie-2'],
+          7,
+          'add',
+          'movie',
+        ),
+      ).resolves.toEqual({
+        results: [
+          { mediaId: 'movie-1', code: 1 },
+          {
+            mediaId: 'movie-2',
+            code: 0,
+            message: 'Failed - refused by the media server',
+          },
+        ],
+      });
+    });
+
+    it('refuses to add an id the media server does not hold', async () => {
+      const addInternal = jest.spyOn(service as any, 'addToCollectionInternal');
+      mediaServer.itemExists.mockResolvedValue(false);
+
+      await expect(
+        service.bulkMediaCollectionAction(['ghost-1'], 7, 'add', 'movie'),
+      ).resolves.toEqual({
+        results: [
+          {
+            mediaId: 'ghost-1',
+            code: 0,
+            message: 'Failed - not found on the media server',
+          },
+        ],
+      });
+      expect(addInternal).not.toHaveBeenCalled();
+    });
+
+    describe('a collection bound to one library', () => {
+      const addAllowed = () =>
+        jest
+          .spyOn(service as any, 'addToCollectionInternal')
+          .mockResolvedValue({
+            collection: createCollection(),
+            serverRejectedIds: [],
+          });
+
+      beforeEach(() => {
+        collectionRepo.findOne.mockResolvedValue({
+          id: 7,
+          type: 'movie',
+          libraryId: 'library-1',
+        } as any);
+        mediaServer.supportsFeature.mockReturnValue(false);
+      });
+
+      it('refuses an item from another library', async () => {
+        const addInternal = addAllowed();
+        mediaServer.getMetadata.mockResolvedValue({
+          library: { id: 'library-2' },
+        } as any);
+
+        await expect(
+          service.bulkMediaCollectionAction(['movie-1'], 7, 'add', 'movie'),
+        ).resolves.toEqual({
+          results: [
+            {
+              mediaId: 'movie-1',
+              code: 0,
+              message: "Failed - not in this collection's library",
+            },
+          ],
+        });
+        expect(addInternal).not.toHaveBeenCalled();
+      });
+
+      // An unreadable library is not evidence against the item; existence is
+      // already settled by itemExists, which throws when it cannot ask.
+      it.each([
+        ['its own library', { library: { id: 'library-1' } }],
+        ['no readable library at all', undefined],
+      ])('adds an item with %s', async (_label, metadata) => {
+        const addInternal = addAllowed();
+        mediaServer.getMetadata.mockResolvedValue(metadata as any);
+
+        await expect(
+          service.bulkMediaCollectionAction(['movie-1'], 7, 'add', 'movie'),
+        ).resolves.toEqual({ results: [{ mediaId: 'movie-1', code: 1 }] });
+        expect(addInternal).toHaveBeenCalled();
+      });
+    });
+
+    it('does not read metadata to check the library where collections span them', async () => {
+      collectionRepo.findOne.mockResolvedValue({
+        id: 7,
+        type: 'movie',
+        libraryId: 'library-1',
+      } as any);
+      mediaServer.supportsFeature.mockImplementation(
+        (feature) => feature === MediaServerFeature.CROSS_LIBRARY_COLLECTIONS,
+      );
+      mediaServer.getMetadata.mockReset();
+      jest.spyOn(service as any, 'addToCollectionInternal').mockResolvedValue({
+        collection: createCollection(),
+        serverRejectedIds: [],
+      });
+
+      await expect(
+        service.bulkMediaCollectionAction(['movie-1'], 7, 'add', 'movie'),
+      ).resolves.toEqual({ results: [{ mediaId: 'movie-1', code: 1 }] });
+      expect(mediaServer.itemExists).toHaveBeenCalledWith('movie-1');
+      expect(mediaServer.getMetadata).not.toHaveBeenCalled();
+    });
+
+    it('adds anyway when the existence lookup is inconclusive', async () => {
+      const addInternal = jest
+        .spyOn(service as any, 'addToCollectionInternal')
+        .mockResolvedValue({
+          collection: createCollection(),
+          serverRejectedIds: [],
+        });
+      mediaServer.itemExists.mockRejectedValue(new Error('unreachable'));
+
+      await expect(
+        service.bulkMediaCollectionAction(['movie-1'], 7, 'add', 'movie'),
+      ).resolves.toEqual({ results: [{ mediaId: 'movie-1', code: 1 }] });
+      expect(addInternal).toHaveBeenCalled();
+    });
+
+    it('removes without an existence check, so a stale row can still be cleaned up', async () => {
+      const removeFromCollection = jest
+        .spyOn(service, 'removeFromCollection')
+        .mockResolvedValue(createCollection());
+
+      await service.bulkMediaCollectionAction(
+        ['ghost-1'],
+        7,
+        'remove',
+        'movie',
+      );
+
+      expect(mediaServer.itemExists).not.toHaveBeenCalled();
+      expect(removeFromCollection).toHaveBeenCalledWith(7, [
+        { mediaServerId: 'ghost-1' },
+      ]);
+    });
+
+    it('removes from every collection when none is named', async () => {
+      const removeAll = jest
+        .spyOn(service, 'removeFromAllCollections')
+        .mockResolvedValue({ status: 'OK', code: 1, message: 'Success' });
+
+      await expect(
+        service.bulkMediaCollectionAction(
+          ['movie-1'],
+          undefined,
+          'remove',
+          'movie',
+        ),
+      ).resolves.toEqual({ results: [{ mediaId: 'movie-1', code: 1 }] });
+      expect(removeAll).toHaveBeenCalledWith([{ mediaServerId: 'movie-1' }]);
+    });
+
+    // removeFromCollection answers nothing when it fails instead of throwing,
+    // so a discarded result let a failed removal report as done.
+    it('reports a collection that could not be updated during a remove-all', async () => {
+      const collections = [
+        createCollection({ id: 7 }),
+        createCollection({ id: 8 }),
+      ] as Collection[];
+      collectionRepo.find.mockResolvedValue(collections);
+      jest
+        .spyOn(service, 'removeFromCollection')
+        .mockResolvedValueOnce(collections[0])
+        .mockResolvedValueOnce(undefined);
+
+      await expect(
+        service.removeFromAllCollections([{ mediaServerId: 'movie-1' }]),
+      ).resolves.toEqual({ status: 'NOK', code: 0, message: 'Failed' });
+    });
+
+    it('reports an item the target collection cannot take', async () => {
+      mediaServer.getAllIdsForContextAction.mockResolvedValue([]);
+
+      await expect(
+        service.bulkMediaCollectionAction(['show-1'], 7, 'add', 'show'),
+      ).resolves.toEqual({
+        results: [
+          {
+            mediaId: 'show-1',
+            code: 0,
+            message: 'Failed - nothing this collection can take',
+          },
+        ],
+      });
+    });
+
+    it('rejects a collection that does not exist rather than acting globally', async () => {
+      collectionRepo.findOne.mockResolvedValue(null);
+
+      await expect(
+        service.bulkMediaCollectionAction(['movie-1'], 999, 'remove', 'movie'),
+      ).rejects.toThrow('Collection 999 not found');
+    });
+  });
+
+  // A library id used to discard the type filter, so the add modal listed the
+  // same collection once per type it asked for.
+  describe('getCollections filtering', () => {
+    it.each([
+      [
+        'both filters',
+        '2',
+        'season' as const,
+        { libraryId: '2', type: 'season' },
+      ],
+      ['a library only', '2', undefined, { libraryId: '2' }],
+      ['a type only', undefined, 'season' as const, { type: 'season' }],
+    ])('applies %s', async (label, libraryId, typeId, expected) => {
+      collectionRepo.find.mockResolvedValue([]);
+
+      await service.getCollections(libraryId, typeId);
+
+      expect(collectionRepo.find).toHaveBeenCalledWith({ where: expected });
+    });
+
+    it('reads every collection when neither filter is given', async () => {
+      collectionRepo.find.mockResolvedValue([]);
+
+      await service.getCollections();
+
+      expect(collectionRepo.find).toHaveBeenCalledWith(undefined);
+    });
+  });
+
+  describe('findMediaServerCollection', () => {
+    const boxset = (props: Partial<MediaCollection>): MediaCollection =>
+      ({ id: 'box-1', title: 'Shared', smart: false, ...props }) as never;
+
+    beforeEach(() => {
+      mediaServer.getCollections = jest.fn().mockResolvedValue([]);
+      mediaServer.getLibraries = jest.fn().mockResolvedValue([
+        { id: 'movies', title: 'Movies', type: 'movie' },
+        { id: 'shows', title: 'Shows', type: 'show' },
+      ]);
+    });
+
+    it('returns a match from the requested library without searching others', async () => {
+      mediaServer.getCollections.mockResolvedValue([
+        boxset({ title: 'Shared' }),
+      ]);
+
+      const found = await service.findMediaServerCollection('Shared', 'shows');
+
+      expect(found?.id).toBe('box-1');
+      expect(mediaServer.getCollections).toHaveBeenCalledTimes(1);
+      // useCache=false: this is an existence decision, and a stale miss makes
+      // the caller create a duplicate (#3344).
+      expect(mediaServer.getCollections).toHaveBeenCalledWith('shows', false);
+      expect(mediaServer.getLibraries).not.toHaveBeenCalled();
+    });
+
+    it('ignores smart collections when matching by name', async () => {
+      mediaServer.getCollections.mockResolvedValue([
+        boxset({ title: 'Shared', smart: true }),
+      ]);
+
+      const found = await service.findMediaServerCollection('Shared', 'shows');
+
+      expect(found).toBeUndefined();
+    });
+
+    // Adopting a show collection for a season rule group made every later add
+    // a 400 on Plex, which fixes a collection's media type at creation.
+    it('leaves a same-named collection of another media type alone', async () => {
+      mediaServer.getCollections.mockResolvedValue([
+        boxset({ title: 'Shared', type: 'show' }),
+      ]);
+
+      await expect(
+        service.findMediaServerCollection('Shared', 'shows', false, 'season'),
+      ).resolves.toBeUndefined();
+    });
+
+    it('adopts a same-named collection of the expected media type', async () => {
+      mediaServer.getCollections.mockResolvedValue([
+        boxset({ title: 'Shared', type: 'season' }),
+      ]);
+
+      await expect(
+        service.findMediaServerCollection('Shared', 'shows', false, 'season'),
+      ).resolves.toMatchObject({ id: 'box-1' });
+    });
+
+    // A false miss creates a second collection beside the real one (#3344),
+    // so an unknown type on either side still matches.
+    it('adopts a same-named collection whose media type the server omits', async () => {
+      mediaServer.getCollections.mockResolvedValue([
+        boxset({ title: 'Shared', type: undefined }),
+      ]);
+
+      await expect(
+        service.findMediaServerCollection('Shared', 'shows', false, 'season'),
+      ).resolves.toMatchObject({ id: 'box-1' });
+    });
+
+    it('falls back to other libraries for a cross-library server when opted in', async () => {
+      // The shared boxset is only reported under the movie library (it holds
+      // movies but no shows yet), mirroring the reported Emby/Jellyfin issue.
+      mediaServer.supportsFeature.mockImplementation(
+        (feature) => feature === MediaServerFeature.CROSS_LIBRARY_COLLECTIONS,
+      );
+      mediaServer.getCollections.mockImplementation(
+        async (libraryId: string) =>
+          libraryId === 'movies' ? [boxset({ title: 'Shared' })] : [],
+      );
+
+      const found = await service.findMediaServerCollection(
+        'Shared',
+        'shows',
+        true,
+      );
+
+      expect(found?.id).toBe('box-1');
+      // Own library searched first, then the other one - never re-searching it.
+      expect(mediaServer.getCollections).toHaveBeenCalledWith('shows', false);
+      expect(mediaServer.getCollections).toHaveBeenCalledWith('movies', false);
+      expect(mediaServer.getCollections).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not search other libraries when not opted in', async () => {
+      mediaServer.supportsFeature.mockImplementation(
+        (feature) => feature === MediaServerFeature.CROSS_LIBRARY_COLLECTIONS,
+      );
+      mediaServer.getCollections.mockImplementation(
+        async (libraryId: string) =>
+          libraryId === 'movies' ? [boxset({ title: 'Shared' })] : [],
+      );
+
+      const found = await service.findMediaServerCollection('Shared', 'shows');
+
+      expect(found).toBeUndefined();
+      expect(mediaServer.getLibraries).not.toHaveBeenCalled();
+    });
+
+    it('does not search other libraries when the server lacks cross-library collections (Plex)', async () => {
+      mediaServer.supportsFeature.mockReturnValue(false);
+      mediaServer.getCollections.mockImplementation(
+        async (libraryId: string) =>
+          libraryId === 'movies' ? [boxset({ title: 'Shared' })] : [],
+      );
+
+      const found = await service.findMediaServerCollection(
+        'Shared',
+        'shows',
+        true,
+      );
+
+      expect(found).toBeUndefined();
+      expect(mediaServer.getLibraries).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('removeOldCollectionLogs', () => {
+    it('queries by the collection FK only, never the unloaded ruleGroup relation (#3147)', async () => {
+      // getAllCollections() loads collections without relations, so ruleGroup is
+      // an own `undefined` property under useDefineForClassFields. Passing the
+      // whole entity into a where would serialize that undefined and throw.
+      const collection = createCollection({ id: 42, keepLogsForMonths: 6 });
+      expect('ruleGroup' in collection).toBe(true);
+      collectionLogRepo.find.mockResolvedValue([]);
+
+      await service.removeOldCollectionLogs(collection);
+
+      expect(collectionLogRepo.find).toHaveBeenCalledTimes(1);
+      const where = collectionLogRepo.find.mock.calls[0][0]?.where as Record<
+        string,
+        unknown
+      >;
+      expect(where.collection).toEqual({ id: 42 });
+      expect(where).not.toHaveProperty('ruleGroup');
+      expect(where.timestamp).toBeInstanceOf(FindOperator);
+      // no undefined leaks into the criteria
+      expect(Object.values(where.collection as object)).not.toContain(
+        undefined,
+      );
+    });
+
+    it('keeps logs forever when keepLogsForMonths is 0', async () => {
+      const collection = createCollection({ id: 7, keepLogsForMonths: 0 });
+
+      await service.removeOldCollectionLogs(collection);
+
+      expect(collectionLogRepo.find).not.toHaveBeenCalled();
+      expect(collectionLogRepo.remove).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('removeAllCollectionLogs', () => {
+    it('deletes by the collection FK without loading the entity', async () => {
+      collectionLogRepo.delete.mockResolvedValue({} as any);
+
+      await service.removeAllCollectionLogs(99);
+
+      expect(collectionRepo.findOne).not.toHaveBeenCalled();
+      expect(collectionLogRepo.delete).toHaveBeenCalledWith({
+        collection: { id: 99 },
+      });
+    });
+  });
+
+  describe('updateCollectionTotalSize', () => {
+    beforeEach(() => {
+      (
+        service.updateCollectionTotalSize as jest.MockedFunction<
+          typeof service.updateCollectionTotalSize
+        >
+      ).mockRestore();
+    });
+
+    const sizedItem = (id: string, sizeBytes: number) =>
+      createMediaItem({
+        id,
+        type: 'movie',
+        mediaSources: [{ id: `source-${id}`, duration: 0, sizeBytes }],
+      });
+
+    it('reads every row in one batch instead of a request per item', async () => {
+      const collection = createCollection({ id: 3, type: 'movie' });
+      collectionRepo.findOne.mockResolvedValue(collection);
+      collectionMediaRepo.find.mockResolvedValue([
+        createCollectionMedia(collection, { id: 1, mediaServerId: 'a' }),
+        createCollectionMedia(collection, { id: 2, mediaServerId: 'b' }),
+      ]);
+      mediaServer.getMetadataBatch.mockResolvedValue([
+        sizedItem('a', 100),
+        sizedItem('b', 250),
+      ]);
+
+      await service.updateCollectionTotalSize(3);
+
+      expect(mediaServer.getMetadataBatch).toHaveBeenCalledWith(['a', 'b']);
+      expect(mediaServer.getMetadata).not.toHaveBeenCalled();
+      expect(collectionRepo.update).toHaveBeenCalledWith(3, {
+        totalSizeBytes: 350,
+      });
+    });
+
+    it('keeps the cached size of a row the server did not answer for', async () => {
+      const collection = createCollection({ id: 4, type: 'movie' });
+      collectionRepo.findOne.mockResolvedValue(collection);
+      collectionMediaRepo.find.mockResolvedValue([
+        createCollectionMedia(collection, { id: 1, mediaServerId: 'live' }),
+        createCollectionMedia(collection, {
+          id: 2,
+          mediaServerId: 'gone',
+          sizeBytes: 999,
+        }),
+      ]);
+      mediaServer.getMetadataBatch.mockResolvedValue([sizedItem('live', 100)]);
+
+      await service.updateCollectionTotalSize(4);
+
+      expect(collectionMediaRepo.update).not.toHaveBeenCalledWith(
+        2,
+        expect.anything(),
+      );
+      expect(collectionRepo.update).toHaveBeenCalledWith(4, {
+        totalSizeBytes: 100,
+      });
+    });
+
+    it('keeps the last known total when the read answers for nothing', async () => {
+      // Emby 500s an entire batch over one unparseable id, and the shared
+      // helper answers []. Writing null there would erase a known total.
+      const collection = createCollection({ id: 6, type: 'movie' });
+      collectionRepo.findOne.mockResolvedValue(collection);
+      collectionMediaRepo.find.mockResolvedValue([
+        createCollectionMedia(collection, { id: 1, mediaServerId: 'a' }),
+        createCollectionMedia(collection, { id: 2, mediaServerId: 'bad' }),
+      ]);
+      mediaServer.getMetadataBatch.mockResolvedValue([]);
+
+      await service.updateCollectionTotalSize(6);
+
+      expect(collectionRepo.update).not.toHaveBeenCalled();
+    });
+
+    it('still totals the readable rows when a show cannot be traversed', async () => {
+      const collection = createCollection({ id: 5, type: 'show' });
+      collectionRepo.findOne.mockResolvedValue(collection);
+      collectionMediaRepo.find.mockResolvedValue([
+        createCollectionMedia(collection, { id: 1, mediaServerId: 'show-1' }),
+        createCollectionMedia(collection, { id: 2, mediaServerId: 'movie-1' }),
+      ]);
+      mediaServer.getMetadataBatch.mockResolvedValue([
+        createMediaItem({ id: 'show-1', type: 'show', mediaSources: [] }),
+        sizedItem('movie-1', 400),
+      ]);
+      mediaServer.getChildrenMetadata.mockRejectedValue(
+        new Error('children unavailable'),
+      );
+
+      await service.updateCollectionTotalSize(5);
+
+      expect(collectionRepo.update).toHaveBeenCalledWith(5, {
+        totalSizeBytes: 400,
+      });
+    });
   });
 });

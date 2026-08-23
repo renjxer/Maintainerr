@@ -1,14 +1,16 @@
 // Emby cache and batching tuning. Values mirror Jellyfin defaults until tuned
-// against a live Emby server.
+// against a live Emby server. TTLs are in SECONDS - node-cache takes ttl in
+// seconds, not milliseconds (see api/lib/cache.ts and #3274).
 
 export const EMBY_CACHE_TTL = {
-  WATCH_HISTORY: 300000,
-  USER_DATA: 300000,
-  PLAYED_THRESHOLD: 300000,
-  USERS: 1800000,
-  LIBRARIES: 1800000,
-  STATUS: 60000,
-  COLLECTIONS: 600,
+  WATCH_HISTORY: 300, // 5 min
+  USER_DATA: 300, // 5 min
+  PLAYED_THRESHOLD: 300, // 5 min
+  METADATA: 300, // 5 min
+  USERS: 1800, // 30 min
+  LIBRARIES: 1800, // 30 min
+  STATUS: 60, // 1 min
+  COLLECTIONS: 600, // 10 min
 } as const;
 
 export const EMBY_BATCH_SIZE = {
@@ -19,9 +21,17 @@ export const EMBY_BATCH_SIZE = {
 } as const;
 
 export const EMBY_CACHE_KEYS = {
+  METADATA: 'emby:metadata',
+  // Batched list-route rows carry a stubbed UserData (PlayCount 0, no
+  // LastPlayedDate - verified on 4.9.5, EnableUserData does not help), so
+  // they are cached apart from the full direct-route rows getMetadata serves.
+  METADATA_BATCH: 'emby:metadata-batch',
+  CHILDREN: 'emby:children',
   USERS: 'emby:users',
   LIBRARIES: 'emby:libraries',
   STATUS: 'emby:status',
+  COLLECTIONS: 'emby:collections',
+  RESOLVED_USER_ID: 'emby:resolved-user-id',
 } as const;
 
 // Emby uses the same .NET DateTime tick convention as Jellyfin.
@@ -29,7 +39,7 @@ export const EMBY_CACHE_KEYS = {
 export const EMBY_TICKS_PER_MS = 10000;
 
 // Emby's authorization header requires a pinned client Version string of
-// '1.0.0'. Newer values are rejected by some endpoints. See Jellyseerr
+// '1.0.0'. Newer values are rejected by some endpoints. See Seerr
 // server/api/jellyfin.ts where mediaServerType === 'emby' hardcodes the same.
 export const EMBY_CLIENT_INFO = {
   name: 'Maintainerr',

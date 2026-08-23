@@ -12,6 +12,7 @@ import {
   MediaSource,
   MediaUser,
   WatchRecord,
+  isValidMediaItemType,
 } from '@maintainerr/contracts';
 import { EPlexDataType } from '../../plex-api/enums/plex-data-type-enum';
 import {
@@ -27,6 +28,11 @@ import {
   PlexUserAccount,
 } from '../../plex-api/interfaces/library.interfaces';
 import { Media, PlexMetadata } from '../../plex-api/interfaces/media.interface';
+import { addProviderId, emptyProviderIds } from '../media-provider-ids.utils';
+
+const GUID_SCHEME_SEPARATOR = '://';
+const LEGACY_AGENT_PREFIX = 'com.plexapp.agents.';
+const PLEX_AGENT_GUID_PREFIX = `plex${GUID_SCHEME_SEPARATOR}`;
 
 /**
  * Mapper for converting Plex-specific types to server-agnostic MediaItem types.
@@ -116,43 +122,75 @@ export class PlexMapper {
    * - "tmdb://12345"
    * - "tvdb://12345"
    * - "plex://movie/5d776830880197001ec7f3eb"
+   * - "com.plexapp.agents.thetvdb://73141/1/1?lang=en" (legacy agent)
+   *
+   * @param fallbackGuid - The item's own `guid`. A library still matched by a
+   *   legacy agent carries no `Guid[]`, and keeps the provider id here.
    */
   static extractProviderIds(
     guids: { id: string }[] | undefined,
+    fallbackGuid?: string,
   ): MediaProviderIds {
-    const providerIds: MediaProviderIds = {
-      imdb: [],
-      tmdb: [],
-      tvdb: [],
+    const providerIds = emptyProviderIds();
+
+    const collect = (guid: string | undefined) => {
+      const schemeEnd = guid?.indexOf(GUID_SCHEME_SEPARATOR) ?? -1;
+      if (schemeEnd < 1) return;
+
+      // A legacy agent names the provider in the scheme
+      // (com.plexapp.agents.thetvdb://), and appends the season and episode to
+      // the series id with a language on the end: 73141/1/1?lang=en.
+      const scheme = guid.slice(0, schemeEnd).toLowerCase();
+      const id = guid
+        .slice(schemeEnd + GUID_SCHEME_SEPARATOR.length)
+        .split('/', 1)[0]
+        .split('?', 1)[0];
+
+      addProviderId(
+        providerIds,
+        scheme.startsWith(LEGACY_AGENT_PREFIX)
+          ? scheme.slice(LEGACY_AGENT_PREFIX.length)
+          : scheme,
+        id,
+      );
     };
 
-    if (!guids || !Array.isArray(guids)) {
-      return providerIds;
+    for (const guid of Array.isArray(guids) ? guids : []) {
+      collect(guid?.id);
+    }
+    collect(fallbackGuid);
+
+    return providerIds;
+  }
+
+  /**
+   * The id Plex's own agent gives an item, from a `plex://<type>/<uuid>` guid.
+   *
+   * Undefined for anything else - a legacy-agent, unmatched or personal-media
+   * guid carries no such id. plex.tv keys watchlist entries on it, so an item
+   * without one can never appear on a watchlist.
+   */
+  static extractPlexAgentId(guid?: string): string | undefined {
+    if (!guid?.startsWith(PLEX_AGENT_GUID_PREFIX)) {
+      return undefined;
     }
 
-    for (const guid of guids) {
-      if (!guid.id) continue;
+    const typeEnd = guid.indexOf('/', PLEX_AGENT_GUID_PREFIX.length);
+    if (typeEnd <= PLEX_AGENT_GUID_PREFIX.length) {
+      return undefined;
+    }
 
-      const match = guid.id.match(/^(\w+):\/\/(.+)$/);
-      if (!match) continue;
+    const id = guid.slice(typeEnd + 1);
+    for (const character of id) {
+      const isDigit = character >= '0' && character <= '9';
+      const isLowercaseLetter = character >= 'a' && character <= 'z';
 
-      const [, provider, id] = match;
-
-      switch (provider.toLowerCase()) {
-        case 'imdb':
-          providerIds.imdb.push(id);
-          break;
-        case 'tmdb':
-          providerIds.tmdb.push(id);
-          break;
-        case 'tvdb':
-          providerIds.tvdb.push(id);
-          break;
-        // Ignore plex:// and other unknown providers
+      if (!isDigit && !isLowercaseLetter) {
+        return undefined;
       }
     }
 
-    return providerIds;
+    return id || undefined;
   }
 
   /**
@@ -165,14 +203,14 @@ export class PlexMapper {
       grandparentId: plex.grandparentRatingKey,
       title: plex.title,
       parentTitle: plex.parentTitle,
-      grandparentTitle: undefined, // Not available on PlexLibraryItem
+      grandparentTitle: plex.grandparentTitle,
       guid: plex.guid,
       parentGuid: plex.parentGuid,
       grandparentGuid: plex.grandparentGuid,
       type: PlexMapper.toMediaItemType(plex.type),
       addedAt: new Date(plex.addedAt * 1000),
       updatedAt: plex.updatedAt ? new Date(plex.updatedAt * 1000) : undefined,
-      providerIds: PlexMapper.extractProviderIds(plex.Guid),
+      providerIds: PlexMapper.extractProviderIds(plex.Guid, plex.guid),
       mediaSources: PlexMapper.toMediaSources(plex.Media),
       library: {
         id: plex.librarySectionID?.toString(),
@@ -194,6 +232,7 @@ export class PlexMapper {
       userRating: plex.userRating,
       genres: PlexMapper.toMediaGenres(plex.Genre),
       actors: PlexMapper.toMediaActors(plex.Role),
+      studios: PlexMapper.toMediaStudios(plex.studio),
       childCount: plex.leafCount,
       watchedChildCount: plex.viewedLeafCount,
       index: plex.index,
@@ -221,16 +260,18 @@ export class PlexMapper {
       type: PlexMapper.toMediaItemType(plex.type),
       addedAt: new Date(plex.addedAt * 1000),
       updatedAt: plex.updatedAt ? new Date(plex.updatedAt * 1000) : undefined,
-      providerIds: PlexMapper.extractProviderIds(plex.Guid),
+      providerIds: PlexMapper.extractProviderIds(plex.Guid, plex.guid),
       mediaSources: PlexMapper.toMediaSources(plex.Media || plex.media),
       library: {
-        id: '', // Not available on PlexMetadata
-        title: '',
+        id: plex.librarySectionID?.toString() ?? '',
+        title: plex.librarySectionTitle ?? '',
       },
       summary: plex.summary,
-      viewCount: undefined,
+      viewCount: plex.viewCount,
       skipCount: undefined,
-      lastViewedAt: undefined,
+      lastViewedAt: plex.lastViewedAt
+        ? new Date(plex.lastViewedAt * 1000)
+        : undefined,
       year: plex.year,
       durationMs: plex.media?.[0]?.duration,
       originallyAvailableAt: plex.originallyAvailableAt
@@ -241,6 +282,7 @@ export class PlexMapper {
       userRating: plex.userRating,
       genres: PlexMapper.toMediaGenres(plex.Genre),
       actors: PlexMapper.toMediaActors(plex.Role),
+      studios: PlexMapper.toMediaStudios(plex.studio),
       childCount: plex.leafCount,
       watchedChildCount: plex.viewedLeafCount,
       index: plex.index,
@@ -300,6 +342,10 @@ export class PlexMapper {
       addedAt: plex.addedAt ? new Date(plex.addedAt * 1000) : undefined,
       updatedAt: plex.updatedAt ? new Date(plex.updatedAt * 1000) : undefined,
       smart: plex.smart,
+      // Deliberately not toMediaItemType: that defaults to 'movie', which would
+      // turn an unrecognised subtype into a confident wrong answer, and callers
+      // read undefined as "unknown" rather than as a mismatch.
+      type: isValidMediaItemType(plex.subtype) ? plex.subtype : undefined,
       libraryId: undefined, // Not available on PlexCollection directly
     };
   }
@@ -379,6 +425,16 @@ export class PlexMapper {
       role: a.role,
       thumb: a.thumb,
     }));
+  }
+
+  /**
+   * Plex sends one studio as a string where Jellyfin and Emby send a list.
+   * Undefined rather than empty, so the sort still reads it as unknown.
+   */
+  private static toMediaStudios(
+    studio: string | undefined,
+  ): string[] | undefined {
+    return studio?.trim() ? [studio] : undefined;
   }
 
   private static toMediaRatings(plex: PlexLibraryItem): MediaRating[] {

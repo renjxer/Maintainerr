@@ -16,8 +16,12 @@ import { format as dateFnsFormat, type Locale } from 'date-fns';
 import * as dateFnsLocales from 'date-fns/locale';
 import * as fs from 'fs';
 import * as path from 'path';
-import sharp from 'sharp';
 import { dataDir as configDataDir } from '../../app/config/dataDir';
+import {
+  isSharpAvailable,
+  sharp,
+  SHARP_UNAVAILABLE_MESSAGE,
+} from '../../utils/sharp';
 import { MaintainerrLogger } from '../logging/logs.service';
 
 export interface TemplateRenderContext {
@@ -101,7 +105,8 @@ export class OverlayRenderService {
         this.registeredFonts.set(fontPath, family);
         return family;
       } catch (err) {
-        this.logger.warn(`Failed to register font at ${resolvedPath}`);
+        const msg = (err && (err as Error).message) || String(err);
+        this.logger.warn(`Failed to register font at ${resolvedPath}: ${msg}`);
         this.logger.debug(err);
       }
     } else {
@@ -174,6 +179,46 @@ export class OverlayRenderService {
       default:
         return 0;
     }
+  }
+
+  private computeRotationOffset(
+    width: number,
+    height: number,
+    rotation: number,
+  ): { left: number; top: number } {
+    if (!rotation) {
+      return { left: 0, top: 0 };
+    }
+
+    const angle = ((rotation % 360) + 360) % 360;
+    const radians = (angle * Math.PI) / 180;
+    const cx = width / 2;
+    const cy = height / 2;
+
+    const rotatePoint = (x: number, y: number) => {
+      const dx = x - cx;
+      const dy = y - cy;
+      return {
+        x: dx * Math.cos(radians) - dy * Math.sin(radians) + cx,
+        y: dx * Math.sin(radians) + dy * Math.cos(radians) + cy,
+      };
+    };
+
+    const points = [
+      rotatePoint(0, 0),
+      rotatePoint(width, 0),
+      rotatePoint(0, height),
+      rotatePoint(width, height),
+    ];
+
+    const minX = Math.min(...points.map((p) => p.x));
+    const minY = Math.min(...points.map((p) => p.y));
+    const topLeft = points[0];
+
+    return {
+      left: Math.round(minX - topLeft.x),
+      top: Math.round(minY - topLeft.y),
+    };
   }
 
   // ── Frame drawing ───────────────────────────────────────────────────────
@@ -289,6 +334,9 @@ export class OverlayRenderService {
     posterBuffer: Buffer,
     opts: OverlayRenderOptions,
   ): Promise<OverlayResult> {
+    if (!isSharpAvailable) {
+      throw new Error(SHARP_UNAVAILABLE_MESSAGE);
+    }
     const meta = await sharp(posterBuffer).metadata();
     const imgW = meta.width!;
     const imgH = meta.height!;
@@ -467,16 +515,21 @@ export class OverlayRenderService {
     canvasHeight: number,
     context: TemplateRenderContext,
   ): Promise<OverlayResult> {
+    if (!isSharpAvailable) {
+      throw new Error(SHARP_UNAVAILABLE_MESSAGE);
+    }
     const meta = await sharp(posterBuffer).metadata();
     const imgW = meta.width!;
     const imgH = meta.height!;
 
-    // Scale factor: template canvas → actual poster dimensions.
-    // Style values (fontSize, padding, radii, strokeWidth) all scale by
-    // `scaleX` so text and shape styling stay proportional with each other;
-    // canvas and poster share the same aspect ratio in practice.
-    const scaleX = imgW / canvasWidth;
-    const scaleY = imgH / canvasHeight;
+    // Map the template canvas onto the largest centered canvas-aspect
+    // region of the artwork instead of stretching it over the full image.
+    // Media-server clients cover-crop artwork to the canvas shape when
+    // rendering cards, so anything drawn outside that region is invisible
+    // (#3533: 4:3 or 21:9 episode stills on a 16:9 titlecard canvas).
+    const uniformScale = Math.min(imgW / canvasWidth, imgH / canvasHeight);
+    const offsetX = Math.round((imgW - canvasWidth * uniformScale) / 2);
+    const offsetY = Math.round((imgH - canvasHeight * uniformScale) / 2);
 
     // Sort elements by layerOrder, then render bottom-up
     const sorted = [...elements]
@@ -486,22 +539,28 @@ export class OverlayRenderService {
     const layers: Array<{ input: Buffer; left: number; top: number }> = [];
 
     for (const el of sorted) {
-      const sx = Math.round(el.x * scaleX);
-      const sy = Math.round(el.y * scaleY);
-      const sw = Math.max(1, Math.round(el.width * scaleX));
-      const sh = Math.max(1, Math.round(el.height * scaleY));
+      const sx = offsetX + Math.round(el.x * uniformScale);
+      const sy = offsetY + Math.round(el.y * uniformScale);
+      const sw = Math.max(1, Math.round(el.width * uniformScale));
+      const sh = Math.max(1, Math.round(el.height * uniformScale));
 
       let layerBuf: Buffer | null = null;
 
       switch (el.type) {
         case 'text':
-          layerBuf = this.renderTextElement(el, sw, sh, scaleX);
+          layerBuf = this.renderTextElement(el, sw, sh, uniformScale);
           break;
         case 'variable':
-          layerBuf = this.renderVariableElement(el, sw, sh, scaleX, context);
+          layerBuf = this.renderVariableElement(
+            el,
+            sw,
+            sh,
+            uniformScale,
+            context,
+          );
           break;
         case 'shape':
-          layerBuf = this.renderShapeElement(el, sw, sh, scaleX);
+          layerBuf = this.renderShapeElement(el, sw, sh, uniformScale);
           break;
         case 'image':
           layerBuf = await this.renderImageElement(el, sw, sh);
@@ -510,10 +569,12 @@ export class OverlayRenderService {
 
       if (layerBuf) {
         // Apply rotation if needed
+        let rotateOffset = { left: 0, top: 0 };
         if (el.rotation && el.rotation !== 0) {
           layerBuf = await sharp(layerBuf)
             .rotate(el.rotation, { background: { r: 0, g: 0, b: 0, alpha: 0 } })
             .toBuffer();
+          rotateOffset = this.computeRotationOffset(sw, sh, el.rotation);
         }
 
         // Apply element-level opacity
@@ -521,13 +582,13 @@ export class OverlayRenderService {
           layerBuf = await this.applyOpacity(layerBuf, el.opacity);
         }
 
-        // Clamp layer to poster bounds – sharp.composite() throws
+        // Clamp layer to poster bounds - sharp.composite() throws
         // when a composite layer extends beyond the base image.
         const layerMeta = await sharp(layerBuf).metadata();
         let lw = layerMeta.width ?? sw;
         let lh = layerMeta.height ?? sh;
-        let lx = sx;
-        let ly = sy;
+        let lx = sx + rotateOffset.left;
+        let ly = sy + rotateOffset.top;
 
         // Handle negative offsets by extracting the visible sub-region
         let extractLeft = 0;

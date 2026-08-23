@@ -1,3 +1,4 @@
+import { Trans, useLingui } from '@lingui/react/macro'
 import {
   ClipboardListIcon,
   DocumentAddIcon,
@@ -13,10 +14,11 @@ import {
   useState,
 } from 'react'
 import { arrayMove, List } from 'react-movable'
+import { useRuleUsernames } from '../../../../api/rules'
 import AddButton from '../../../Common/AddButton'
 import Alert from '../../../Common/Alert'
 import SectionHeading from '../../../Common/SectionHeading'
-import RuleInput from './RuleInput'
+import RuleInput, { RULE_USERNAMES_DATALIST_ID } from './RuleInput'
 
 export interface IRule {
   operator: string | null
@@ -25,6 +27,7 @@ export interface IRule {
   section?: number
   customVal?: { ruleTypeId: number; value: string | number }
   arrDiskPath?: string
+  username?: string
   action: number
 }
 
@@ -41,6 +44,7 @@ interface iRuleCreator {
   onCancel: () => void
   radarrSettingsId?: number | null
   sonarrSettingsId?: number | null
+  sportarrSettingsId?: number | null
 }
 
 type RuleSlot = { uid: string; rule: IRule | null }
@@ -95,10 +99,13 @@ const flattenSections = (sections: SectionSlot[]): IRule[] => {
 }
 
 const RuleCreator = (props: iRuleCreator) => {
+  const { t } = useLingui()
   const [sections, setSections] = useState<SectionSlot[]>(() =>
     buildInitialSections(props.editData),
   )
   const didMountRef = useRef(false)
+  // Reads the cache only: a rule card that needs users is what fetches them.
+  const { data: ruleUsernames = [] } = useRuleUsernames({ enabled: false })
 
   const emitUpdate = useEffectEvent(() => {
     props.onUpdate(flattenSections(sections))
@@ -112,7 +119,7 @@ const RuleCreator = (props: iRuleCreator) => {
     emitUpdate()
   }, [sections])
 
-  const handleCommit = (uid: string) => (_id: number, rule: IRule) => {
+  const handleCommit = (uid: string) => (rule: IRule) => {
     setSections((prev) => {
       let changed = false
       const next = prev.map((section) => ({
@@ -213,6 +220,11 @@ const RuleCreator = (props: iRuleCreator) => {
 
   return (
     <div className="text-zinc-100">
+      <datalist id={RULE_USERNAMES_DATALIST_ID}>
+        {ruleUsernames.map((username) => (
+          <option key={username} value={username} />
+        ))}
+      </datalist>
       <List
         lockVertically
         values={sections}
@@ -226,7 +238,7 @@ const RuleCreator = (props: iRuleCreator) => {
         )}
         renderItem={({ value: section, props: itemProps, index }) => {
           const sectionNumber = (index ?? 0) + 1
-          const { key: _itemKey, style: itemStyle, ...itemRest } = itemProps
+          const { key: itemKey, style: itemStyle, ...itemRest } = itemProps
           return (
             <div
               key={section.uid}
@@ -240,13 +252,13 @@ const RuleCreator = (props: iRuleCreator) => {
                     data-movable-handle
                     tabIndex={-1}
                     className="mr-2 flex h-10 w-10 cursor-grab items-center justify-center rounded-sm text-zinc-400 hover:bg-zinc-600 hover:text-zinc-100 active:cursor-grabbing md:h-6 md:w-6"
-                    title="Drag to reorder section"
-                    aria-label={`Drag handle for section ${sectionNumber}`}
+                    title={t`Drag to reorder section`}
+                    aria-label={t`Drag handle for section ${{ sectionNumber }}`}
                   >
                     <MenuIcon className="h-4 w-4" />
                   </button>
                   <div className="flex-1">
-                    <SectionHeading id={sectionNumber} name="Section" />
+                    <SectionHeading label={t`Section #${{ sectionNumber }}`} />
                   </div>
                 </div>
 
@@ -272,7 +284,7 @@ const RuleCreator = (props: iRuleCreator) => {
                     const tagId = (ruleIndex ?? 0) + 1
                     const absoluteId = ++absoluteCounter
                     const {
-                      key: _ruleKey,
+                      key: ruleKey,
                       style: ruleStyle,
                       onKeyDown: ruleOnKeyDown,
                       ...ruleRest
@@ -290,8 +302,8 @@ const RuleCreator = (props: iRuleCreator) => {
                             data-movable-handle
                             tabIndex={-1}
                             className="mt-3 mr-2 flex h-10 w-10 shrink-0 cursor-grab items-center justify-center rounded-sm text-zinc-400 hover:bg-zinc-700 hover:text-zinc-100 active:cursor-grabbing md:mt-5 md:h-6 md:w-6"
-                            title="Drag to reorder rule"
-                            aria-label={`Drag handle for rule ${tagId} in section ${sectionNumber}`}
+                            title={t`Drag to reorder rule`}
+                            aria-label={t`Drag handle for rule ${{ tagId }} in section ${{ sectionNumber }}`}
                           >
                             <MenuIcon className="h-4 w-4" />
                           </button>
@@ -307,6 +319,7 @@ const RuleCreator = (props: iRuleCreator) => {
                               dataType={props.dataType}
                               radarrSettingsId={props.radarrSettingsId}
                               sonarrSettingsId={props.sonarrSettingsId}
+                              sportarrSettingsId={props.sportarrSettingsId}
                               onCommit={handleCommit(slot.uid)}
                               onIncomplete={handleIncomplete(slot.uid)}
                               onDelete={handleDelete(section.uid, slot.uid)}
@@ -324,8 +337,8 @@ const RuleCreator = (props: iRuleCreator) => {
                     <AddButton
                       className="mx-0"
                       onClick={() => addRule(section.uid)}
-                      title={`Add a new rule to Section ${sectionNumber}`}
-                      text="Add Rule"
+                      title={t`Add a new rule to Section ${{ sectionNumber }}`}
+                      text={t`Add Rule`}
                       icon={<DocumentAddIcon className="h-5 w-5" />}
                       buttonSize="sm"
                     />
@@ -343,8 +356,8 @@ const RuleCreator = (props: iRuleCreator) => {
             <AddButton
               className="mx-0"
               onClick={addSection}
-              title="Add a new section"
-              text="New Section"
+              title={t`Add a new section`}
+              text={t`New Section`}
               icon={<ClipboardListIcon className="h-5 w-5" />}
               buttonSize="sm"
             />
@@ -354,7 +367,9 @@ const RuleCreator = (props: iRuleCreator) => {
 
       {completed !== totalRules ? (
         <div className="mt-5">
-          <Alert type="error">{`Some incomplete rules won't be saved`} </Alert>
+          <Alert type="error">
+            <Trans>Some incomplete rules won&apos;t be saved</Trans>{' '}
+          </Alert>
         </div>
       ) : null}
     </div>

@@ -4,11 +4,13 @@ import {
   RequestMediaStatus,
 } from '@maintainerr/contracts';
 import { Injectable } from '@nestjs/common';
-import _ from 'lodash';
+import { cloneDeep } from 'lodash';
 import { MediaServerFactory } from '../../api/media-server/media-server.factory';
 import {
+  resolveRequestUsername,
   SeerrApiService,
   SeerrMovieResponse,
+  SeerrRequest,
   SeerrSeasonRequest,
   SeerrSeasonResponse,
   SeerrTVRequest,
@@ -21,6 +23,7 @@ import {
   Property,
   RuleConstants,
 } from '../constants/rules.constants';
+import { ArrLookupCache } from '../helpers/arr-lookup-cache';
 
 @Injectable()
 export class SeerrGetterService {
@@ -39,16 +42,18 @@ export class SeerrGetterService {
     ).props;
   }
 
-  async get(id: number, libItem: MediaItem, dataType?: MediaItemType) {
+  async get(
+    id: number,
+    libItem: MediaItem,
+    dataType?: MediaItemType,
+    arrLookupCache?: ArrLookupCache,
+  ) {
     try {
       let origLibItem: MediaItem = undefined;
-      let seasonMediaResponse: SeerrSeasonResponse = undefined;
-      let tvMediaResponse: SeerrTVResponse = undefined;
-      let movieMediaResponse: SeerrMovieResponse = undefined;
 
       // get original show in case of season / episode
       if (dataType === 'season' || dataType === 'episode') {
-        origLibItem = _.cloneDeep(libItem);
+        origLibItem = cloneDeep(libItem);
         const mediaServer = await this.mediaServerFactory.getService();
         libItem = await mediaServer.getMetadata(
           dataType === 'season' ? libItem.parentId : libItem.grandparentId,
@@ -56,46 +61,78 @@ export class SeerrGetterService {
       }
 
       const prop = this.appProperties.find((el) => el.id === id);
-      const resolvedIds =
-        await this.metadataService.resolveIdsFromMediaItemForService(
+      // The id-resolution (media item -> tmdb) is identical for an item across
+      // every Seerr condition in a run, yet ran once per condition - redundant
+      // CPU, response cloning and duplicate logs (#3285, the same redundancy the
+      // Radarr/Sonarr candidate memo already dedupes). Route it through the same
+      // run-scoped memo. libItem is already lifted to the parent show for
+      // season/episode above, so the key collapses them onto one entry. Evict a
+      // result with no tmdb so a transient metadata-provider failure retries next
+      // condition instead of sticking for the run.
+      const resolveIds = () =>
+        this.metadataService.resolveIdsFromMediaItemForService(
           libItem,
           'seerr',
         );
+      const resolvedIds = await (arrLookupCache
+        ? arrLookupCache.memoize(
+            `metadata:seerr:${libItem.id}`,
+            resolveIds,
+            (ids) => !ids?.tmdb,
+          )
+        : resolveIds());
       const tmdbId = resolvedIds?.tmdb as number | undefined;
 
-      if (tmdbId) {
-        if (libItem.type === 'movie') {
-          movieMediaResponse = await this.seerrApi.getMovie(tmdbId.toString());
-        } else {
-          tvMediaResponse = await this.seerrApi.getShow(tmdbId.toString());
-          if (dataType === 'season' || dataType === 'episode') {
-            const seasonNumber =
-              dataType === 'season'
-                ? origLibItem.index
-                : origLibItem.parentIndex;
-            seasonMediaResponse = await this.seerrApi.getSeason(
-              tmdbId.toString(),
-              seasonNumber?.toString(),
-            );
-            if (!seasonMediaResponse) {
-              this.logger.debug(
-                `Couldn't fetch season data for '${libItem.title}' season ${seasonNumber} from Seerr. As a result, unreliable results are expected.`,
-              );
-            }
-          }
-        }
-      } else {
+      if (!tmdbId) {
         this.logger.debug(
           `Couldn't find tmdb id for media '${libItem.title}' with id '${libItem.id}'. As a result, no Seerr query could be made.`,
         );
+        // Transient either way: "we could not look it up" is not the same claim
+        // as "it is not requested", and a definitive answer would let unmatched
+        // and personal media match NOT_EXISTS rules.
+        return undefined;
       }
 
-      const mediaResponse: SeerrTVResponse | SeerrMovieResponse =
-        tvMediaResponse ?? movieMediaResponse;
+      // releaseDate (movie releaseDate / tv firstAirDate / season|episode
+      // airDate) is not carried by the /request list endpoint, so it keeps the
+      // per-item getMovie/getShow/getSeason fallback. Accepted limitation -
+      // releaseDate rules were not part of #3152.
+      if (prop?.name === 'releaseDate') {
+        return await this.getReleaseDate(
+          libItem,
+          origLibItem,
+          dataType,
+          tmdbId,
+        );
+      }
+
+      // Every other Seerr property derives from the request set. Read the
+      // run-scoped request index (one bulk /request sweep, deduped + cached)
+      // instead of a per-item getMovie/getShow - the per-item path rate-limited
+      // under whole-library runs and silently degraded matches to near-zero
+      // (#3152).
+      const requestsForMedia = await this.seerrApi.getRequestsForMedia(tmdbId);
+      // undefined => the bulk sweep failed (Seerr unreachable). Transient: skip
+      // so the comparator protects the item rather than treating it as "not
+      // requested" (mirrors #3125).
+      if (requestsForMedia === undefined) {
+        return undefined;
+      }
+
+      // Reconstruct the per-title view the property logic expects. When the
+      // title has no request the synthetic mediaInfo carries an empty request
+      // list, so the switch yields the definitive "not requested" values
+      // (0 / [] / null) - the core #3152 fix (these items previously
+      // rate-limited to null and were skipped).
+      const mediaResponse = this.toMediaResponse(requestsForMedia);
+      const tvMediaResponse =
+        libItem.type === 'movie'
+          ? undefined
+          : (mediaResponse as SeerrTVResponse);
       const requests = mediaResponse?.mediaInfo?.requests ?? [];
 
       if (mediaResponse?.mediaInfo) {
-        switch (prop.name) {
+        switch (prop?.name) {
           case 'addUser': {
             try {
               const userNames: string[] = [];
@@ -118,7 +155,7 @@ export class SeerrGetterService {
                     continue;
                   }
 
-                  const username = this.resolveRequestUsername(request);
+                  const username = resolveRequestUsername(request);
                   if (username) {
                     userNames.push(username);
                   }
@@ -129,7 +166,9 @@ export class SeerrGetterService {
             } catch (error) {
               this.logger.warn("Couldn't get addUser from Seerr");
               this.logger.debug(error);
-              return null;
+              // undefined (transient) per the getter contract - null reads as
+              // a confirmed answer and lifts the removal guard.
+              return undefined;
             }
           }
           case 'amountRequested': {
@@ -149,28 +188,6 @@ export class SeerrGetterService {
             return mediaResponse?.mediaInfo?.requests[0]?.createdAt
               ? new Date(mediaResponse?.mediaInfo?.requests[0]?.createdAt)
               : null;
-          }
-          case 'releaseDate': {
-            if (libItem.type === 'movie') {
-              return movieMediaResponse?.releaseDate
-                ? new Date(movieMediaResponse?.releaseDate)
-                : null;
-            } else {
-              if (dataType === 'episode') {
-                const ep = seasonMediaResponse?.episodes?.find(
-                  (el) => el.episodeNumber === origLibItem.index,
-                );
-                return ep?.airDate ? new Date(ep.airDate) : null;
-              } else if (dataType === 'season') {
-                return seasonMediaResponse?.airDate
-                  ? new Date(seasonMediaResponse.airDate)
-                  : null;
-              } else {
-                return tvMediaResponse?.firstAirDate
-                  ? new Date(tvMediaResponse.firstAirDate)
-                  : null;
-              }
-            }
           }
           case 'approvalDate': {
             if (dataType === 'season' || dataType === 'episode') {
@@ -228,9 +245,9 @@ export class SeerrGetterService {
           }
         }
       } else {
-        this.logger.debug(
-          `Couldn't fetch Seerr metadata for media '${libItem.title}' with id '${libItem.id}'. As a result, no Seerr query could be made.`,
-        );
+        // Defensive only: toMediaResponse always yields a mediaInfo (empty
+        // request list when the title has none), so this branch is unreachable
+        // for the index path.
         return null;
       }
     } catch (error) {
@@ -243,6 +260,98 @@ export class SeerrGetterService {
       );
       return undefined;
     }
+  }
+
+  /**
+   * Resolves the Seerr release/air date via the per-item getMovie/getShow/
+   * getSeason endpoints. The bulk /request index carries request data, not the
+   * TMDB release/air dates, so this property keeps the per-item fallback -
+   * releaseDate-seeded rules were not part of #3152. A communication failure
+   * returns `undefined` (transient skip, mirrors #3125); an untracked title
+   * (no mediaInfo) returns `null`, preserving the prior behavior.
+   */
+  private async getReleaseDate(
+    libItem: MediaItem,
+    origLibItem: MediaItem | undefined,
+    dataType: MediaItemType | undefined,
+    tmdbId: number,
+  ): Promise<Date | null | undefined> {
+    let movieMediaResponse: SeerrMovieResponse = undefined;
+    let tvMediaResponse: SeerrTVResponse = undefined;
+    let seasonMediaResponse: SeerrSeasonResponse = undefined;
+
+    if (libItem.type === 'movie') {
+      movieMediaResponse = await this.seerrApi.getMovie(tmdbId.toString());
+      if (movieMediaResponse === undefined) {
+        return undefined;
+      }
+    } else {
+      tvMediaResponse = await this.seerrApi.getShow(tmdbId.toString());
+      if (tvMediaResponse === undefined) {
+        return undefined;
+      }
+      if (dataType === 'season' || dataType === 'episode') {
+        const seasonNumber =
+          dataType === 'season' ? origLibItem.index : origLibItem.parentIndex;
+        seasonMediaResponse = await this.seerrApi.getSeason(
+          tmdbId.toString(),
+          seasonNumber?.toString(),
+        );
+        if (!seasonMediaResponse) {
+          this.logger.debug(
+            `Couldn't fetch season data for '${libItem.title}' season ${seasonNumber} from Seerr. As a result, unreliable results are expected.`,
+          );
+        }
+      }
+    }
+
+    const mediaResponse: SeerrTVResponse | SeerrMovieResponse =
+      tvMediaResponse ?? movieMediaResponse;
+    if (!mediaResponse?.mediaInfo) {
+      return null;
+    }
+
+    if (libItem.type === 'movie') {
+      return movieMediaResponse?.releaseDate
+        ? new Date(movieMediaResponse.releaseDate)
+        : null;
+    }
+    if (dataType === 'episode') {
+      const ep = seasonMediaResponse?.episodes?.find(
+        (el) => el.episodeNumber === origLibItem.index,
+      );
+      return ep?.airDate ? new Date(ep.airDate) : null;
+    }
+    if (dataType === 'season') {
+      return seasonMediaResponse?.airDate
+        ? new Date(seasonMediaResponse.airDate)
+        : null;
+    }
+    return tvMediaResponse?.firstAirDate
+      ? new Date(tvMediaResponse.firstAirDate)
+      : null;
+  }
+
+  /**
+   * Rebuilds the per-title response shape the property switch expects from the
+   * flat request list returned by the run-scoped index. All requests for one
+   * tmdbId share the same media (the /request list endpoint populates
+   * request.media but not media.requests), so any request's media seeds the
+   * synthetic mediaInfo and the grouped list is attached as its requests. An
+   * empty list yields a mediaInfo with no requests, so the switch derives the
+   * definitive "not requested" values.
+   */
+  private toMediaResponse(
+    requests: SeerrRequest[],
+  ): SeerrTVResponse | SeerrMovieResponse {
+    const media = requests[0]?.media;
+    return {
+      id: media?.id,
+      mediaInfo: {
+        ...(media ?? {}),
+        requests,
+      },
+    } as SeerrTVResponse | SeerrMovieResponse;
   }
 
   private getSeasonRequests(
@@ -268,32 +377,5 @@ export class SeerrGetterService {
       (season) => season.seasonNumber === seasonNumber,
     );
     return season !== undefined;
-  }
-
-  /**
-   * Resolves the username from a Seerr request.
-   *
-   * Uses the username fields directly from the Seerr API response
-   * rather than looking up users by ID on the media server, because
-   * media server user IDs don't match Seerr's plexId (Plex.tv ID).
-   *
-   * Seerr user types store their name in different fields:
-   * - Plex (1): plexUsername
-   * - Local (2): username
-   * - Jellyfin (3) / Emby (4): jellyfinUsername
-   */
-  private resolveRequestUsername(request: {
-    requestedBy?: {
-      plexUsername?: string;
-      jellyfinUsername?: string;
-      username?: string;
-    };
-  }): string | undefined {
-    const user = request.requestedBy;
-    if (!user) return undefined;
-
-    return (
-      user.plexUsername || user.jellyfinUsername || user.username || undefined
-    );
   }
 }

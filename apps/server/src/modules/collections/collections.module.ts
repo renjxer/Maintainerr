@@ -1,4 +1,4 @@
-import { Module, forwardRef } from '@nestjs/common';
+import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { ActionsModule } from '../actions/actions.module';
 import { MediaServerModule } from '../api/media-server/media-server.module';
@@ -9,9 +9,9 @@ import { TautulliApiModule } from '../api/tautulli-api/tautulli-api.module';
 import { CollectionLog } from '../collections/entities/collection_log.entities';
 import { CollectionLogCleanerService } from '../collections/tasks/collection-log-cleaner.service';
 import { MetadataModule } from '../metadata/metadata.module';
+import { OverlaysModule } from '../overlays/overlays.module';
 import { Exclusion } from '../rules/entities/exclusion.entities';
 import { RuleGroup } from '../rules/entities/rule-group.entities';
-import { RulesModule } from '../rules/rules.module';
 import { SettingsModule } from '../settings/settings.module';
 import { TasksModule } from '../tasks/tasks.module';
 import { CollectionHandler } from './collection-handler';
@@ -21,6 +21,7 @@ import { CollectionsController } from './collections.controller';
 import { CollectionsService } from './collections.service';
 import { Collection } from './entities/collection.entities';
 import { CollectionMedia } from './entities/collection_media.entities';
+import { CollectionMediaRuleRemoval } from './entities/collection_media_rule_removal.entities';
 import { RecentlyHandledMediaService } from './recently-handled-media.service';
 
 @Module({
@@ -31,6 +32,7 @@ import { RecentlyHandledMediaService } from './recently-handled-media.service';
     TypeOrmModule.forFeature([
       Collection,
       CollectionMedia,
+      CollectionMediaRuleRemoval,
       CollectionLog,
       RuleGroup,
       Exclusion,
@@ -41,7 +43,7 @@ import { RecentlyHandledMediaService } from './recently-handled-media.service';
     ServarrApiModule,
     TasksModule,
     ActionsModule,
-    forwardRef(() => RulesModule),
+    OverlaysModule,
   ],
   providers: [
     CollectionsService,

@@ -1,10 +1,20 @@
 import { Transition } from '@headlessui/react'
+import { XIcon } from '@heroicons/react/solid'
+import { Trans, useLingui } from '@lingui/react/macro'
 import React, { MouseEvent, ReactNode, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import useClickOutside from '../../../hooks/useClickOutside'
 import { useLockBodyScroll } from '../../../hooks/useLockBodyScroll'
 import Button, { ButtonType } from '../Button'
 import LoadingSpinner from '../LoadingSpinner'
+
+/**
+ * Shared with the media backdrop modal, which builds its own overlay, so both
+ * look and sit the same. Add `sm:hidden` where a footer Cancel already covers
+ * the wider screens.
+ */
+export const modalCloseButtonClassName =
+  'absolute top-3 right-3 z-20 cursor-pointer rounded-full border border-zinc-600 bg-zinc-800/90 p-2 text-zinc-300 shadow-md transition hover:text-white focus:text-white focus:outline-hidden'
 
 interface ModalProps {
   title?: string
@@ -48,6 +58,7 @@ const Modal: React.FC<ModalProps> = ({
   footerActions,
   size = '3xl',
 }) => {
+  const { t } = useLingui()
   const modalRef = useRef<HTMLDivElement>(null)
   useClickOutside(modalRef, () => {
     if (typeof onCancel === 'function' && backgroundClickable) {
@@ -97,7 +108,19 @@ const Modal: React.FC<ModalProps> = ({
         }}
         ref={modalRef}
       >
-        <div className="relative overflow-x-hidden sm:flex sm:items-center">
+        {typeof onCancel === 'function' && (
+          <button
+            type="button"
+            onClick={onCancel}
+            aria-label={t`Close`}
+            className={`${modalCloseButtonClassName} sm:hidden`}
+          >
+            <XIcon className="h-5 w-5" />
+          </button>
+        )}
+        {/* Padded both sides below `sm`, so the close button takes its room
+            without pushing the centred title off centre. */}
+        <div className="relative overflow-x-hidden px-8 sm:flex sm:items-center sm:px-0">
           {iconSvg && <div className="modal-icon">{iconSvg}</div>}
           <div
             className={`mt-3 truncate text-center text-white sm:mt-0 sm:text-left ${
@@ -129,7 +152,7 @@ const Modal: React.FC<ModalProps> = ({
                 className="ml-3"
                 type="button"
               >
-                {cancelText ? cancelText : 'Cancel'}
+                {cancelText ? cancelText : <Trans>Cancel</Trans>}
               </Button>
             )}
           </div>

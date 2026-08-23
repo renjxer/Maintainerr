@@ -1,8 +1,9 @@
+import { Trans, useLingui } from '@lingui/react/macro'
 import { RefreshIcon } from '@heroicons/react/outline'
 import { ChevronDownIcon, ChevronUpIcon } from '@heroicons/react/solid'
 import axios from 'axios'
 import { orderBy } from 'lodash-es'
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useSettingsOutletContext } from '..'
 import {
   useDeletePlexAuth,
@@ -107,6 +108,7 @@ export const hasUnsavedPlexServerChanges = (
 }
 
 const PlexSettings = () => {
+  const { t } = useLingui()
   const { settings } = useSettingsOutletContext()
   const [tokenValidationOverride, setTokenValidationOverride] =
     useState<TokenValidationOverride>()
@@ -120,7 +122,7 @@ const PlexSettings = () => {
   const [advancedDraftOverride, setAdvancedDraftOverride] = useState<
     PlexAdvancedDraft | undefined
   >(undefined)
-  const [testBanner, setTestbanner] = useState<{
+  const [testBanner, setTestBanner] = useState<{
     status: boolean
     version: string
   }>({ status: false, version: '' })
@@ -136,7 +138,10 @@ const PlexSettings = () => {
     showError,
     showWarning,
     clearError,
-  } = useSettingsFeedback('Plex settings')
+  } = useSettingsFeedback({
+    updated: t`Plex settings updated`,
+    updateError: t`Plex settings could not be updated`,
+  })
 
   const { mutateAsync: updateSettings, isPending } = usePatchSettings()
   const { mutateAsync: deletePlexAuth, isPending: deletePlexAuthPending } =
@@ -180,24 +185,27 @@ const PlexSettings = () => {
   const tokenValid =
     tokenValidationOverride?.valid ??
     (hasStoredPlexToken ? storedTokenValidation?.valid === true : false)
-  const storedTokenValidationError =
+  const showStoredValidationResult =
     tokenValidationOverride == null &&
     hasStoredPlexToken &&
     !tokenValidationPending &&
     storedTokenValidation?.valid === false
-      ? storedTokenValidation.errorMessage
-      : undefined
-  const isAuthenticated = tokenValid
-
-  useEffect(() => {
-    if (!storedTokenValidationError) {
-      return
-    }
-
-    // TanStack Query v5 removed query-level onError; route this back through
-    // shared settings feedback so Plex follows the same inline feedback pattern.
-    showError(storedTokenValidationError)
-  }, [showError, storedTokenValidationError])
+  // plex.tv couldn't be reached: the saved token may be fine, so stay
+  // authenticated and warn (the query keeps retrying) instead of demanding
+  // re-authentication.
+  const tokenUnreachable =
+    showStoredValidationResult && storedTokenValidation?.unreachable === true
+  const storedTokenValidationAlert = showStoredValidationResult
+    ? {
+        type: tokenUnreachable ? ('warning' as const) : ('error' as const),
+        title:
+          storedTokenValidation?.errorMessage ??
+          (tokenUnreachable
+            ? t`Couldn't reach ${{ plexTv: 'plex.tv' }} to verify your credentials - retrying. Your saved token is still in use.`
+            : t`Stored Plex credentials are invalid. Re-authenticate with Plex.`),
+      }
+    : null
+  const isAuthenticated = tokenValid || tokenUnreachable
 
   const {
     data: availableServers,
@@ -227,14 +235,14 @@ const PlexSettings = () => {
       advancedSsl !== savedAdvancedDraft.ssl)
 
   const clearTestBanner = () => {
-    setTestbanner({ status: false, version: '' })
+    setTestBanner({ status: false, version: '' })
   }
 
   const submit = async () => {
     clearError()
 
     if (!isAuthenticated) {
-      showWarning('Authenticate with Plex before saving server settings.')
+      showWarning(t`Authenticate with Plex before saving server settings.`)
       return
     }
 
@@ -246,12 +254,12 @@ const PlexSettings = () => {
         const port = Number(advancedPort.trim())
 
         if (!normalizedHostname) {
-          showInfo('Please enter a hostname or IP address.')
+          showInfo(t`Please enter a hostname or IP address.`)
           return
         }
 
         if (!Number.isInteger(port) || port <= 0 || port > 65535) {
-          showInfo('Please enter a valid port.')
+          showInfo(t`Please enter a valid port.`)
           return
         }
 
@@ -272,7 +280,7 @@ const PlexSettings = () => {
           selectedServer.name === ''
         ) {
           showInfo(
-            'Please complete server setup by selecting a server from the dropdown.',
+            t`Please complete server setup by selecting a server from the dropdown.`,
           )
           return
         }
@@ -301,7 +309,7 @@ const PlexSettings = () => {
         await updatePlexAuth(plex_token.plex_auth_token)
         return true
       } catch {
-        showError('There was an error updating Plex authentication.')
+        showError(t`There was an error updating Plex authentication.`)
       }
     }
 
@@ -378,7 +386,7 @@ const PlexSettings = () => {
       clearTestBanner()
       showUpdated()
     } catch {
-      showError('There was an error clearing Plex authentication.')
+      showError(t`There was an error clearing Plex authentication.`)
     }
   }
 
@@ -401,8 +409,7 @@ const PlexSettings = () => {
         ? { valid: true as const }
         : {
             valid: false as const,
-            errorMessage:
-              'Plex authentication could not be verified. Please try again.',
+            errorMessage: t`Plex authentication could not be verified. Please try again.`,
           }
     } catch (error) {
       setTokenValidationOverride({ pending: false, valid: false })
@@ -410,7 +417,7 @@ const PlexSettings = () => {
         valid: false as const,
         errorMessage: getApiErrorMessage(
           error,
-          'Plex authentication could not be verified. Please try again.',
+          t`Plex authentication could not be verified. Please try again.`,
         ),
       }
     }
@@ -420,12 +427,12 @@ const PlexSettings = () => {
     if (testing) return
 
     if (updatePlexAuthPending) {
-      showWarning('Wait for Plex authentication to finish before testing.')
+      showWarning(t`Wait for Plex authentication to finish before testing.`)
       return
     }
 
     if (!isAuthenticated) {
-      showWarning('Authenticate with Plex before testing the connection.')
+      showWarning(t`Authenticate with Plex before testing the connection.`)
       return
     }
 
@@ -438,19 +445,19 @@ const PlexSettings = () => {
         message: string
       }>('/settings/test/plex')
 
-      setTestbanner({
+      setTestBanner({
         status: result.code === 1,
         version: normalizeConnectionErrorMessage(
           result.message,
-          'Failed to connect to Plex. Verify your Plex configuration.',
+          t`Failed to connect to Plex. Verify your Plex configuration.`,
         ),
       })
     } catch (error) {
-      setTestbanner({
+      setTestBanner({
         status: false,
         version: getApiErrorMessage(
           error,
-          'Failed to connect to Plex. Verify your Plex configuration.',
+          t`Failed to connect to Plex. Verify your Plex configuration.`,
         ),
       })
     } finally {
@@ -460,33 +467,41 @@ const PlexSettings = () => {
 
   return (
     <>
-      <title>Plex settings - Maintainerr</title>
+      <title>{t`Plex settings - Maintainerr`}</title>
       <div className="h-full w-full">
         <div className="section h-full w-full">
-          <h3 className="heading">Plex Settings</h3>
-          <p className="description">Plex configuration</p>
+          <h3 className="heading">
+            <Trans>Plex Settings</Trans>
+          </h3>
+          <p className="description">
+            <Trans>Plex configuration</Trans>
+          </p>
         </div>
 
-        {tokenValidationPending && hasStoredPlexToken ? (
-          <Alert type="info" title="Validating stored Plex authentication..." />
-        ) : !isAuthenticated ? (
+        {!isAuthenticated && !(tokenValidationPending && hasStoredPlexToken) ? (
           <Alert
             type="info"
-            title="Plex configuration is required. Authenticate with Plex to get started."
+            title={t`Plex configuration is required. Authenticate with Plex to get started.`}
           />
         ) : null}
 
         <SettingsAlertSlot>
-          {feedback || testBanner.version || storedTokenValidationError ? (
+          {feedback || storedTokenValidationAlert || testBanner.version ? (
             <div className="space-y-4">
               {feedback ? (
                 <Alert type={feedback.type} title={feedback.title} />
+              ) : null}
+              {storedTokenValidationAlert ? (
+                <Alert
+                  type={storedTokenValidationAlert.type}
+                  title={storedTokenValidationAlert.title}
+                />
               ) : null}
               {testBanner.version ? (
                 testBanner.status ? (
                   <Alert
                     type="success"
-                    title={`Successfully connected to Plex (${testBanner.version})`}
+                    title={t`Successfully connected to Plex (${{ version: testBanner.version }})`}
                   />
                 ) : (
                   <Alert type="error" title={testBanner.version} />
@@ -501,18 +516,21 @@ const PlexSettings = () => {
             {/* Authentication */}
             <div className="form-row">
               <label className="text-label">
-                Authentication
+                <Trans>Authentication</Trans>
                 <span className="label-tip">
-                  {`Authentication with the server's admin account is required to access the Plex API`}
+                  <Trans>
+                    Authentication with the server&apos;s admin account is
+                    required to access the Plex API
+                  </Trans>
                 </span>
               </label>
               <div className="form-input">
                 <div className="form-input-field">
                   {tokenValidationPending ? (
                     <Button type="button" buttonType="default" disabled>
-                      Checking authentication...
+                      <Trans>Checking authentication...</Trans>
                     </Button>
-                  ) : tokenValid ? (
+                  ) : isAuthenticated ? (
                     clearTokenClicked ? (
                       <Button
                         type="button"
@@ -520,7 +538,7 @@ const PlexSettings = () => {
                         buttonType="warning"
                         disabled={deletePlexAuthPending}
                       >
-                        Clear credentials?
+                        <Trans>Clear credentials?</Trans>
                       </Button>
                     ) : (
                       <Button
@@ -528,7 +546,7 @@ const PlexSettings = () => {
                         onClick={() => setClearTokenClicked(true)}
                         buttonType="success"
                       >
-                        Authenticated
+                        <Trans>Authenticated</Trans>
                       </Button>
                     )
                   ) : (
@@ -543,14 +561,16 @@ const PlexSettings = () => {
               </div>
             </div>
 
-            {/* Server — only shown when authenticated */}
+            {/* Server - only shown when authenticated */}
             {isAuthenticated && (
               <div className="form-row">
                 <label className="text-label">
-                  Server
+                  <Trans>Server</Trans>
                   <span className="label-tip">
-                    Ensure DNS is properly configured since Plex depends on
-                    working DNS resolution
+                    <Trans>
+                      Ensure DNS is properly configured since Plex depends on
+                      working DNS resolution
+                    </Trans>
                   </span>
                 </label>
                 <div className="form-input">
@@ -572,7 +592,11 @@ const PlexSettings = () => {
                             )}
                             {selectedServer.local !== undefined && (
                               <span className="inline-flex items-center rounded-sm bg-zinc-700 px-1.5 py-0.5 text-xs text-zinc-300">
-                                {selectedServer.local ? 'Local' : 'Remote'}
+                                {selectedServer.local ? (
+                                  <Trans>Local</Trans>
+                                ) : (
+                                  <Trans>Remote</Trans>
+                                )}
                               </span>
                             )}
                             {selectedServer.latency !== undefined && (
@@ -594,7 +618,7 @@ const PlexSettings = () => {
                             clearTestBanner()
                           }}
                         >
-                          Change
+                          <Trans>Change</Trans>
                         </Button>
                       </div>
                     </div>
@@ -627,12 +651,12 @@ const PlexSettings = () => {
                         >
                           <option value="" disabled>
                             {isRefreshingPresets
-                              ? 'Retrieving servers...'
+                              ? t`Retrieving servers...`
                               : isServersError
-                                ? 'Failed to load servers — press refresh to retry'
+                                ? t`Failed to load servers - press refresh to retry`
                                 : !availableServers
-                                  ? 'Loading servers...'
-                                  : 'Select a server...'}
+                                  ? t`Loading servers...`
+                                  : t`Select a server...`}
                           </option>
                           {availablePresets.map((server, index) => (
                             <option
@@ -641,9 +665,9 @@ const PlexSettings = () => {
                               disabled={!server.status}
                             >
                               {server.name} ({server.address}:{server.port}) [
-                              {server.local ? 'local' : 'remote'}]
-                              {server.ssl ? ' [secure]' : ''}
-                              {!server.status ? ' (unavailable)' : ''}
+                              {server.local ? t`local` : t`remote`}]
+                              {server.ssl ? ` [${t`secure`}]` : ''}
+                              {!server.status ? ` (${t`unavailable`})` : ''}
                             </option>
                           ))}
                         </Select>
@@ -651,7 +675,7 @@ const PlexSettings = () => {
                       <button
                         type="button"
                         onClick={() => void refetchServers()}
-                        disabled={tokenValid !== true || updatePlexAuthPending}
+                        disabled={!isAuthenticated || updatePlexAuthPending}
                         className="input-action"
                       >
                         <RefreshIcon
@@ -665,7 +689,7 @@ const PlexSettings = () => {
               </div>
             )}
 
-            {/* Advanced Settings — hidden collapsible section */}
+            {/* Advanced Settings - hidden collapsible section */}
             {isAuthenticated && (
               <div className="mt-6">
                 <button
@@ -678,10 +702,10 @@ const PlexSettings = () => {
                   ) : (
                     <ChevronDownIcon className="h-4 w-4" />
                   )}
-                  Advanced Settings
+                  <Trans>Advanced Settings</Trans>
                   {manualMode && (
                     <span className="ml-1.5 inline-flex items-center rounded-sm bg-maintainerr-600 px-1.5 py-0.5 text-xs text-white">
-                      Manual
+                      <Trans>Manual</Trans>
                     </span>
                   )}
                 </button>
@@ -693,12 +717,14 @@ const PlexSettings = () => {
                         htmlFor="advanced-manual-mode"
                         className="text-label"
                       >
-                        Manual connection override
+                        <Trans>Manual connection override</Trans>
                         <span className="label-tip">
-                          Override the connection discovered by Plex.
-                          <br />
-                          Disables automatic reconnection — you manage the
-                          connection.
+                          <Trans>
+                            Override the connection discovered by Plex.
+                            <br />
+                            Disables automatic reconnection - you manage the
+                            connection.
+                          </Trans>
                         </span>
                       </label>
                       <div className="form-input">
@@ -724,10 +750,12 @@ const PlexSettings = () => {
                               className="checkbox"
                             />
                             <span className="text-sm text-zinc-300">
-                              Enable manual mode
+                              <Trans>Enable manual mode</Trans>
                               <br />
                               <span className="text-xs text-zinc-500">
-                                Plex authentication (above) is still required
+                                <Trans>
+                                  Plex authentication (above) is still required
+                                </Trans>
                               </span>
                             </span>
                           </label>
@@ -742,8 +770,10 @@ const PlexSettings = () => {
                             htmlFor="advanced-hostname"
                             className="text-label"
                           >
-                            Hostname / IP
+                            <Trans>Hostname / IP</Trans>
                             <span className="label-tip">
+                              {/* Example values stay untranslated per the
+                                  do-not-translate list. */}
                               e.g. plex, 192.168.1.50, or localhost
                             </span>
                           </label>
@@ -772,7 +802,7 @@ const PlexSettings = () => {
 
                         <div className="form-row">
                           <label htmlFor="advanced-port" className="text-label">
-                            Port
+                            <Trans>Port</Trans>
                           </label>
                           <div className="form-input">
                             <div className="form-input-field">
@@ -816,7 +846,7 @@ const PlexSettings = () => {
                                   className="checkbox"
                                 />
                                 <span className="text-sm text-zinc-300">
-                                  Use HTTPS
+                                  <Trans>Use HTTPS</Trans>
                                 </span>
                               </label>
                             </div>
@@ -854,14 +884,14 @@ const PlexSettings = () => {
                     }
                     title={
                       updatePlexAuthPending
-                        ? 'Wait for Plex authentication to finish before testing.'
+                        ? t`Wait for Plex authentication to finish before testing.`
                         : !isAuthenticated
-                          ? 'Authenticate with Plex before testing the connection.'
+                          ? t`Authenticate with Plex before testing the connection.`
                           : !hasSelectedServer && !manualMode
-                            ? 'Select a Plex server before testing.'
+                            ? t`Select a Plex server before testing.`
                             : testWouldTestWrongServer ||
                                 hasUnsavedAdvancedChanges
-                              ? 'Save your settings before testing.'
+                              ? t`Save your settings before testing.`
                               : undefined
                     }
                   />
@@ -875,9 +905,9 @@ const PlexSettings = () => {
                       isPending={isPending}
                       title={
                         updatePlexAuthPending
-                          ? 'Wait for Plex authentication to finish before saving.'
+                          ? t`Wait for Plex authentication to finish before saving.`
                           : !isAuthenticated
-                            ? 'Authenticate with Plex before saving server settings.'
+                            ? t`Authenticate with Plex before saving server settings.`
                             : undefined
                       }
                     />

@@ -1,8 +1,20 @@
-import { cleanup, render, screen } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { QueryClientProvider } from '@tanstack/react-query'
+import { render, screen, type RenderResult } from '../../test-utils/render'
+import type { ReactElement } from 'react'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createDeferred } from '../../test-utils/createDeferred'
+import { createTestQueryClient } from '../../test-utils/queryClient'
 import RadarrSettings from './Radarr'
 import SonarrSettings from './Sonarr'
+
+// The pages embed ExclusionTagSettings, which reads global settings via
+// TanStack Query, so renders need a QueryClient in the tree.
+const renderWithClient = (ui: ReactElement): RenderResult =>
+  render(
+    <QueryClientProvider client={createTestQueryClient()}>
+      {ui}
+    </QueryClientProvider>,
+  )
 
 const getApiHandler = vi.fn()
 const deleteApiHandler = vi.fn()
@@ -52,10 +64,6 @@ describe.each([
     toastError.mockReset()
   })
 
-  afterEach(() => {
-    cleanup()
-  })
-
   it('does not show transient loading UI while server settings load', async () => {
     const request = createDeferred<
       Array<{
@@ -71,10 +79,15 @@ describe.each([
         return request.promise
       }
 
+      // ExclusionTagSettings fetches global settings; answer benignly.
+      if (url === '/settings') {
+        return Promise.resolve({})
+      }
+
       throw new Error(`Unexpected request: ${url}`)
     })
 
-    render(<Component />)
+    renderWithClient(<Component />)
 
     expect(
       screen.getByRole('heading', { name: `${label} Settings` }),

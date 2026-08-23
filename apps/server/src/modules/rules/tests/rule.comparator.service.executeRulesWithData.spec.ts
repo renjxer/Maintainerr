@@ -1,9 +1,13 @@
 import { Mocked, TestBed } from '@suites/unit';
-import { createMediaItem, createRulesDto } from '../../../../test/utils/data';
+import {
+  createMediaItem,
+  createRuleGroupDto,
+} from '../../../../test/utils/data';
 import { MaintainerrLogger } from '../../logging/logs.service';
 import { RuleConstanstService } from '../constants/constants.service';
 import {
   Application,
+  RuleOperators,
   RulePossibility,
   RuleType,
 } from '../constants/rules.constants';
@@ -137,6 +141,31 @@ describe('RuleComparatorService.executeRulesWithData', () => {
     } as never);
   });
 
+  it('rethrows evaluation failures instead of returning undefined for the chunk (#3307)', async () => {
+    // A swallowed chunk error left every item in it unmatched and
+    // unprotected, so the executor removed them as "no longer matching".
+    const mediaItem = createSingleMedia();
+    const rules = [
+      createStoredRule(1, {
+        operator: null,
+        action: RulePossibility.SMALLER,
+        firstVal: [Application.PLEX, 31],
+        customVal: { ruleTypeId: +RuleType.NUMBER, value: '6' },
+        section: 0,
+      }),
+    ];
+
+    valueGetterService.get.mockReset();
+    valueGetterService.get.mockRejectedValue(new Error('boom'));
+
+    await expect(
+      ruleComparatorService.executeRulesWithData(
+        createRuleGroupDto({ dataType: 'movie', rules }),
+        [mediaItem],
+      ),
+    ).rejects.toThrow('boom');
+  });
+
   it('fails closed when the first value is missing for a custom comparison', async () => {
     const mediaItem = createSingleMedia();
     const rules = [
@@ -152,7 +181,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
     mockGetterSequence(null);
 
     const result = await ruleComparatorService.executeRulesWithData(
-      createRulesDto({ dataType: 'movie', rules }),
+      createRuleGroupDto({ dataType: 'movie', rules }),
       [mediaItem],
     );
 
@@ -193,7 +222,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
     mockGetterSequence(10, null);
 
     const result = await ruleComparatorService.executeRulesWithData(
-      createRulesDto({ dataType: 'movie', rules }),
+      createRuleGroupDto({ dataType: 'movie', rules }),
       [mediaItem],
     );
 
@@ -223,7 +252,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
     mockGetterSequence('HEVC 1080p');
 
     const result = await ruleComparatorService.executeRulesWithData(
-      createRulesDto({ dataType: 'movie', rules }),
+      createRuleGroupDto({ dataType: 'movie', rules }),
       [mediaItem],
     );
 
@@ -257,7 +286,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
     mockGetterSequence(null);
 
     const result = await ruleComparatorService.executeRulesWithData(
-      createRulesDto({ dataType: 'movie', rules }),
+      createRuleGroupDto({ dataType: 'movie', rules }),
       [mediaItem],
     );
 
@@ -295,7 +324,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
     mockGetterSequence(null);
 
     const result = await ruleComparatorService.executeRulesWithData(
-      createRulesDto({ dataType: 'movie', rules }),
+      createRuleGroupDto({ dataType: 'movie', rules }),
       [mediaItem],
     );
 
@@ -329,7 +358,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
     const startedAt = Date.now();
 
     const result = await ruleComparatorService.executeRulesWithData(
-      createRulesDto({ dataType: 'movie', rules }),
+      createRuleGroupDto({ dataType: 'movie', rules }),
       [mediaItem],
     );
 
@@ -362,7 +391,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
     mockGetterSequence(null);
 
     const result = await ruleComparatorService.executeRulesWithData(
-      createRulesDto({ dataType: 'movie', rules }),
+      createRuleGroupDto({ dataType: 'movie', rules }),
       [mediaItem],
     );
 
@@ -390,7 +419,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
     const startedAt = Date.now();
 
     const result = await ruleComparatorService.executeRulesWithData(
-      createRulesDto({ dataType: 'movie', rules }),
+      createRuleGroupDto({ dataType: 'movie', rules }),
       [mediaItem],
     );
 
@@ -422,7 +451,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
     mockGetterSequence('HEVC 1080p', null);
 
     const result = await ruleComparatorService.executeRulesWithData(
-      createRulesDto({ dataType: 'movie', rules }),
+      createRuleGroupDto({ dataType: 'movie', rules }),
       [mediaItem],
     );
 
@@ -438,7 +467,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
   });
 
   // Unary EXISTS/NOT_EXISTS must distinguish the getter's `null` (definitive
-  // absence — e.g. lastViewedAt for a never-watched item) from `undefined`
+  // absence - e.g. lastViewedAt for a never-watched item) from `undefined`
   // (outer-catch transport failure in plex/seerr-getter). Without the
   // tightened shouldCompare, `!hasExistsValue(undefined) === true` would
   // spuriously add items on every transient API blip (#1446).
@@ -458,7 +487,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
       mockGetterSequence(null);
 
       const result = await ruleComparatorService.executeRulesWithData(
-        createRulesDto({ dataType: 'movie', rules }),
+        createRuleGroupDto({ dataType: 'movie', rules }),
         [mediaItem],
       );
 
@@ -479,11 +508,331 @@ describe('RuleComparatorService.executeRulesWithData', () => {
       mockGetterSequence(undefined);
 
       const result = await ruleComparatorService.executeRulesWithData(
-        createRulesDto({ dataType: 'movie', rules }),
+        createRuleGroupDto({ dataType: 'movie', rules }),
         [mediaItem],
       );
 
       expect(result.data).toEqual([]);
+    });
+
+    // A failed lookup reported as "no entries for this item" reads as real data
+    // and hides the outage from whoever is debugging the rule (#3395).
+    it.each([
+      [undefined, true],
+      [null, false],
+    ])('reports %p as a failed lookup: %p', async (value, lookupFailed) => {
+      const rules = [
+        createStoredRule(1, {
+          operator: null,
+          action: RulePossibility.EXISTS,
+          firstVal: [Application.PLEX, 6],
+          section: 0,
+        }),
+      ];
+
+      mockGetterSequence(value);
+
+      await ruleComparatorService.executeRulesWithData(
+        createRuleGroupDto({ dataType: 'movie', rules }),
+        [createSingleMedia()],
+      );
+
+      expect(ruleConstanstService.getValueNullReason).toHaveBeenCalledWith(
+        [Application.PLEX, 6],
+        undefined,
+        { lookupFailed },
+      );
+    });
+
+    it('completes the run and logs a skip (not a crash) when a unary rule value is unavailable', async () => {
+      // getCustomValueIdentifier dereferences customValue.ruleTypeId. A unary
+      // rule (EXISTS/NOT_EXISTS) carries no customVal, so logging the skipped
+      // comparison must not reach this helper - otherwise the run threw
+      // "Cannot read properties of undefined (reading 'ruleTypeId')" and aborted.
+      ruleConstanstService.getCustomValueIdentifier.mockImplementation(
+        (customValue: { ruleTypeId: number; value: string }) => ({
+          type: ['number', 'date', 'text', 'boolean', 'text list'][
+            customValue.ruleTypeId
+          ],
+          value: customValue.value,
+        }),
+      );
+
+      const mediaItem = createSingleMedia();
+      const rules = [
+        createStoredRule(1, {
+          operator: null,
+          action: RulePossibility.NOT_EXISTS,
+          firstVal: [Application.PLEX, 6],
+          section: 0,
+        }),
+      ];
+
+      mockGetterSequence(undefined);
+
+      const result = await ruleComparatorService.executeRulesWithData(
+        createRuleGroupDto({ dataType: 'movie', rules }),
+        [mediaItem],
+      );
+
+      // The run completes (the bug aborted via the catch and returned undefined),
+      expect(result).toBeDefined();
+      // the item is not matched,
+      expect(result.data).toEqual([]);
+      // and the skip is logged rather than crashing the run.
+      expect(logger.debug).toHaveBeenCalledWith(
+        expect.stringContaining(
+          'Skipping rule comparison because a value is unavailable',
+        ),
+      );
+      expect(logger.log).not.toHaveBeenCalledWith(
+        expect.stringContaining('Something went wrong'),
+      );
+    });
+  });
+
+  describe('OR sections', () => {
+    // section 0: viewCount EQUALS 0  (operator: null = OR boundary)
+    // section 1: viewCount BIGGER 0  (operator: null = OR boundary)
+    // These two conditions are mutually exclusive, which proves OR semantics -
+    // if AND were used, no item could satisfy both simultaneously.
+    //
+    // Field [Application.PLEX, 5] = viewCount
+    // RulePossibility.EQUALS = 2, RulePossibility.BIGGER = 0
+    // operator null  = first condition of a new OR section
+    // operator RuleOperators.AND (0) = AND within a section
+
+    const buildTwoSectionRules = () => [
+      createStoredRule(
+        1,
+        {
+          operator: null,
+          action: RulePossibility.EQUALS,
+          firstVal: [Application.PLEX, 5],
+          customVal: { ruleTypeId: +RuleType.NUMBER, value: '0' },
+          section: 0,
+        },
+        0,
+      ),
+      createStoredRule(
+        2,
+        {
+          operator: null,
+          action: RulePossibility.BIGGER,
+          firstVal: [Application.PLEX, 5],
+          customVal: { ruleTypeId: +RuleType.NUMBER, value: '0' },
+          section: 1,
+        },
+        1,
+      ),
+    ];
+
+    it('includes an item matching only section 0 (mutually exclusive sections prove OR not AND)', async () => {
+      // viewCount = 0 matches section 0 (EQUALS 0) but not section 1 (BIGGER 0)
+      const mediaItem = createSingleMedia();
+      const rules = buildTwoSectionRules();
+
+      // getter called twice per item: first for section 0 rule, then for section 1 rule
+      mockGetterSequence(0, 0);
+
+      const result = await ruleComparatorService.executeRulesWithData(
+        createRuleGroupDto({ dataType: 'movie', rules }),
+        [mediaItem],
+      );
+
+      expect(result.data).toHaveLength(1);
+      expect(result.stats[0].result).toBe(true);
+    });
+
+    it('includes an item matching only section 1', async () => {
+      // viewCount = 5 does not match section 0 (EQUALS 0) but does match section 1 (BIGGER 0)
+      const mediaItem = createSingleMedia();
+      const rules = buildTwoSectionRules();
+
+      mockGetterSequence(5, 5);
+
+      const result = await ruleComparatorService.executeRulesWithData(
+        createRuleGroupDto({ dataType: 'movie', rules }),
+        [mediaItem],
+      );
+
+      expect(result.data).toHaveLength(1);
+      expect(result.stats[0].result).toBe(true);
+    });
+
+    it('excludes an item matching neither section', async () => {
+      // viewCount = null matches neither EQUALS 0 nor BIGGER 0
+      const mediaItem = createSingleMedia();
+      const rules = buildTwoSectionRules();
+
+      mockGetterSequence(null, null);
+
+      const result = await ruleComparatorService.executeRulesWithData(
+        createRuleGroupDto({ dataType: 'movie', rules }),
+        [mediaItem],
+      );
+
+      expect(result.data).toEqual([]);
+      expect(result.stats[0].result).toBe(false);
+    });
+
+    it('includes an item matching both overlapping sections exactly once (no duplicate)', async () => {
+      // Overlapping (non-exclusive) sections so a single item can satisfy both:
+      //   section 0: viewCount EQUALS 0
+      //   section 1: viewCount SMALLER 1
+      // An item with viewCount = 0 matches both sections. OR semantics must
+      // union the sections and dedupe, so the item appears exactly once - a
+      // regression here (e.g. pushing per matching section) would yield two.
+      const overlappingRules = [
+        createStoredRule(
+          1,
+          {
+            operator: null,
+            action: RulePossibility.EQUALS,
+            firstVal: [Application.PLEX, 5],
+            customVal: { ruleTypeId: +RuleType.NUMBER, value: '0' },
+            section: 0,
+          },
+          0,
+        ),
+        createStoredRule(
+          2,
+          {
+            operator: null,
+            action: RulePossibility.SMALLER,
+            firstVal: [Application.PLEX, 5],
+            customVal: { ruleTypeId: +RuleType.NUMBER, value: '1' },
+            section: 1,
+          },
+          1,
+        ),
+      ];
+      const mediaItem = createSingleMedia();
+
+      // viewCount = 0 for both the section 0 and section 1 evaluations
+      mockGetterSequence(0, 0);
+
+      const result = await ruleComparatorService.executeRulesWithData(
+        createRuleGroupDto({ dataType: 'movie', rules: overlappingRules }),
+        [mediaItem],
+      );
+
+      expect(result.data).toHaveLength(1);
+      expect(result.data[0].id).toBe('media-1');
+      expect(result.stats[0].result).toBe(true);
+    });
+
+    it('short-circuits later OR rules for items that already matched earlier rules in the same section', async () => {
+      const rules = [
+        createStoredRule(
+          1,
+          {
+            operator: null,
+            action: RulePossibility.EQUALS,
+            firstVal: [Application.PLEX, 5],
+            customVal: { ruleTypeId: +RuleType.NUMBER, value: '1' },
+            section: 0,
+          },
+          0,
+        ),
+        createStoredRule(
+          2,
+          {
+            operator: RuleOperators.OR,
+            action: RulePossibility.EQUALS,
+            firstVal: [Application.PLEX, 5],
+            customVal: { ruleTypeId: +RuleType.NUMBER, value: '2' },
+            section: 0,
+          },
+          0,
+        ),
+      ];
+      const matchedByFirstRule = createMediaItem({
+        id: 'matched-first',
+        type: 'movie' as const,
+      });
+      const matchedBySecondRule = createMediaItem({
+        id: 'matched-second',
+        type: 'movie' as const,
+      });
+
+      mockGetterSequence(1, 0, 2);
+
+      const result = await ruleComparatorService.executeRulesWithData(
+        createRuleGroupDto({ dataType: 'movie', rules }),
+        [matchedByFirstRule, matchedBySecondRule],
+      );
+
+      expect(result.data.map((item) => item.id).sort()).toEqual([
+        'matched-first',
+        'matched-second',
+      ]);
+      expect(valueGetterService.get).toHaveBeenCalledTimes(3);
+      expect(
+        result.stats.find((stat) => stat.mediaServerId === 'matched-first')
+          ?.sectionResults[0].ruleResults,
+      ).toHaveLength(1);
+      expect(
+        result.stats.find((stat) => stat.mediaServerId === 'matched-second')
+          ?.sectionResults[0].ruleResults,
+      ).toHaveLength(2);
+    });
+
+    it('honours an explicit AND section operator (intersection), not OR', async () => {
+      // The section operator is persisted as a string. An explicit AND is "0",
+      // so the section combine must use null-guarded coercion: +"0" === 0.
+      // A naive strict comparison ("0" === 0) would be false and silently
+      // turn the section into OR, including items that match only one section.
+      //   section 0: viewCount BIGGER 0        (operator null = first section)
+      //   section 1: viewCount SMALLER 10      (operator "0" = AND)
+      const andRules = [
+        createStoredRule(
+          1,
+          {
+            operator: null,
+            action: RulePossibility.BIGGER,
+            firstVal: [Application.PLEX, 5],
+            customVal: { ruleTypeId: +RuleType.NUMBER, value: '0' },
+            section: 0,
+          },
+          0,
+        ),
+        createStoredRule(
+          2,
+          {
+            // Persisted as a string by the UI (RuleDto types it loosely as the
+            // enum, but the stored value is "0"/"1"); cast to match real data.
+            operator: '0' as unknown as RuleOperators,
+            action: RulePossibility.SMALLER,
+            firstVal: [Application.PLEX, 5],
+            customVal: { ruleTypeId: +RuleType.NUMBER, value: '10' },
+            section: 1,
+          },
+          1,
+        ),
+      ];
+      const inRange = createMediaItem({
+        id: 'in-range',
+        type: 'movie' as const,
+      });
+      const tooHigh = createMediaItem({
+        id: 'too-high',
+        type: 'movie' as const,
+      });
+
+      // getter order: section 0 over [inRange, tooHigh], then section 1 over
+      // [inRange, tooHigh]. viewCount: inRange = 5, tooHigh = 15.
+      mockGetterSequence(5, 15, 5, 15);
+
+      const result = await ruleComparatorService.executeRulesWithData(
+        createRuleGroupDto({ dataType: 'movie', rules: andRules }),
+        [inRange, tooHigh],
+      );
+
+      // AND: only inRange satisfies both (>0 and <10). tooHigh (>0 but not <10)
+      // is excluded. Under the OR regression both would be included.
+      expect(result.data).toHaveLength(1);
+      expect(result.data[0].id).toBe('in-range');
     });
   });
 
@@ -503,7 +852,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
       mockGetterSequence(undefined);
 
       const result = await ruleComparatorService.executeRulesWithData(
-        createRulesDto({ dataType: 'movie', rules }),
+        createRuleGroupDto({ dataType: 'movie', rules }),
         [mediaItem],
       );
 
@@ -525,7 +874,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
       mockGetterSequence(null);
 
       const result = await ruleComparatorService.executeRulesWithData(
-        createRulesDto({ dataType: 'movie', rules }),
+        createRuleGroupDto({ dataType: 'movie', rules }),
         [mediaItem],
       );
 
@@ -547,7 +896,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
       mockGetterSequence(10, undefined);
 
       const result = await ruleComparatorService.executeRulesWithData(
-        createRulesDto({ dataType: 'movie', rules }),
+        createRuleGroupDto({ dataType: 'movie', rules }),
         [mediaItem],
       );
 
@@ -569,7 +918,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
       mockGetterSequence(5);
 
       const result = await ruleComparatorService.executeRulesWithData(
-        createRulesDto({ dataType: 'movie', rules }),
+        createRuleGroupDto({ dataType: 'movie', rules }),
         [mediaItem],
       );
 
@@ -615,7 +964,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
       );
 
       const resultPromise = ruleComparatorService.executeRulesWithData(
-        createRulesDto({ dataType: 'movie', rules }),
+        createRuleGroupDto({ dataType: 'movie', rules }),
         mediaItems,
       );
 

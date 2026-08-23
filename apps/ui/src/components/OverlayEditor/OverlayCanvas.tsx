@@ -1,3 +1,4 @@
+import { useLingui } from '@lingui/react/macro'
 import type { OverlayElement } from '@maintainerr/contracts'
 import Konva from 'konva'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
@@ -52,7 +53,7 @@ export function OverlayCanvas({
   } | null>(null)
   // Cache of decoded bitmaps keyed by `${imagePath}@${version}`. Including
   // the version in the key means an upload that overwrites an existing
-  // filename creates a fresh entry instead of serving stale bytes — without
+  // filename creates a fresh entry instead of serving stale bytes - without
   // needing a synchronous cache-clear effect.
   const [loadedImages, setLoadedImages] = useState<
     Record<string, HTMLImageElement>
@@ -66,14 +67,14 @@ export function OverlayCanvas({
   useEffect(() => {
     const node = containerRef.current
     if (!node) return
-    const update = () => {
+    // ResizeObserver delivers an initial measurement on observe(), so size
+    // does not need to be set synchronously here.
+    const observer = new ResizeObserver(() => {
       setContainerSize({
         width: node.clientWidth,
         height: node.clientHeight,
       })
-    }
-    update()
-    const observer = new ResizeObserver(update)
+    })
     observer.observe(node)
     return () => observer.disconnect()
   }, [])
@@ -157,7 +158,7 @@ export function OverlayCanvas({
 
     // Prune entries that are no longer reachable: stale versions after an
     // upload, and orphans from removed elements. Deferred to a microtask so
-    // the setState lands outside the effect body — same observable timing
+    // the setState lands outside the effect body - same observable timing
     // as a synchronous call (still pre-paint), but doesn't trip the
     // `react-hooks/set-state-in-effect` static check. Identity-preserving:
     // returns `prev` when nothing changed so it never causes a re-render.
@@ -385,6 +386,7 @@ function ElementRenderer({
   onDragEnd: (e: Konva.KonvaEventObject<DragEvent>) => void
   onTransformEnd: (e: Konva.KonvaEventObject<Event>) => void
 }) {
+  const { t } = useLingui()
   const x = el.x * scale
   const y = el.y * scale
   const w = el.width * scale
@@ -518,7 +520,7 @@ function ElementRenderer({
       if (loaded) {
         // Mirror the server's sharp `fit: 'contain'`: scale to fit the
         // bounding box while preserving aspect ratio, centred, padded with
-        // transparent space — never stretched. Keeps the editor preview
+        // transparent space - never stretched. Keeps the editor preview
         // visually identical to the rendered output.
         const naturalW = loaded.naturalWidth || w
         const naturalH = loaded.naturalHeight || h
@@ -552,7 +554,7 @@ function ElementRenderer({
           <Text
             width={w}
             height={h}
-            text={el.imagePath ? 'Loading…' : '[Image]'}
+            text={el.imagePath ? t`Loading…` : t`[Image]`}
             fontSize={14 * scale}
             fill="#888"
             align="center"

@@ -1,8 +1,17 @@
-import { MediaItem } from '@maintainerr/contracts';
+import {
+  LeftoverCleanupScope,
+  leftoverCleanupScope,
+  MediaItem,
+} from '@maintainerr/contracts';
 import { Injectable } from '@nestjs/common';
+import { dirname } from 'path';
+import { DownloadClientApiService } from '../api/download-client-api/download-client-api.service';
 import { MediaServerFactory } from '../api/media-server/media-server.factory';
 import { SeerrApiService } from '../api/seerr-api/seerr-api.service';
-import { SonarrSeries } from '../api/servarr-api/interfaces/sonarr.interface';
+import {
+  SonarrEpisode,
+  SonarrSeries,
+} from '../api/servarr-api/interfaces/sonarr.interface';
 import { ServarrService } from '../api/servarr-api/servarr.service';
 import { Collection } from '../collections/entities/collection.entities';
 import { CollectionMedia } from '../collections/entities/collection_media.entities';
@@ -13,6 +22,20 @@ import {
   formatMetadataLookupCandidates,
 } from '../metadata/metadata-lookup.util';
 import { MetadataService } from '../metadata/metadata.service';
+import { SettingsDataService } from '../settings/settings-data.service';
+import {
+  LeftoverCleanupInput,
+  LeftoverFolderCleanupService,
+} from './leftover-folder-cleanup.service';
+
+/** Leftover-cleanup fences plus the resolved season folder, read pre-delete. */
+interface SonarrCleanupInputs {
+  fences: Pick<
+    LeftoverCleanupInput,
+    'rootFolderPaths' | 'deletedFilePaths' | 'otherItemPaths'
+  >;
+  seasonFolderPath: string | undefined;
+}
 
 @Injectable()
 export class SonarrActionHandler {
@@ -21,6 +44,9 @@ export class SonarrActionHandler {
     private readonly mediaServerFactory: MediaServerFactory,
     private readonly seerrApi: SeerrApiService,
     private readonly metadataService: MetadataService,
+    private readonly settings: SettingsDataService,
+    private readonly downloadClient: DownloadClientApiService,
+    private readonly folderCleanup: LeftoverFolderCleanupService,
     private readonly logger: MaintainerrLogger,
   ) {
     logger.setContext(SonarrActionHandler.name);
@@ -39,6 +65,26 @@ export class SonarrActionHandler {
 
     if (['season', 'episode'].includes(collection.type)) {
       mediaData = await mediaServer.getMetadata(media.mediaServerId);
+    }
+
+    // Every season-scoped Sonarr call has to be limited to this one number, and
+    // it is missing more often than it looks: the metadata read fails because
+    // the season is gone (Plex drops an emptied season on its next scan, while
+    // the item stays queued for retry), or the season simply has no index -
+    // Jellyfin and Emby file episodes they can't place under a permanent
+    // "Season Unknown" that carries no IndexNumber. Either way the index used to
+    // reach `unmonitorSeasons` as its whole-show default and delete every
+    // remaining episode file of the show (#3415), so fail closed: no Sonarr call
+    // is made, and the collection handler decides whether to keep the item for
+    // retry or prune it.
+    const seasonNumber =
+      collection.type === 'season' ? mediaData?.index : undefined;
+
+    if (collection.type === 'season' && seasonNumber == null) {
+      this.logger.warn(
+        `[Sonarr] Couldn't determine the season number for media server item ${media.mediaServerId}. No action was taken.`,
+      );
+      return false;
     }
 
     const lookupCandidates =
@@ -63,6 +109,16 @@ export class SonarrActionHandler {
     });
     let sonarrMedia = matchedResult?.result;
 
+    if (sonarrMedia === undefined) {
+      // Transient Sonarr lookup failure (vs. null = confirmed not tracked):
+      // fail closed instead of falling through to a media-server delete on a
+      // blip. The item stays in the collection and is retried next run. (#3125)
+      this.logger.log(
+        `Couldn't reach Sonarr to resolve a series for media server item ${media.mediaServerId}. No action was taken; will retry next run.`,
+      );
+      return false;
+    }
+
     if (!sonarrMedia?.id) {
       const attemptedIds = formatMetadataLookupCandidates(lookupCandidates);
 
@@ -80,6 +136,14 @@ export class SonarrActionHandler {
         this.logger.log(
           `Couldn't find show in Sonarr using resolved external IDs [${attemptedIds}] for media server item ${media.mediaServerId}. Attempting to remove from the filesystem via media server.`,
         );
+        if (
+          collection.cleanupLeftoverFolders &&
+          leftoverCleanupScope(collection.type, collection.arrAction)
+        ) {
+          this.folderCleanup.logNotApplicableForUntrackedItem(
+            media.mediaServerId,
+          );
+        }
         await mediaServer.deleteFromDisk(media.mediaServerId);
         return true;
       } else {
@@ -89,6 +153,54 @@ export class SonarrActionHandler {
         return false;
       }
     }
+
+    // Capture the download ids before any delete (the history is consumed
+    // afterwards). A whole-show delete removes every torrent the series
+    // produced; a season/episode delete removes only the torrents fully covered
+    // by it, since a season/series pack also backs episodes that are kept.
+    const isFileDeletingAction =
+      collection.arrAction === ServarrAction.DELETE ||
+      collection.arrAction === ServarrAction.UNMONITOR_DELETE_ALL ||
+      collection.arrAction === ServarrAction.UNMONITOR_DELETE_EXISTING ||
+      collection.arrAction === ServarrAction.DELETE_SHOW_IF_EMPTY;
+    let downloadIds: string[] = [];
+    if (isFileDeletingAction && this.settings.downloadClientConfigured()) {
+      if (collection.type === 'show') {
+        downloadIds = await sonarrApiClient.getDownloadIdsForSeries(
+          sonarrMedia.id,
+        );
+      } else if (
+        collection.type === 'season' ||
+        collection.type === 'episode'
+      ) {
+        downloadIds = await this.resolveCoveredDownloadIds(
+          sonarrApiClient,
+          sonarrMedia,
+          collection.type,
+          mediaData,
+          seasonNumber,
+        );
+      }
+    }
+
+    // Leftover-folder cleanup inputs, captured before the delete (the episode
+    // files are gone afterwards). Only the actions that delete episode files one
+    // by one strand a folder; `deleteShow` removes the whole series folder in
+    // Sonarr itself, so DELETE on a show is excluded. Episode scope shares the
+    // season folder with the episodes that are kept, so it is never cleaned.
+    // Gathered only when the feature is on, to keep the common path free of
+    // extra Sonarr calls.
+    const seriesFolderPath = sonarrMedia.path;
+    const cleanupScope = collection.cleanupLeftoverFolders
+      ? leftoverCleanupScope(collection.type, collection.arrAction)
+      : undefined;
+    const cleanupInputs = cleanupScope
+      ? await this.collectCleanupInputs(
+          sonarrApiClient,
+          sonarrMedia,
+          cleanupScope === 'season' ? seasonNumber : undefined,
+        )
+      : undefined;
 
     switch (collection.arrAction) {
       case ServarrAction.DELETE_SHOW_IF_EMPTY:
@@ -100,7 +212,7 @@ export class SonarrActionHandler {
         }
         sonarrMedia = await sonarrApiClient.unmonitorSeasons(
           sonarrMedia.id,
-          mediaData?.index,
+          seasonNumber,
           true,
         );
 
@@ -109,22 +221,35 @@ export class SonarrActionHandler {
         }
 
         this.logger.log(
-          `[Sonarr] Removed season ${mediaData?.index} from show '${sonarrMedia.title}'`,
+          `[Sonarr] Removed season ${seasonNumber} from show '${sonarrMedia.title}'`,
         );
-        await this.deleteShowIfEmpty(
-          sonarrApiClient,
-          matchedResult.candidate,
-          media.tmdbId,
-          mediaData?.index,
-          collection.listExclusions,
-        );
+        {
+          const showDeleted = await this.deleteShowIfEmpty(
+            sonarrApiClient,
+            matchedResult.candidate,
+            media.tmdbId,
+            seasonNumber,
+            collection.listExclusions,
+          );
+          await this.downloadClient.removeDownloads(downloadIds);
+          // Skipped when the show itself was deleted: Sonarr removes the whole
+          // series folder in that case, season folders included.
+          if (!showDeleted) {
+            await this.cleanupLeftoverFolder(
+              cleanupScope,
+              cleanupInputs,
+              seriesFolderPath,
+              sonarrMedia.title,
+            );
+          }
+        }
         return true;
       case ServarrAction.DELETE:
         switch (collection.type) {
           case 'season':
             sonarrMedia = await sonarrApiClient.unmonitorSeasons(
               sonarrMedia.id,
-              mediaData?.index,
+              seasonNumber,
               true,
             );
 
@@ -133,7 +258,14 @@ export class SonarrActionHandler {
             }
 
             this.logger.log(
-              `[Sonarr] Removed season ${mediaData?.index} from show '${sonarrMedia.title}'`,
+              `[Sonarr] Removed season ${seasonNumber} from show '${sonarrMedia.title}'`,
+            );
+            await this.downloadClient.removeDownloads(downloadIds);
+            await this.cleanupLeftoverFolder(
+              cleanupScope,
+              cleanupInputs,
+              seriesFolderPath,
+              sonarrMedia.title,
             );
             return true;
           case 'episode': {
@@ -161,6 +293,7 @@ export class SonarrActionHandler {
             this.logger.log(
               `[Sonarr] Removed season ${mediaData?.parentIndex} ${this.getEpisodeLogLabel(mediaData)} from show '${sonarrMedia.title}'`,
             );
+            await this.downloadClient.removeDownloads(downloadIds);
             return true;
           }
           default:
@@ -174,6 +307,7 @@ export class SonarrActionHandler {
               return false;
             }
             this.logger.log(`Removed show '${sonarrMedia.title}' from Sonarr`);
+            await this.downloadClient.removeDownloads(downloadIds);
             return true;
         }
         break;
@@ -186,7 +320,7 @@ export class SonarrActionHandler {
         }
         sonarrMedia = await sonarrApiClient.unmonitorSeasons(
           sonarrMedia.id,
-          mediaData?.index,
+          seasonNumber,
           false,
         );
 
@@ -195,7 +329,7 @@ export class SonarrActionHandler {
         }
 
         this.logger.log(
-          `[Sonarr] Unmonitored season ${mediaData?.index} from show '${sonarrMedia.title}'`,
+          `[Sonarr] Unmonitored season ${seasonNumber} from show '${sonarrMedia.title}'`,
         );
         await this.unmonitorShowIfEmptyAndEnded(
           sonarrApiClient,
@@ -207,7 +341,7 @@ export class SonarrActionHandler {
           case 'season':
             sonarrMedia = await sonarrApiClient.unmonitorSeasons(
               sonarrMedia.id,
-              mediaData?.index,
+              seasonNumber,
               false,
             );
 
@@ -216,7 +350,7 @@ export class SonarrActionHandler {
             }
 
             this.logger.log(
-              `[Sonarr] Unmonitored season ${mediaData?.index} from show '${sonarrMedia.title}'`,
+              `[Sonarr] Unmonitored season ${seasonNumber} from show '${sonarrMedia.title}'`,
             );
             return true;
           case 'episode': {
@@ -283,6 +417,13 @@ export class SonarrActionHandler {
               this.logger.log(
                 `[Sonarr] Unmonitored show '${sonarrMedia.title}' and removed all episodes`,
               );
+              await this.downloadClient.removeDownloads(downloadIds);
+              await this.cleanupLeftoverFolder(
+                cleanupScope,
+                cleanupInputs,
+                seriesFolderPath,
+                sonarrMedia.title,
+              );
               return true;
             }
 
@@ -298,7 +439,7 @@ export class SonarrActionHandler {
           case 'season':
             sonarrMedia = await sonarrApiClient.unmonitorSeasons(
               sonarrMedia.id,
-              mediaData?.index,
+              seasonNumber,
               true,
               true,
             );
@@ -308,7 +449,14 @@ export class SonarrActionHandler {
             }
 
             this.logger.log(
-              `[Sonarr] Removed existing episodes from season ${mediaData?.index} from show '${sonarrMedia.title}'`,
+              `[Sonarr] Removed existing episodes from season ${seasonNumber} from show '${sonarrMedia.title}'`,
+            );
+            await this.downloadClient.removeDownloads(downloadIds);
+            await this.cleanupLeftoverFolder(
+              cleanupScope,
+              cleanupInputs,
+              seriesFolderPath,
+              sonarrMedia.title,
             );
             return true;
           case 'show':
@@ -325,6 +473,13 @@ export class SonarrActionHandler {
               }
               this.logger.log(
                 `[Sonarr] Unmonitored show '${sonarrMedia.title}' and removed existing episodes`,
+              );
+              await this.downloadClient.removeDownloads(downloadIds);
+              await this.cleanupLeftoverFolder(
+                cleanupScope,
+                cleanupInputs,
+                seriesFolderPath,
+                sonarrMedia.title,
               );
               return true;
             }
@@ -382,6 +537,220 @@ export class SonarrActionHandler {
     return false;
   }
 
+  /**
+   * The torrents a season/episode delete fully covers: those whose every backed
+   * episode is in the deleted set. A season/series pack also backs episodes that
+   * are kept, so it is excluded. Keyed on Sonarr's episodeId - this is the only
+   * safeguard for a lone pack, since removeDownloads' cross-seed guard protects
+   * torrents that share a content path, not one torrent backing several wanted
+   * episodes. Fails closed: returns [] whenever coverage cannot be proven.
+   */
+  private async resolveCoveredDownloadIds(
+    sonarrApiClient: Awaited<ReturnType<ServarrService['getSonarrApiClient']>>,
+    sonarrMedia: SonarrSeries,
+    type: 'season' | 'episode',
+    mediaData?: MediaItem,
+    // The handler's once-resolved, fail-closed season number (#3415) - not
+    // re-derived here so the guard cannot be bypassed by a future edit.
+    seasonNumber?: number,
+  ): Promise<string[]> {
+    try {
+      // The deleted set comes from Sonarr's episode list (what the delete acts
+      // on), not history, so it matches the files actually removed.
+      let deletedEpisodes: SonarrEpisode[];
+      if (type === 'season') {
+        if (seasonNumber === undefined || seasonNumber === null) {
+          this.logger.debug(
+            `[Sonarr] Skipping download cleanup for '${sonarrMedia.title}': season number could not be determined.`,
+          );
+          return [];
+        }
+        deletedEpisodes = await sonarrApiClient.getEpisodes(
+          sonarrMedia.id,
+          seasonNumber,
+        );
+      } else {
+        const lookup = this.getEpisodeLookup(mediaData);
+        if (!lookup || lookup.episodeNumbers.length === 0) {
+          this.logger.debug(
+            `[Sonarr] Skipping download cleanup for '${sonarrMedia.title}': episode(s) could not be identified (e.g. air-date only).`,
+          );
+          return [];
+        }
+        deletedEpisodes = await sonarrApiClient.getEpisodes(
+          sonarrMedia.id,
+          lookup.seasonNumber,
+          lookup.episodeNumbers,
+        );
+      }
+
+      const deletedEpisodeIds = new Set(deletedEpisodes.map((e) => e.id));
+      if (deletedEpisodeIds.size === 0) {
+        this.logger.debug(
+          `[Sonarr] Skipping download cleanup for '${sonarrMedia.title}': no matching episodes resolved.`,
+        );
+        return [];
+      }
+
+      const history = await sonarrApiClient.getSeriesDownloadHistory(
+        sonarrMedia.id,
+      );
+      if (history.length === 0) {
+        this.logger.debug(
+          `[Sonarr] Skipping download cleanup for '${sonarrMedia.title}': no download history found.`,
+        );
+        return [];
+      }
+
+      const episodesByHash = new Map<string, Set<number | undefined>>();
+      for (const item of history) {
+        let episodes = episodesByHash.get(item.hash);
+        if (!episodes) {
+          episodes = new Set();
+          episodesByHash.set(item.hash, episodes);
+        }
+        episodes.add(item.episodeId);
+      }
+
+      const covered: string[] = [];
+      for (const [hash, episodes] of episodesByHash) {
+        const fullyCovered = [...episodes].every(
+          (episodeId) =>
+            episodeId !== undefined && deletedEpisodeIds.has(episodeId),
+        );
+        if (fullyCovered) {
+          covered.push(hash);
+        } else {
+          this.logger.debug(
+            `[Sonarr] Keeping download ${hash} for '${sonarrMedia.title}': it also backs episodes outside this delete.`,
+          );
+        }
+      }
+
+      return covered;
+    } catch (error) {
+      this.logger.debug(
+        `[Sonarr] Download cleanup coverage check failed for '${sonarrMedia.title}'; skipping. ${error}`,
+      );
+      return [];
+    }
+  }
+
+  /**
+   * The fences the leftover-folder cleanup needs, read before the delete since
+   * the episode files are consumed by it: the root folders it may act inside,
+   * the file paths that prove the folder is the one just emptied, the other
+   * series folders it must not touch, and - for a season - the folder itself.
+   *
+   * Every read here is uncached: these fence a filesystem delete, and a series
+   * or a moved file that the cached snapshot predates would leave the fence
+   * blind to it.
+   *
+   * The season folder is read from the episode files themselves - Sonarr's
+   * season-folder naming is configurable, so it is never derived from the
+   * season number. It stays undefined when the series has no season folders
+   * (episodes live in the series root, shared across seasons) or when the
+   * season's files do not all sit in one folder, which skips the cleanup.
+   */
+  private async collectCleanupInputs(
+    sonarrApiClient: Awaited<ReturnType<ServarrService['getSonarrApiClient']>>,
+    sonarrMedia: SonarrSeries,
+    seasonNumber: number | undefined,
+  ): Promise<SonarrCleanupInputs | undefined> {
+    try {
+      const [rootFolders, allSeries, episodeFiles] = await Promise.all([
+        sonarrApiClient.getRootFolders({ fresh: true }),
+        sonarrApiClient.getSeries(),
+        sonarrApiClient.getEpisodeFiles(sonarrMedia.id),
+      ]);
+
+      // undefined = the listing failed, so what it would have fenced is
+      // unknown - not "nothing". Skip rather than fence on a guess: an empty
+      // deleted-file list drops the proof that this is the folder the delete
+      // emptied, and an empty series list drops the fence that keeps the
+      // cleanup off another tracked item's folder.
+      if (episodeFiles === undefined || allSeries === undefined) {
+        return undefined;
+      }
+
+      const isSeasonScope = seasonNumber !== undefined && seasonNumber !== null;
+      const deletedFilePaths = episodeFiles
+        .filter((file) => !isSeasonScope || file.seasonNumber === seasonNumber)
+        .map((file) => file.path)
+        .filter((p): p is string => !!p);
+      if (deletedFilePaths.length === 0) {
+        return undefined;
+      }
+
+      const seasonFolders = new Set(deletedFilePaths.map((p) => dirname(p)));
+
+      return {
+        fences: {
+          rootFolderPaths: (rootFolders ?? [])
+            .map((folder) => folder.path)
+            .filter((p): p is string => !!p),
+          deletedFilePaths,
+          otherItemPaths: allSeries
+            .filter((series) => series.id !== sonarrMedia.id)
+            .map((series) => series.path)
+            .filter((p): p is string => !!p),
+        },
+        seasonFolderPath:
+          isSeasonScope && sonarrMedia.seasonFolder && seasonFolders.size === 1
+            ? [...seasonFolders][0]
+            : undefined,
+      };
+    } catch (error) {
+      this.logger.debug(
+        `[Sonarr] Couldn't resolve the leftover cleanup inputs: ${error}`,
+      );
+      return undefined;
+    }
+  }
+
+  /**
+   * Removes the folder the delete just stranded. Which folder that is comes
+   * from the `leftoverCleanupScope` captured before the delete, so the option
+   * the UI offered and the folder the handler removes cannot drift apart.
+   */
+  private async cleanupLeftoverFolder(
+    scope: LeftoverCleanupScope | undefined,
+    inputs: SonarrCleanupInputs | undefined,
+    seriesFolderPath: string | undefined,
+    label: string | undefined,
+  ): Promise<void> {
+    if (!inputs) {
+      return;
+    }
+
+    switch (scope) {
+      case 'series':
+        await this.folderCleanup.cleanupAfterDelete({
+          ...inputs.fences,
+          folderPath: seriesFolderPath,
+          scope,
+          label,
+        });
+        return;
+      case 'season':
+        if (!inputs.seasonFolderPath) {
+          return;
+        }
+        await this.folderCleanup.cleanupAfterDelete({
+          ...inputs.fences,
+          folderPath: inputs.seasonFolderPath,
+          scope,
+          parentPath: seriesFolderPath,
+          label,
+        });
+        return;
+      default:
+        // 'movie' is Radarr's scope and undefined means nothing is stranded;
+        // neither is reachable for a Sonarr collection type.
+        return;
+    }
+  }
+
   private getEpisodeLookup(mediaData?: MediaItem):
     | {
         seasonNumber: number;
@@ -431,21 +800,21 @@ export class SonarrActionHandler {
     tmdbId: number | undefined,
     removedSeasonNumber: number | undefined,
     listExclusions: boolean | undefined,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const series = await this.refetchSeries(sonarrApiClient, lookupCandidate);
 
     if (!series?.id) {
       this.logger.debug(
         `[Sonarr] Skipping empty-show cleanup: series refetch returned no result for ${lookupCandidate.providerKey} id ${lookupCandidate.id}`,
       );
-      return;
+      return false;
     }
 
     if (!this.isShowEmpty(series, 'files')) {
       this.logger.debug(
         `[Sonarr] Show '${series.title}' still has ${series.statistics?.episodeFileCount ?? 0} episode file(s) - skipping show deletion`,
       );
-      return;
+      return false;
     }
 
     const hasSeerrCheckInputs =
@@ -462,41 +831,48 @@ export class SonarrActionHandler {
         this.logger.debug(
           `[Sonarr] Show '${series.title}' has other active Seerr season requests - skipping show deletion`,
         );
-        return;
+        return false;
       }
 
       if (hasRemainingRequests === undefined) {
         this.logger.debug(
           `[Sonarr] Show '${series.title}' Seerr state could not be determined - skipping show deletion`,
         );
-        return;
+        return false;
       }
 
-      await sonarrApiClient.deleteShow(series.id, true, listExclusions);
+      if (
+        !(await sonarrApiClient.deleteShow(series.id, true, listExclusions))
+      ) {
+        return false;
+      }
       this.logger.log(
         `[Sonarr] Show '${series.title}' has no files and no remaining Seerr season requests - deleted from Sonarr`,
       );
-      return;
+      return true;
     }
 
     // No-Seerr fallback. The file gate above already proved the show has no
     // episode files; `ended` confirms no further episodes are coming. We do
     // NOT additionally require every season to be unmonitored: Sonarr carries
     // every TVDB season on the series, including ones the user never
-    // downloaded, and those stay monitored forever — which would block
+    // downloaded, and those stay monitored forever - which would block
     // deletion of a genuinely empty, ended show indefinitely (issue #2757 /
     // #2891: e.g. a show where the user only ever had seasons 1-4).
     if (series.status !== 'ended') {
       this.logger.debug(
         `[Sonarr] Show '${series.title}' has no episode files but is not ended (status=${series.status}) - skipping show deletion`,
       );
-      return;
+      return false;
     }
 
-    await sonarrApiClient.deleteShow(series.id, true, listExclusions);
+    if (!(await sonarrApiClient.deleteShow(series.id, true, listExclusions))) {
+      return false;
+    }
     this.logger.log(
       `[Sonarr] Show '${series.title}' is ended with no episode files remaining - deleted from Sonarr`,
     );
+    return true;
   }
 
   private async unmonitorShowIfEmptyAndEnded(
@@ -556,13 +932,13 @@ export class SonarrActionHandler {
     // 'monitored': the show counts as empty once no season is still both
     // monitored AND holding files. Seasons the user never downloaded stay
     // monitored on the series object indefinitely (Sonarr carries every TVDB
-    // season) and have zero files — they must not count as monitored content,
+    // season) and have zero files - they must not count as monitored content,
     // or a genuinely finished show could never be unmonitored (#2757 / #2891).
     //
     // A monitored season is only treated as empty when Sonarr *explicitly*
     // reports zero files. season.statistics is optional; if it's absent the
     // file count is unknown, so the season is treated as still having content
-    // (conservative — never unmonitor a show on an assumption).
+    // (conservative - never unmonitor a show on an assumption).
     return series.seasons.every(
       (season) =>
         !season.monitored || season.statistics?.episodeFileCount === 0,

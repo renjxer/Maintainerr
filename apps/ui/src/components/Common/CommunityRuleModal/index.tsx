@@ -1,4 +1,5 @@
 import { UploadIcon } from '@heroicons/react/solid'
+import { Trans, useLingui } from '@lingui/react/macro'
 import { compareVersions } from 'compare-versions'
 import { useEffect, useMemo, useState } from 'react'
 import GetApiHandler, { PostApiHandler } from '../../../utils/ApiHandler'
@@ -40,13 +41,14 @@ export interface ICommunityRule {
 }
 
 const CommunityRuleModal = (props: ICommunityRuleModal) => {
+  const { t } = useLingui()
   const [communityRules, setCommunityRules] = useState<ICommunityRule[]>([])
   const [error, setError] = useState(false)
   const [loading, setLoading] = useState<boolean>(true)
   const [currentPage, setCurrentPage] = useState<number>(1)
   const [selectedRule, setSelectedRule] = useState<number | undefined>()
   const [history, setHistory] = useState<ICommunityRuleKarmaHistory[]>([])
-  const [showInfo, setInfo] = useState<boolean>(false)
+  const [showInfo, setShowInfo] = useState<boolean>(false)
   const [uploadMyRules, setUploadMyRules] = useState<boolean>(false)
   const [appVersion, setAppVersion] = useState<string>('0.0.0')
   const [searchText, setSearchText] = useState<string>('')
@@ -226,7 +228,7 @@ const CommunityRuleModal = (props: ICommunityRuleModal) => {
         backgroundClickable={false}
         onCancel={props.onCancel}
         size="5xl"
-        title="Community Rules"
+        title={t`Community Rules`}
         iconSvg=""
         footerActions={
           <Button
@@ -235,13 +237,16 @@ const CommunityRuleModal = (props: ICommunityRuleModal) => {
             disabled={selectedRule == null}
             onClick={handleSubmit}
           >
-            Import
+            <Trans>Import</Trans>
           </Button>
         }
       >
         <div>
           <Alert type="info">
-            {`Import rules made by the community. This will override your current rules.`}
+            <Trans>
+              Import rules made by the community. This will override your
+              current rules.
+            </Trans>
           </Alert>
         </div>
         <SearchBar
@@ -257,16 +262,24 @@ const CommunityRuleModal = (props: ICommunityRuleModal) => {
                     <tbody className="divide-y divide-zinc-600 bg-zinc-800">
                       <tr>
                         <th className="w-60 truncate bg-gray-500 px-4 py-3 text-xs font-medium text-gray-200 uppercase md:w-80">
-                          <span>Name</span>
+                          <span>
+                            <Trans>Name</Trans>
+                          </span>
                         </th>
                         <th className="truncate bg-gray-500 text-center text-xs font-medium text-gray-200 uppercase">
-                          <span>Karma</span>
+                          <span>
+                            <Trans>Karma</Trans>
+                          </span>
                         </th>
                         <th className="truncate bg-gray-500 px-3 text-center text-xs font-medium text-gray-200 uppercase">
-                          <span>Uploaded By</span>
+                          <span>
+                            <Trans>Uploaded By</Trans>
+                          </span>
                         </th>
                         <th className="truncate bg-gray-500 px-3 text-center text-xs font-medium text-gray-200 uppercase">
-                          <span>Made with Version</span>
+                          <span>
+                            <Trans>Made with Version</Trans>
+                          </span>
                         </th>
                       </tr>
                       {error ? (
@@ -275,8 +288,10 @@ const CommunityRuleModal = (props: ICommunityRuleModal) => {
                             colSpan={4}
                             className="px-4 py-4 text-center font-semibold text-maintainerr"
                           >
-                            An error occurred fetching community rules. Please
-                            try again later.
+                            <Trans>
+                              An error occurred fetching community rules. Please
+                              try again later.
+                            </Trans>
                           </td>
                         </tr>
                       ) : (
@@ -287,8 +302,10 @@ const CommunityRuleModal = (props: ICommunityRuleModal) => {
                                 colSpan={4}
                                 className="px-4 py-4 text-center text-white"
                               >
-                                No community rules found for this type &
-                                Maintainerr version.
+                                <Trans>
+                                  No community rules found for this type &
+                                  Maintainerr version.
+                                </Trans>
                               </td>
                             </tr>
                           ) : (
@@ -299,7 +316,9 @@ const CommunityRuleModal = (props: ICommunityRuleModal) => {
                                     colSpan={4}
                                     className="px-4 py-4 text-center text-white"
                                   >
-                                    No community rules found for this search.
+                                    <Trans>
+                                      No community rules found for this search.
+                                    </Trans>
                                   </td>
                                 </tr>
                               ) : (
@@ -310,7 +329,7 @@ const CommunityRuleModal = (props: ICommunityRuleModal) => {
                                         key={index}
                                         clicked={selectedRule === cr.id}
                                         onClick={handleClick}
-                                        onDoubleClick={() => setInfo(true)}
+                                        onDoubleClick={() => setShowInfo(true)}
                                         thumbsActive={
                                           history.find(
                                             (e) =>
@@ -339,24 +358,22 @@ const CommunityRuleModal = (props: ICommunityRuleModal) => {
             <div className="">
               <span className="float-left">
                 <InfoButton
-                  text="Info"
+                  text={t`Info`}
                   enabled={selectedRule != null}
-                  onClick={() => setInfo(true)}
+                  onClick={() => setShowInfo(true)}
                 />
               </span>
               <span className="float-right">
-                <button
-                  disabled={false}
-                  className="mb-2 flex h-9 w-fit rounded-sm bg-zinc-900 text-zinc-200 shadow-md hover:bg-zinc-800 disabled:opacity-50 md:ml-2"
+                <Button
+                  buttonType="success"
+                  className="mb-2 md:ml-2"
                   onClick={() => {
                     setUploadMyRules(true)
                   }}
                 >
-                  {<UploadIcon className="m-auto ml-5 h-5" />}{' '}
-                  <p className="rules-button-text m-auto mr-5 ml-1">
-                    Upload my rules
-                  </p>
-                </button>
+                  <UploadIcon className="mr-2 h-5 w-5" />
+                  <Trans>Upload my rules</Trans>
+                </Button>
               </span>
             </div>
             <Pagination
@@ -374,9 +391,9 @@ const CommunityRuleModal = (props: ICommunityRuleModal) => {
         {showInfo ? (
           <Modal
             loading={false}
-            onCancel={() => setInfo(false)}
-            cancelText="Close"
-            title="Community Rule Description"
+            onCancel={() => setShowInfo(false)}
+            cancelText={t`Close`}
+            title={t`Community Rule Description`}
             iconSvg=""
           >
             <div className="block max-h-full w-full max-w-full overflow-auto bg-zinc-600 p-3 text-zinc-200">

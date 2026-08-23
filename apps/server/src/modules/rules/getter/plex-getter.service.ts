@@ -7,6 +7,7 @@ import { Injectable } from '@nestjs/common';
 import { SimplePlexUser } from '../../..//modules/api/plex-api/interfaces/library.interfaces';
 import { PlexApiService } from '../../../modules/api/plex-api/plex-api.service';
 import { PlexAdapterService } from '../../api/media-server/plex/plex-adapter.service';
+import { PlexMapper } from '../../api/media-server/plex/plex.mapper';
 import { PlexMetadata } from '../../api/plex-api/interfaces/media.interface';
 import { MaintainerrLogger } from '../../logging/logs.service';
 import {
@@ -14,8 +15,18 @@ import {
   Property,
   RuleConstants,
 } from '../constants/rules.constants';
-import { RulesDto } from '../dtos/rules.dto';
-import { buildCollectionExcludeNames } from '../helpers/collection-exclude.helper';
+import { RuleGroupDto } from '../dtos/ruleGroup.dto';
+import { ArrLookupCache } from '../helpers/arr-lookup-cache';
+import {
+  countRuleCollectionNames,
+  definedUniqueValues,
+  filterRuleCollectionNames,
+  getParentBackedRuleItem,
+  mapMatchingRuleUsersToNames,
+  trimRulePropertyNames,
+  uniqueTrimmedRulePropertyNames,
+} from '../helpers/rule-property.helper';
+import { MetadataRuleValueService } from './metadata-rule-value.service';
 
 @Injectable()
 export class PlexGetterService {
@@ -25,6 +36,7 @@ export class PlexGetterService {
   constructor(
     private readonly plexApi: PlexApiService,
     private readonly plexAdapter: PlexAdapterService,
+    private readonly metadataRuleValueService: MetadataRuleValueService,
     private readonly logger: MaintainerrLogger,
   ) {
     logger.setContext(PlexGetterService.name);
@@ -38,10 +50,23 @@ export class PlexGetterService {
     id: number,
     libItem: MediaItem,
     dataType?: MediaItemType,
-    ruleGroup?: RulesDto,
+    ruleGroup?: RuleGroupDto,
+    arrLookupCache?: ArrLookupCache,
   ): Promise<RuleValueType> {
     try {
       const prop = this.plexProperties.find((el) => el.id === id);
+
+      if (prop?.name === 'studios') {
+        return await this.metadataRuleValueService.getStudios(
+          libItem,
+          arrLookupCache,
+        );
+      }
+
+      // Which library's prefetched watch-history snapshot may answer the reads
+      // below. Absent (a single-item rule test) means every watch read goes
+      // live rather than risk another library's snapshot.
+      const libraryId = ruleGroup?.libraryId;
 
       // fetch metadata, parent & grandparent from cache, this data is more complete
       // libItem.id maps to Plex's ratingKey
@@ -72,6 +97,16 @@ export class PlexGetterService {
         return grandparentPromise;
       };
 
+      // The show a season/episode belongs to. Undefined for anything else, so
+      // the `*Show` properties answer `null` (does not apply) instead of
+      // throwing into the transient signal - same as Jellyfin and Emby.
+      const getShowMetadata = async (): Promise<PlexMetadata | undefined> =>
+        metadata?.type === 'season'
+          ? getParent()
+          : metadata?.type === 'episode'
+            ? getGrandparent()
+            : undefined;
+
       switch (prop.name) {
         case 'addDate': {
           return metadata.addedAt ? new Date(+metadata.addedAt * 1000) : null;
@@ -83,11 +118,17 @@ export class PlexGetterService {
           const plexUsers = await this.plexApi.getCorrectedUsers(false);
           const viewers = await this.plexApi.getWatchHistory(
             metadata.ratingKey,
+            true,
+            metadata.type,
+            libraryId,
           );
           const viewerIds = viewers.map((el) => +el.accountID);
-          return plexUsers
-            .filter((el) => viewerIds.includes(el.plexId))
-            .map((el) => el.username);
+          return mapMatchingRuleUsersToNames(
+            viewerIds,
+            plexUsers,
+            (user) => user.plexId,
+            (user) => user.username,
+          );
         }
         case 'releaseDate': {
           return new Date(metadata.originallyAvailableAt)
@@ -110,7 +151,6 @@ export class PlexGetterService {
           const watchState = await this.plexAdapter.getWatchState(
             metadata.ratingKey,
             libItem.viewCount,
-            libItem.title,
           );
           return watchState.viewCount;
         }
@@ -118,43 +158,40 @@ export class PlexGetterService {
           const watchState = await this.plexAdapter.getWatchState(
             metadata.ratingKey,
             libItem.viewCount,
-            libItem.title,
           );
           return watchState.isWatched;
         }
         case 'labels': {
-          const item =
-            metadata.type === 'episode'
-              ? ((await getGrandparent()) ?? metadata)
-              : metadata.type === 'season'
-                ? ((await getParent()) ?? metadata)
-                : metadata;
+          const item = await getParentBackedRuleItem(
+            metadata.type,
+            metadata,
+            getParent,
+            getGrandparent,
+          );
 
           return item.Label ? item.Label.map((l) => l.tag) : [];
         }
         case 'collections': {
-          const excludeNames = buildCollectionExcludeNames(ruleGroup);
-          return metadata.Collection
-            ? metadata.Collection.filter(
-                (el) => !excludeNames.includes(el.tag.toLowerCase().trim()),
-              ).length
-            : 0;
+          return countRuleCollectionNames(
+            metadata.Collection?.map((collection) => collection.tag) ?? [],
+            ruleGroup,
+          );
         }
         case 'sw_collections_including_parent': {
           const parent = await getParent();
           const grandparent = await getGrandparent();
-          const combinedCollections = [
-            ...(metadata?.Collection || []),
-            ...(parent?.Collection || []),
-            ...(grandparent?.Collection || []),
-          ];
-
-          const excludeNames = buildCollectionExcludeNames(ruleGroup);
-          return combinedCollections
-            ? combinedCollections.filter(
-                (el) => !excludeNames.includes(el.tag.toLowerCase().trim()),
-              ).length
-            : 0;
+          return countRuleCollectionNames(
+            [
+              ...(metadata.Collection?.map((collection) => collection.tag) ??
+                []),
+              ...(parent?.Collection?.map((collection) => collection.tag) ??
+                []),
+              ...(grandparent?.Collection?.map(
+                (collection) => collection.tag,
+              ) ?? []),
+            ],
+            ruleGroup,
+          );
         }
         case 'playlists': {
           if (metadata.type !== 'episode' && metadata.type !== 'movie') {
@@ -214,46 +251,56 @@ export class PlexGetterService {
                 });
               }
             }
-            return filtered ? filtered.map((el) => el.title.trim()) : [];
+            return trimRulePropertyNames(filtered.map((el) => el.title));
           } else {
             const playlists = await this.plexApi.getPlaylists(
               metadata.ratingKey,
             );
-            return playlists ? playlists.map((el) => el.title.trim()) : [];
+            return trimRulePropertyNames(
+              playlists ? playlists.map((el) => el.title) : [],
+            );
           }
         }
         case 'collection_names': {
-          return metadata.Collection
-            ? metadata.Collection.map((el) => el.tag.trim())
-            : [];
+          return trimRulePropertyNames(
+            metadata.Collection?.map((collection) => collection.tag) ?? [],
+          );
         }
         case 'sw_collection_names_including_parent': {
           const parent = await getParent();
           const grandparent = await getGrandparent();
-          const combinedCollections = [
-            ...(metadata?.Collection || []),
-            ...(parent?.Collection || []),
-            ...(grandparent?.Collection || []),
-          ];
-
-          return combinedCollections
-            ? combinedCollections.map((el) => el.tag.trim())
-            : null;
+          return trimRulePropertyNames([
+            ...(metadata.Collection?.map((collection) => collection.tag) ?? []),
+            ...(parent?.Collection?.map((collection) => collection.tag) ?? []),
+            ...(grandparent?.Collection?.map((collection) => collection.tag) ??
+              []),
+          ]);
         }
         case 'lastViewedAt': {
           // Errors must surface so the outer catch returns `undefined` for an
           // unknown watch state instead of collapsing the failure into a
           // confirmed never-watched `null`.
-          const seenby = await this.plexApi.getWatchHistory(metadata.ratingKey);
-          if (seenby && seenby.length > 0) {
-            return new Date(
-              +seenby
-                .map((el) => el.viewedAt)
-                .sort()
-                .reverse()[0] * 1000,
-            );
-          }
-          return null;
+          const seenby = await this.plexApi.getWatchHistory(
+            metadata.ratingKey,
+            true,
+            metadata.type,
+            libraryId,
+          );
+          // Marking something played by hand, or a scrobble from an external
+          // tracker, moves the item's own lastViewedAt without writing a
+          // history row - so start from that and let any newer view win.
+          const newest = (seenby ?? []).reduce(
+            (latest, el) => Math.max(latest, el.viewedAt * 1000),
+            libItem.lastViewedAt?.getTime() ?? 0,
+          );
+          return newest > 0 ? new Date(newest) : null;
+        }
+        case 'lastPlayedAt': {
+          // Plex moves the item's own lastViewedAt on any playback but only
+          // writes a history row for a completed view, so the item field alone
+          // is the last play attempt (verified on 1.43). It therefore reports
+          // the same value lastViewedAt does on Plex.
+          return libItem.lastViewedAt ?? null;
         }
         case 'fileVideoResolution': {
           return metadata.Media[0].videoResolution
@@ -269,12 +316,12 @@ export class PlexGetterService {
             : null;
         }
         case 'genre': {
-          const item =
-            metadata.type === 'episode'
-              ? ((await getGrandparent()) ?? metadata)
-              : metadata.type === 'season'
-                ? ((await getParent()) ?? metadata)
-                : metadata;
+          const item = await getParentBackedRuleItem(
+            metadata.type,
+            metadata,
+            getParent,
+            getGrandparent,
+          );
           return item.Genre ? item.Genre.map((el) => el.tag) : null;
         }
         case 'sw_allEpisodesSeenBy': {
@@ -290,11 +337,14 @@ export class PlexGetterService {
               season.ratingKey,
             );
             for (const episode of episodes) {
-              // Errors propagate to the outer catch — silently treating a
+              // Errors propagate to the outer catch - silently treating a
               // failed lookup as "no viewers" would drop genuine viewers from
               // `allViewers` and mark the show as unwatched-by-everyone.
               const viewers = await this.plexApi.getWatchHistory(
                 episode.ratingKey,
+                true,
+                'episode',
+                libraryId,
               );
 
               const arrLength = allViewers.length - 1;
@@ -313,15 +363,18 @@ export class PlexGetterService {
 
           if (allViewers && allViewers.length > 0) {
             const viewerIds = allViewers.map((el) => +el.plexId);
-            return plexUsers
-              .filter((el) => viewerIds.includes(el.plexId))
-              .map((el) => el.username);
+            return mapMatchingRuleUsersToNames(
+              viewerIds,
+              plexUsers,
+              (user) => user.plexId,
+              (user) => user.username,
+            );
           }
 
           return [];
         }
         // At season/show level this returns the UNION of users that watched
-        // any descendant episode — not the intersection. Plex's per-show
+        // any descendant episode - not the intersection. Plex's per-show
         // watch history aggregates child views, so any account that watched
         // at least one episode appears here. Use `sw_allEpisodesSeenBy` when
         // you need "watched every episode" semantics instead.
@@ -330,6 +383,9 @@ export class PlexGetterService {
 
           const watchHistory = await this.plexApi.getWatchHistory(
             metadata.ratingKey,
+            true,
+            metadata.type,
+            libraryId,
           );
 
           const viewers = watchHistory
@@ -338,24 +394,35 @@ export class PlexGetterService {
           const uniqueViewers = [...new Set(viewers)];
 
           if (uniqueViewers && uniqueViewers.length > 0) {
-            return plexUsers
-              .filter((el) => uniqueViewers.includes(+el.plexId))
-              .map((el) => el.username);
+            return mapMatchingRuleUsersToNames(
+              uniqueViewers,
+              plexUsers,
+              (user) => +user.plexId,
+              (user) => user.username,
+            );
           }
           return [];
         }
         case 'sw_lastWatched': {
-          let watchHistory = await this.plexApi.getWatchHistory(
+          const watchHistory = await this.plexApi.getWatchHistory(
             metadata.ratingKey,
+            true,
+            metadata.type,
+            libraryId,
           );
-          watchHistory?.sort((a, b) => a.parentIndex - b.parentIndex).reverse();
-          watchHistory = watchHistory?.filter(
+          // getWatchHistory returns [] for a confirmed-empty history (it throws
+          // on a real outage). [] is truthy and the sort/filter below index
+          // watchHistory[0], so guard up front: "never watched" returns null
+          // (confirmed absent) rather than reading viewedAt off undefined (#3083).
+          if (!watchHistory.length) {
+            return null;
+          }
+          watchHistory.sort((a, b) => b.parentIndex - a.parentIndex);
+          const newestSeason = watchHistory.filter(
             (el) => el.parentIndex === watchHistory[0].parentIndex,
           );
-          watchHistory?.sort((a, b) => a.index - b.index).reverse();
-          return watchHistory
-            ? new Date(+watchHistory[0].viewedAt * 1000)
-            : null;
+          newestSeason.sort((a, b) => b.index - a.index);
+          return new Date(+newestSeason[0].viewedAt * 1000);
         }
         case 'sw_episodes': {
           if (metadata.type === 'season') {
@@ -380,6 +447,9 @@ export class PlexGetterService {
             for (const episode of episodes) {
               const views = await this.plexApi.getWatchHistory(
                 episode.ratingKey,
+                true,
+                'episode',
+                libraryId,
               );
               if (views?.length > 0) {
                 viewCount++;
@@ -388,6 +458,13 @@ export class PlexGetterService {
           }
           return viewCount;
         }
+        case 'sw_markedWatchedEpisodes': {
+          // Uses Plex's watched STATE (viewedLeafCount) instead of play history.
+          // Unlike sw_viewedEpisodes (which counts episodes with a play-history
+          // entry), this also counts episodes manually marked as watched: Plex
+          // updates viewedLeafCount for manual marks but records no play history.
+          return metadata.viewedLeafCount ? +metadata.viewedLeafCount : 0;
+        }
         case 'sw_amountOfViews': {
           let viewCount = 0;
 
@@ -395,6 +472,9 @@ export class PlexGetterService {
           if (metadata.type === 'episode') {
             const views = await this.plexApi.getWatchHistory(
               metadata.ratingKey,
+              true,
+              metadata.type,
+              libraryId,
             );
             viewCount =
               views?.length > 0 ? viewCount + views.length : viewCount;
@@ -411,6 +491,9 @@ export class PlexGetterService {
               for (const episode of episodes) {
                 const views = await this.plexApi.getWatchHistory(
                   episode.ratingKey,
+                  true,
+                  'episode',
+                  libraryId,
                 );
                 viewCount =
                   views?.length > 0 ? viewCount + views.length : viewCount;
@@ -456,48 +539,10 @@ export class PlexGetterService {
           // originallyAvailableAt is usually an ISO 8601 date string, no need to convert from epoch time
           return lastEpDate ? new Date(lastEpDate) : null;
         }
-        case 'watchlist_isListedByUsers': {
-          // returns a list of users that have this media item, or parent, in their watchlist
-          const parent = await getParent();
-          const grandparent = await getGrandparent();
-          const guid = grandparent
-            ? grandparent.guid
-            : parent
-              ? parent.guid
-              : metadata.guid;
-          const media_uuid = guid.match(/plex:\/\/[a-z]+\/([a-z0-9]+)$/);
-
-          const plexUsers: SimplePlexUser[] =
-            await this.plexApi.getCorrectedUsers();
-
-          // When plex.tv is unreachable, no users will have UUIDs.
-          // Return null to skip the rule rather than falsely report an empty watchlist.
-          if (
-            plexUsers.length > 0 &&
-            !plexUsers.some((u) => u.uuid !== undefined)
-          ) {
-            this.logger.warn(
-              'Unable to check watchlists: no user UUIDs available (plex.tv may be unreachable)',
-            );
-            return null;
-          }
-
-          const usernames: string[] = [];
-          for (const u of plexUsers.filter(
-            (u) => u.uuid !== undefined && media_uuid !== undefined,
-          )) {
-            const watchlist = await this.plexApi.getWatchlistIdsForUser(
-              u.uuid,
-              u.username,
-            );
-            if (watchlist?.find((i) => i.id === media_uuid[1]) !== undefined) {
-              usernames.push(u.username);
-            }
-          }
-
-          return usernames;
-        }
+        case 'watchlist_isListedByUsers':
         case 'watchlist_isWatchlisted': {
+          // returns the users that have this media item, or its parent, in
+          // their watchlist
           const parent = await getParent();
           const grandparent = await getGrandparent();
           const guid = grandparent
@@ -505,36 +550,18 @@ export class PlexGetterService {
             : parent
               ? parent.guid
               : metadata.guid;
-          const media_uuid = guid.match(/plex:\/\/[a-z]+\/([a-z0-9]+)$/);
 
-          const plexUsers: SimplePlexUser[] =
-            await this.plexApi.getCorrectedUsers();
+          const asBoolean = prop.name === 'watchlist_isWatchlisted';
+          const usernames = await this.getWatchlistedByUsernames(
+            guid,
+            asBoolean,
+          );
 
-          // When plex.tv is unreachable, no users will have UUIDs.
-          // Return null to skip the rule rather than falsely report an empty watchlist.
-          if (
-            plexUsers.length > 0 &&
-            !plexUsers.some((u) => u.uuid !== undefined)
-          ) {
-            this.logger.warn(
-              'Unable to check watchlists: no user UUIDs available (plex.tv may be unreachable)',
-            );
-            return null;
+          if (usernames === undefined) {
+            return undefined;
           }
 
-          for (const u of plexUsers.filter(
-            (u) => u.uuid !== undefined && media_uuid !== undefined,
-          )) {
-            const watchlist = await this.plexApi.getWatchlistIdsForUser(
-              u.uuid,
-              u.username,
-            );
-            if (watchlist?.find((i) => i.id === media_uuid[1]) !== undefined) {
-              return true;
-            }
-          }
-
-          return false;
+          return asBoolean ? usernames.length > 0 : usernames;
         }
         case 'sw_seasonLastEpisodeAiredAt': {
           const parent = await getParent();
@@ -581,10 +608,8 @@ export class PlexGetterService {
           );
         }
         case 'rating_imdbShow': {
-          const showMetadata =
-            metadata.type === 'season'
-              ? await getParent()
-              : await getGrandparent();
+          const showMetadata = await getShowMetadata();
+          if (!showMetadata) return null;
 
           return (
             showMetadata.Rating?.find(
@@ -593,10 +618,8 @@ export class PlexGetterService {
           );
         }
         case 'rating_rottenTomatoesCriticShow': {
-          const showMetadata =
-            metadata.type === 'season'
-              ? await getParent()
-              : await getGrandparent();
+          const showMetadata = await getShowMetadata();
+          if (!showMetadata) return null;
 
           return (
             showMetadata.Rating?.find(
@@ -605,10 +628,8 @@ export class PlexGetterService {
           );
         }
         case 'rating_rottenTomatoesAudienceShow': {
-          const showMetadata =
-            metadata.type === 'season'
-              ? await getParent()
-              : await getGrandparent();
+          const showMetadata = await getShowMetadata();
+          if (!showMetadata) return null;
 
           return (
             showMetadata.Rating?.find(
@@ -618,10 +639,8 @@ export class PlexGetterService {
           );
         }
         case 'rating_tmdbShow': {
-          const showMetadata =
-            metadata.type === 'season'
-              ? await getParent()
-              : await getGrandparent();
+          const showMetadata = await getShowMetadata();
+          if (!showMetadata) return null;
 
           return (
             showMetadata.Rating?.find(
@@ -657,12 +676,10 @@ export class PlexGetterService {
             }
           }
 
-          const excludeNames = buildCollectionExcludeNames(ruleGroup);
-          const normalCollectionCount = metadata.Collection
-            ? metadata.Collection.filter(
-                (el) => !excludeNames.includes(el.tag.toLowerCase().trim()),
-              ).length
-            : 0;
+          const normalCollectionCount = countRuleCollectionNames(
+            metadata.Collection?.map((collection) => collection.tag) ?? [],
+            ruleGroup,
+          );
 
           return normalCollectionCount + smartCollectionCount;
         }
@@ -687,23 +704,21 @@ export class PlexGetterService {
               smartCollection.ratingKey,
             );
 
-            const ratingKeys = [
+            const ratingKeys = definedUniqueValues([
               metadata.ratingKey,
               parent?.ratingKey,
               grandparent?.ratingKey,
-            ].filter((x) => x != null);
+            ]);
 
             smartCollectionCount += children.filter((x) =>
               ratingKeys.includes(x.ratingKey),
             ).length;
           }
 
-          const excludeNames = buildCollectionExcludeNames(ruleGroup);
-          const normalCollectionCount = combinedCollections
-            ? combinedCollections.filter(
-                (el) => !excludeNames.includes(el.tag.toLowerCase().trim()),
-              ).length
-            : 0;
+          const normalCollectionCount = countRuleCollectionNames(
+            combinedCollections.map((collection) => collection.tag),
+            ruleGroup,
+          );
 
           return normalCollectionCount + smartCollectionCount;
         }
@@ -722,25 +737,23 @@ export class PlexGetterService {
               smartCollection.ratingKey,
             );
 
-            const ratingKeys = [
+            const ratingKeys = definedUniqueValues([
               metadata.ratingKey,
               parent?.ratingKey,
               grandparent?.ratingKey,
-            ].filter((x) => x != null);
+            ]);
 
             if (children.some((x) => ratingKeys.includes(x.ratingKey))) {
               smartCollectionNames.push(smartCollection.title);
             }
           }
 
-          const combinedCollections = new Set([
+          return uniqueTrimmedRulePropertyNames([
             ...(metadata.Collection?.map((x) => x.tag) || []),
             ...(parent?.Collection?.map((x) => x.tag) || []),
             ...(grandparent?.Collection?.map((x) => x.tag) || []),
             ...smartCollectionNames,
           ]);
-
-          return Array.from(combinedCollections).map((el) => el.trim());
         }
         case 'collection_names_including_smart': {
           if (
@@ -770,27 +783,25 @@ export class PlexGetterService {
             }
           }
 
-          const combinedCollections = new Set([
+          return uniqueTrimmedRulePropertyNames([
             ...(metadata.Collection?.map((x) => x.tag) || []),
             ...smartCollectionNames,
           ]);
-
-          return Array.from(combinedCollections).map((el) => el.trim());
         }
         case 'collection_siblings_lastViewedAt': {
           // Aggregate "last view date" across every movie that shares a Plex
           // collection with this item, so one recently-watched sibling keeps
           // the whole set out of the delete pool.
           //
-          // We use getWatchHistory (/status/sessions/history/all) — not the
-          // per-child lastViewedAt field — because library metadata is scoped
+          // We use getWatchHistory (/status/sessions/history/all) - not the
+          // per-child lastViewedAt field - because library metadata is scoped
           // to the calling account (admin-only), while the history endpoint
           // returns every user's entries when called with an admin token.
           // Same pattern as the existing lastViewedAt rule (prop id 7).
-          const excludeNames = buildCollectionExcludeNames(ruleGroup);
-          const memberTags = (metadata.Collection ?? [])
-            .map((el) => el.tag.trim())
-            .filter((tag) => !excludeNames.includes(tag.toLowerCase()));
+          const memberTags = filterRuleCollectionNames(
+            metadata.Collection?.map((collection) => collection.tag) ?? [],
+            ruleGroup,
+          );
 
           if (memberTags.length === 0 || !ruleGroup?.libraryId) {
             return null;
@@ -816,6 +827,9 @@ export class PlexGetterService {
               // false delete on a recently-watched sibling collection.
               const history = await this.plexApi.getWatchHistory(
                 child.ratingKey,
+                true,
+                child.type,
+                libraryId,
               );
               for (const entry of history) {
                 if (entry.viewedAt && +entry.viewedAt > latest) {
@@ -841,5 +855,69 @@ export class PlexGetterService {
       );
       return undefined;
     }
+  }
+
+  /**
+   * The users whose plex.tv watchlist holds the item behind `guid`.
+   *
+   * `undefined` means the answer could not be established and must not be read
+   * as "nobody" (#3307). `stopAtFirstMatch` skips the remaining lookups once a
+   * user matches, for the boolean property.
+   */
+  private async getWatchlistedByUsernames(
+    guid: string | undefined,
+    stopAtFirstMatch: boolean,
+  ): Promise<string[] | undefined> {
+    // Watchlist entries are keyed on the Plex agent id, so an item without one
+    // cannot be correlated with any watchlist. Transient rather than an empty
+    // answer: a definitive one would let unmatched and personal media match a
+    // "not watchlisted" rule.
+    const plexAgentId = PlexMapper.extractPlexAgentId(guid);
+    if (!plexAgentId) {
+      return undefined;
+    }
+
+    const plexUsers: SimplePlexUser[] = await this.plexApi.getCorrectedUsers();
+
+    // When plex.tv is unreachable, no users will have UUIDs. This is a
+    // transient transport failure, so return `undefined` - `null` would
+    // read as "confirmed absent" and let the executor remove protected
+    // items (#3307).
+    if (plexUsers.length > 0 && !plexUsers.some((u) => u.uuid !== undefined)) {
+      this.logger.warn(
+        'Unable to check watchlists: no user UUIDs available (plex.tv may be unreachable)',
+      );
+      return undefined;
+    }
+
+    const usernames: string[] = [];
+    for (const user of plexUsers.filter((u) => u.uuid !== undefined)) {
+      const watchlist = await this.plexApi.getWatchlistIdsForUser(
+        user.uuid,
+        user.username,
+      );
+
+      // A failed fetch would silently understate the list, so surface it as
+      // transient instead of a confirmed answer.
+      if (watchlist === undefined) {
+        return undefined;
+      }
+
+      // A watchlist Plex refuses to share is permanently unreadable, so skip
+      // that user and let the others still decide the rule - blocking on it
+      // stalls the whole rule forever (#3395).
+      if (watchlist === null) {
+        continue;
+      }
+
+      if (watchlist.some((entry) => entry.id === plexAgentId)) {
+        usernames.push(user.username);
+        if (stopAtFirstMatch) {
+          break;
+        }
+      }
+    }
+
+    return usernames;
   }
 }

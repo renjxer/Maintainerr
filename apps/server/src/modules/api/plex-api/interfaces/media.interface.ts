@@ -8,6 +8,7 @@ export interface PlexMetadata {
   title: string;
   summary?: string;
   year?: number;
+  studio?: string;
   Guid: {
     id: string;
   }[];
@@ -23,6 +24,8 @@ export interface PlexMetadata {
   viewedLeafCount: number;
   addedAt: number;
   updatedAt: number;
+  viewCount?: number;
+  lastViewedAt?: number;
   media: Media[];
   parentData?: PlexMetadata;
   Label?: { tag: string }[];
@@ -37,6 +40,9 @@ export interface PlexMetadata {
   grandparentTitle?: string;
   Rating?: PlexRating[];
   contentRating?: string;
+  // /library/metadata/{id} and /search carry these; a child listing does not.
+  librarySectionID?: number;
+  librarySectionTitle?: string;
 }
 
 export interface PlexMediaPart {

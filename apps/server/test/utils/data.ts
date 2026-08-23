@@ -43,7 +43,7 @@ import {
   ResolvedMediaIds,
 } from '../../src/modules/metadata/interfaces/metadata.types';
 import { RuleDto } from '../../src/modules/rules/dtos/rule.dto';
-import { RulesDto } from '../../src/modules/rules/dtos/rules.dto';
+import { RuleGroupDto } from '../../src/modules/rules/dtos/ruleGroup.dto';
 
 export const createCollection = (
   properties: Partial<Collection> = {},
@@ -79,7 +79,12 @@ export const createCollection = (
     sonarrSettings: undefined,
     sonarrSettingsId: undefined,
     sonarrQualityProfileId: undefined,
+    sportarrSettings: undefined,
+    sportarrSettingsId: undefined,
+    sportarrQualityProfileId: undefined,
+    tagInArr: false,
     listExclusions: false,
+    cleanupLeftoverFolders: false,
     ruleGroup: undefined,
     visibleOnHome: false,
     visibleOnRecommended: false,
@@ -592,9 +597,9 @@ export const createSonarrEpisodeFile = (
   ...properties,
 });
 
-export const createRulesDto = (
-  properties: Partial<RulesDto> = {},
-): RulesDto => ({
+export const createRuleGroupDto = (
+  properties: Partial<RuleGroupDto> = {},
+): RuleGroupDto => ({
   id: faker.number.int(),
   libraryId: faker.number.int().toString(),
   dataType: faker.helpers.arrayElement([
@@ -641,6 +646,19 @@ export const createMockLogger = (): jest.Mocked<MaintainerrLogger> =>
     debug: jest.fn(),
   }) as unknown as jest.Mocked<MaintainerrLogger>;
 
+// Inert ServarrTagService double: the exclusion-tag gates report "disabled" so
+// the tagging side effects stay off unless a test opts in by overriding them.
+export const createMockServarrTagService = () =>
+  ({
+    syncMembershipTags: jest.fn().mockResolvedValue(undefined),
+    applyExclusionTag: jest.fn().mockResolvedValue(undefined),
+    removeExclusionTag: jest.fn().mockResolvedValue(undefined),
+    anyExclusionTaggingEnabled: jest.fn().mockReturnValue(false),
+    anyExclusionUntaggingEnabled: jest.fn().mockReturnValue(false),
+    exclusionTaggingEnabled: jest.fn().mockReturnValue(false),
+    exclusionUntaggingEnabled: jest.fn().mockReturnValue(false),
+  }) as any;
+
 type MetadataDetailsFixture = Partial<Omit<MetadataDetails, 'externalIds'>> & {
   externalIds?: Partial<ResolvedMediaIds> & Pick<ResolvedMediaIds, 'type'>;
 };
@@ -653,6 +671,7 @@ export interface MetadataProviderMockConfig {
   detailsId?: number;
   posterUrl?: string;
   backdropUrl?: string;
+  hierarchyOverview?: string;
   findByExternalId?: (
     externalId: string | number,
     type: string,
@@ -693,6 +712,7 @@ export const createMetadataProviderMock = ({
   detailsId,
   posterUrl,
   backdropUrl,
+  hierarchyOverview,
   findByExternalId,
 }: MetadataProviderMockConfig): jest.Mocked<IMetadataProvider> => {
   const resolvedDetails = details
@@ -719,6 +739,7 @@ export const createMetadataProviderMock = ({
     getBackdropUrl: jest
       .fn()
       .mockResolvedValue(backdropUrl ?? `https://${idKey}/backdrop.jpg`),
+    getHierarchyOverview: jest.fn().mockResolvedValue(hierarchyOverview),
     getPersonDetails: jest.fn(),
     findByExternalId: jest
       .fn()

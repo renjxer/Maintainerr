@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
+import { readItemPresence } from '../../api/media-server/item-presence.util';
 import { MediaServerFactory } from '../../api/media-server/media-server.factory';
 import { CollectionsService } from '../../collections/collections.service';
 import { Collection } from '../../collections/entities/collection.entities';
@@ -40,13 +41,18 @@ export class RuleMaintenanceService extends TaskBase {
         await this.removeLeftoverExclusions();
         // remove collection media entries for items deleted from media server
         await this.collectionsService.removeStaleCollectionMedia();
+        // Only prune orphaned collection rows against a reachable server. This
+        // drops the row without touching the media server (by design since
+        // f5826cc1), so running it during an outage can strand a collection
+        // whose delete had just failed. The guard was lost when the task moved
+        // to the media-server abstraction (174a5cb2).
+        await this.removeCollectionsWithoutRule();
       } else {
         this.logger.warn(
           'Skipping media server cleanup; media server was not reachable.',
         );
       }
 
-      await this.removeCollectionsWithoutRule();
       this.logger.log('Maintenance done');
     } catch (error) {
       this.logger.error('Rule Maintenance failed');
@@ -55,15 +61,19 @@ export class RuleMaintenanceService extends TaskBase {
   }
 
   private async removeLeftoverExclusions() {
-    // get all exclusions
     const exclusions = await this.rulesService.getAllExclusions();
     const mediaServer = await this.mediaServerFactory.getService();
-    // loop through exclusions
+
+    // `missing` is a confirmed absence only, so a transient failure never
+    // deletes the protection an exclusion provides.
+    const { missing } = await readItemPresence(
+      mediaServer,
+      exclusions.map((exclusion) => exclusion.mediaServerId),
+      (error) => this.logger.debug(error),
+    );
+
     for (const exclusion of exclusions) {
-      // check if media still exists
-      const resp = await mediaServer.getMetadata(exclusion.mediaServerId);
-      // remove when not
-      if (!resp?.id) {
+      if (missing.has(exclusion.mediaServerId)) {
         await this.rulesService.removeExclusion(exclusion.id);
       }
     }

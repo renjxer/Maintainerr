@@ -1,3 +1,4 @@
+import { Trans, useLingui } from '@lingui/react/macro'
 import {
   DocumentAddIcon,
   PlusCircleIcon,
@@ -13,6 +14,7 @@ import {
   SettingsFeedbackAlert,
   useSettingsFeedback,
 } from '../useSettingsFeedback'
+import ExclusionTagSettings from '../Servarr/ExclusionTagSettings'
 import ServarrSettingsModal from '../Servarr/ServarrSettingsModal'
 
 type DeleteSonarrSettingResponseDto =
@@ -39,6 +41,7 @@ export interface ISonarrSetting {
 }
 
 const SonarrSettings = () => {
+  const { t } = useLingui()
   const [loaded, setLoaded] = useState(false)
   const [settings, setSettings] = useState<ISonarrSetting[]>([])
   const [settingsModalActive, setSettingsModalActive] = useState<
@@ -47,8 +50,7 @@ const SonarrSettings = () => {
   const [collectionsInUseWarning, setCollectionsInUseWarning] = useState<
     ICollection[] | undefined
   >()
-  const { feedback, clear, showError, showInfo } =
-    useSettingsFeedback('Sonarr settings')
+  const { feedback, clear, showError, showInfo } = useSettingsFeedback()
 
   const handleSettingsSaved = (setting: ISonarrSetting) => {
     const newSettings = [...settings]
@@ -74,14 +76,14 @@ const SonarrSettings = () => {
           currentSettings.filter((setting) => setting.id !== id),
         )
         setSettingsModalActive(undefined)
-        showInfo('Sonarr server removed')
+        showInfo(t`Sonarr server removed`)
         return true
       }
 
       if (resp.data?.collectionsInUse) {
         setCollectionsInUseWarning(resp.data.collectionsInUse)
       } else {
-        showError('Failed to delete Sonarr setting.')
+        showError(t`Failed to delete Sonarr setting.`)
       }
     } catch (error: unknown) {
       void logClientError(
@@ -89,7 +91,7 @@ const SonarrSettings = () => {
         error,
         'Settings.Sonarr.confirmedDelete',
       )
-      showError('Failed to delete Sonarr setting. Check logs for details.')
+      showError(t`Failed to delete Sonarr setting. Check logs for details.`)
     }
 
     return false
@@ -109,16 +111,22 @@ const SonarrSettings = () => {
 
   return (
     <>
-      <title>Sonarr settings - Maintainerr</title>
+      <title>{t`Sonarr settings - Maintainerr`}</title>
       <div className="h-full w-full">
         <div className="section h-full w-full">
-          <h3 className="heading">Sonarr Settings</h3>
-          <p className="description">Sonarr configuration</p>
+          <h3 className="heading">
+            <Trans>Sonarr Settings</Trans>
+          </h3>
+          <p className="description">
+            <Trans>Sonarr configuration</Trans>
+          </p>
         </div>
 
         <SettingsFeedbackAlert feedback={feedback} />
 
-        <ul className="grid max-w-6xl grid-cols-1 gap-6 lg:grid-cols-2 xl:grid-cols-3">
+        {/* Reserve the card-row height so the list doesn't pop in / shift the
+            page (no layout shift) while the server list loads. */}
+        <ul className="grid min-h-39 max-w-6xl grid-cols-1 gap-6 lg:grid-cols-2 xl:grid-cols-3">
           {loaded
             ? settings.map((setting) => (
                 <li
@@ -129,7 +137,9 @@ const SonarrSettings = () => {
                     {setting.serverName}
                   </div>
                   <p className="mb-4 space-x-2 truncate text-gray-300">
-                    <span className="font-semibold">Address</span>
+                    <span className="font-semibold">
+                      <Trans>Address</Trans>
+                    </span>
                     <a href={setting.url} className="hover:underline">
                       {setting.url}
                     </a>
@@ -145,7 +155,9 @@ const SonarrSettings = () => {
                       }}
                     >
                       {<DocumentAddIcon className="m-auto" />}{' '}
-                      <p className="m-auto font-semibold">Edit</p>
+                      <p className="m-auto font-semibold">
+                        <Trans>Edit</Trans>
+                      </p>
                     </Button>
                     <DeleteButton
                       onDeleteRequested={() => {
@@ -161,19 +173,23 @@ const SonarrSettings = () => {
             <li className="flex h-full min-h-39 items-center justify-center rounded-xl border-2 border-dashed border-gray-400 bg-zinc-800 p-4 text-zinc-400 shadow-sm">
               <button
                 type="button"
-                className="add-button m-auto flex h-9 rounded-sm bg-maintainerr-600 px-4 text-zinc-200 shadow-md hover:bg-maintainerr"
+                className="add-button m-auto flex h-9 rounded-md bg-maintainerr-600 px-4 text-zinc-200 shadow-md hover:bg-maintainerr"
                 onClick={showAddModal}
               >
                 {<PlusCircleIcon className="m-auto h-5" />}
-                <p className="m-auto ml-1 font-semibold">Add server</p>
+                <p className="m-auto ml-1 font-semibold">
+                  <Trans>Add server</Trans>
+                </p>
               </button>
             </li>
           ) : null}
         </ul>
+
+        <ExclusionTagSettings service="sonarr" />
       </div>
       {settingsModalActive && (
         <ServarrSettingsModal
-          title="Sonarr Settings"
+          title={t`Sonarr Settings`}
           docsPage="Configuration/#sonarr"
           settingsPath="/settings/sonarr"
           testPath="/settings/test/sonarr"
@@ -192,7 +208,7 @@ const SonarrSettings = () => {
       )}
       {collectionsInUseWarning ? (
         <Modal
-          title="Server in-use"
+          title={t`Server in-use`}
           size="sm"
           footerActions={
             <Button
@@ -200,21 +216,25 @@ const SonarrSettings = () => {
               className="ml-3"
               onClick={() => setCollectionsInUseWarning(undefined)}
             >
-              Ok
+              <Trans>Ok</Trans>
             </Button>
           }
         >
-          <p className="mb-4">
-            This server is currently being used by the following rules:
-            <ul className="list-inside list-disc">
-              {collectionsInUseWarning.map((x) => (
-                <li key={x.id}>{x.title}</li>
-              ))}
-            </ul>
-          </p>
           <p>
-            You must re-assign these rules to a different server before
-            deleting.
+            <Trans>
+              This server is currently being used by the following rules:
+            </Trans>
+          </p>
+          <ul className="mb-4 list-inside list-disc">
+            {collectionsInUseWarning.map((x) => (
+              <li key={x.id}>{x.title}</li>
+            ))}
+          </ul>
+          <p>
+            <Trans>
+              You must re-assign these rules to a different server before
+              deleting.
+            </Trans>
           </p>
         </Modal>
       ) : undefined}
@@ -245,7 +265,7 @@ const DeleteButton = ({
     >
       {<TrashIcon className="m-auto" />}{' '}
       <p className="m-auto font-semibold">
-        {showSureDelete ? <>Are you sure?</> : <>Delete</>}
+        {showSureDelete ? <Trans>Are you sure?</Trans> : <Trans>Delete</Trans>}
       </p>
     </Button>
   )

@@ -1,8 +1,9 @@
+import { Trans, useLingui } from '@lingui/react/macro'
 import { useQualityProfiles } from '../../../../api/servarr'
 import { Select } from '../../../Forms/Select'
 
 interface QualityProfileSelectorProps {
-  type: 'Radarr' | 'Sonarr'
+  type: 'Radarr' | 'Sonarr' | 'Sportarr'
   settingId?: number | null
   qualityProfileId?: number | null
   onUpdate: (qualityProfileId?: number) => void
@@ -10,8 +11,11 @@ interface QualityProfileSelectorProps {
 }
 
 const QualityProfileSelector = (props: QualityProfileSelectorProps) => {
+  const { t } = useLingui()
+  // Named so the message carries {serviceName} rather than an opaque {0}.
+  const serviceName = props.type
   const { data: profiles = [], isLoading } = useQualityProfiles(
-    props.type.toLowerCase() as 'radarr' | 'sonarr',
+    props.type.toLowerCase() as 'radarr' | 'sonarr' | 'sportarr',
     props.settingId,
   )
 
@@ -21,9 +25,9 @@ const QualityProfileSelector = (props: QualityProfileSelectorProps) => {
   return (
     <div className="form-row items-center">
       <label htmlFor={`${props.type}-quality-profile`} className="text-label">
-        {props.type} quality profile *
+        <Trans>{serviceName} quality profile *</Trans>
         <p className="text-xs font-normal">
-          Target quality profile to change to
+          <Trans>Target quality profile to change to</Trans>
         </p>
       </label>
       <div className="form-input">
@@ -39,7 +43,7 @@ const QualityProfileSelector = (props: QualityProfileSelectorProps) => {
           >
             {selectedProfile === '-1' && (
               <option value="-1" disabled>
-                Select a quality profile
+                {t`Select a quality profile`}
               </option>
             )}
             {profiles.map((profile) => (
@@ -49,7 +53,7 @@ const QualityProfileSelector = (props: QualityProfileSelectorProps) => {
             ))}
             {isLoading && (
               <option value="" disabled>
-                Loading profiles...
+                {t`Loading profiles...`}
               </option>
             )}
           </Select>

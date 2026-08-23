@@ -1,5 +1,6 @@
-import { BasicResponseDto } from '@maintainerr/contracts';
+import { BasicResponseDto, stripTrailingSlashes } from '@maintainerr/contracts';
 import { Injectable } from '@nestjs/common';
+import { cloneDeep } from 'lodash';
 import { SettingsDataService } from '../../../modules/settings/settings-data.service';
 import {
   CONNECTION_TEST_TIMEOUT_MS,
@@ -10,6 +11,13 @@ import {
   MaintainerrLogger,
   MaintainerrLoggerFactory,
 } from '../../logging/logs.service';
+import { createPrefetchProgressReporter } from '../../../utils/prefetch-progress';
+import cacheManager from '../lib/cache';
+import {
+  SEERR_REQUESTS_CACHE_ID,
+  SEERR_REQUESTS_CACHE_KEY,
+  SEERR_REQUESTS_PAGE_SIZE,
+} from './seerr-api.constants';
 import { SeerrApi } from './helpers/seerr-api.helper';
 
 interface SeerrMediaInfo {
@@ -96,6 +104,27 @@ export type SeerrMovieRequest = SeerrBaseRequest & {
 
 export type SeerrRequest = SeerrMovieRequest | SeerrTVRequest;
 
+/**
+ * Reads the name off the request rather than looking the user up on the media
+ * server: media server user IDs don't match Seerr's plexId. Seerr stores the
+ * name per user type - Plex in plexUsername, local in username, Jellyfin/Emby
+ * in jellyfinUsername.
+ */
+export const resolveRequestUsername = (request: {
+  requestedBy?: {
+    plexUsername?: string;
+    jellyfinUsername?: string;
+    username?: string;
+  };
+}): string | undefined => {
+  const user = request.requestedBy;
+  if (!user) return undefined;
+
+  return (
+    user.plexUsername || user.jellyfinUsername || user.username || undefined
+  );
+};
+
 interface SeerrUser {
   id: number;
   email: string;
@@ -160,9 +189,25 @@ interface SeerrUserResponseResult {
   displayName: string;
 }
 
+interface SeerrRequestPageResponse {
+  pageInfo: {
+    pages: number;
+    pageSize: number;
+    results: number;
+    page: number;
+  };
+  results: SeerrRequest[];
+}
+
 @Injectable()
 export class SeerrApiService {
   api: SeerrApi;
+
+  // Deduplicates concurrent callers (the first batch of rule-evaluation items)
+  // onto a single /request sweep while the run-scoped index is being built.
+  private requestIndexPromise?: Promise<
+    Map<number, SeerrRequest[]> | undefined
+  >;
 
   constructor(
     private readonly settings: SettingsDataService,
@@ -173,13 +218,19 @@ export class SeerrApiService {
   }
 
   public init() {
+    // Drop the previous client first, so removing Seerr from settings stops
+    // the app querying it rather than leaving the old one live until restart.
+    this.api = undefined;
+
     if (!this.settings.seerr_url) {
       return;
     }
 
     this.api = new SeerrApi(
       {
-        url: `${this.settings.seerr_url.endsWith('/') ? this.settings.seerr_url.slice(0, -1) : this.settings.seerr_url}/api/v1`,
+        // Settings saved before the URL schema normalised them can still hold
+        // a trailing slash.
+        url: `${stripTrailingSlashes(this.settings.seerr_url)}/api/v1`,
         apiKey: `${this.settings.seerr_api_key}`,
       },
       this.loggerFactory.createLogger(),
@@ -283,6 +334,200 @@ export class SeerrApiService {
     }
   }
 
+  /**
+   * Fetches every request in a single paginated sweep, mirroring getUsers()'s
+   * pagination. Unlike getUsers() (which collapses errors to []), this returns
+   * `undefined` on failure so the index build can tell a genuinely empty Seerr
+   * (definitive: nothing requested) from an unreachable one (transient: protect
+   * items). `[]` therefore means "Seerr reachable, no requests".
+   */
+  public async getRequests(): Promise<SeerrRequest[] | undefined> {
+    try {
+      const size = SEERR_REQUESTS_PAGE_SIZE;
+      let hasNext = true;
+      let skip = 0;
+
+      const requests: SeerrRequest[] = [];
+      // Bracket the sweep like the media-server ones do: with only the decile
+      // lines, a sweep that fits in one page said nothing at all, and a slow
+      // one had no line to attribute the wait to.
+      this.logger.log('Prefetching Seerr requests...');
+      const reportProgress = createPrefetchProgressReporter(
+        (message) => this.logger.log(message),
+        'Prefetching Seerr requests',
+        'requests',
+      );
+
+      while (hasNext) {
+        // Seerr has no `added` sort value (only `modified` → request.updatedAt;
+        // anything else falls back to the default `request.id DESC`), so we omit
+        // `sort` and let buildRequestIndex normalise ordering instead of relying
+        // on the sweep order. `filter=all` keeps every request status.
+        const resp = await this.api.getWithoutCache<SeerrRequestPageResponse>(
+          `/request?take=${size}&skip=${skip}&filter=all`,
+        );
+
+        // The HTTP helper swallows request failures and returns undefined; a
+        // genuine empty result still carries pageInfo. A missing pageInfo means
+        // the sweep failed - surface that (transient), don't read it as empty.
+        if (!resp?.pageInfo) {
+          return undefined;
+        }
+
+        requests.push(...(resp.results ?? []));
+        reportProgress(requests.length, resp.pageInfo.results);
+
+        if (resp.pageInfo.page < resp.pageInfo.pages) {
+          skip = skip + size;
+        } else {
+          hasNext = false;
+        }
+      }
+      // The completion line belongs to buildRequestIndex, this method's only
+      // caller: it reports the same sweep plus the title count, so logging it
+      // here too reads as two prefetches.
+      return requests;
+    } catch (error) {
+      this.logger.warn(
+        `Couldn't fetch Seerr requests. Is the application running?`,
+      );
+      this.logger.debug(
+        `Couldn't fetch Seerr requests. Is the application running?`,
+        error,
+      );
+      return undefined;
+    }
+  }
+
+  /**
+   * Run-scoped lookup of the Seerr requests for a single tmdbId, backed by one
+   * bulk /request sweep per rule-group run (issue #3152). The per-item
+   * getMovie/getShow calls this replaces rate-limited under whole-library runs,
+   * making Seerr-seeded rules silently match almost nothing.
+   *
+   * Returns a deep copy of the title's request list (the cache holds the Map by
+   * reference with useClones off), so callers may read or mutate it freely
+   * without corrupting the shared index. `[]` means the sweep succeeded and the
+   * title has no request (definitive). `undefined` means the sweep failed -
+   * Seerr is unreachable - so the getter returns `undefined` (transient) and the
+   * comparator protects the item rather than treating it as "not requested".
+   */
+  public async getRequestsForMedia(
+    tmdbId: number,
+  ): Promise<SeerrRequest[] | undefined> {
+    const index = await this.getRequestIndex();
+    if (index === undefined) {
+      return undefined;
+    }
+    const requests = index.get(tmdbId);
+    // cloneDeep, not structuredClone: it never throws on an unexpected
+    // non-cloneable value (which would surface as a per-item warn + skip).
+    return requests ? cloneDeep(requests) : [];
+  }
+
+  /**
+   * Usernames of everyone who requested a title. Unlike the rule getter's
+   * contract, an unreachable Seerr yields `[]` rather than `undefined`: failing
+   * to name the requester must never suppress the pre-deletion warning itself.
+   *
+   * `season` is required for TV, since Seerr tracks requests per season -
+   * without it a season-level item credits whoever requested a different season.
+   */
+  public async getRequestedByUsernames(
+    tmdbId: number,
+    season?: number,
+  ): Promise<string[]> {
+    if (!this.isConfigured() || !tmdbId) {
+      return [];
+    }
+
+    const requests = await this.getRequestsForMedia(tmdbId);
+    if (!requests?.length) {
+      return [];
+    }
+
+    const usernames = requests
+      .filter(
+        (request) =>
+          season === undefined ||
+          request.type !== 'tv' ||
+          request.seasons?.some((s) => Number(s.seasonNumber) === season),
+      )
+      .map((request) => resolveRequestUsername(request))
+      .filter((username): username is string => username !== undefined);
+
+    return [...new Set(usernames)];
+  }
+
+  private async getRequestIndex(): Promise<
+    Map<number, SeerrRequest[]> | undefined
+  > {
+    const cache = cacheManager.getCache(SEERR_REQUESTS_CACHE_ID)?.data;
+    const cached = cache?.get<Map<number, SeerrRequest[]>>(
+      SEERR_REQUESTS_CACHE_KEY,
+    );
+    if (cached) {
+      return cached;
+    }
+
+    // Collapse the first concurrent batch of callers onto one sweep.
+    this.requestIndexPromise ??= this.buildRequestIndex().finally(() => {
+      this.requestIndexPromise = undefined;
+    });
+    return this.requestIndexPromise;
+  }
+
+  private async buildRequestIndex(): Promise<
+    Map<number, SeerrRequest[]> | undefined
+  > {
+    const requests = await this.getRequests();
+    // Don't cache a failed sweep: a later batch in the same run retries, giving
+    // a transient Seerr blip a chance to recover instead of poisoning the run.
+    if (requests === undefined) {
+      return undefined;
+    }
+
+    // requestDate reads requests[0].createdAt and the legacy per-item
+    // getMovie/getShow path returned mediaInfo.requests oldest-first. The bulk
+    // /request sweep is newest-first, so sort ascending by createdAt (tie-break
+    // on id) - requestDate, addUser and the season ordering then match the
+    // pre-#3152 behaviour regardless of how Seerr happened to page the sweep.
+    requests.sort(
+      (a, b) =>
+        new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime() ||
+        a.id - b.id,
+    );
+
+    // Group by media.tmdbId: Seerr keys every media row by tmdbId (non-null,
+    // indexed - tvdbId/imdbId are optional extras), and the metadata service
+    // resolves each library item to that tmdbId via all its providers (with
+    // tvdb/imdb -> tmdb bridging), so tmdbId is the canonical join key (and
+    // matches the per-item getMovie/getShow path this replaces). media.requests
+    // is not populated on the list endpoint (it would be circular), so each
+    // title's request set is rebuilt here.
+    const index = new Map<number, SeerrRequest[]>();
+    for (const request of requests) {
+      const tmdbId = request.media?.tmdbId;
+      if (typeof tmdbId !== 'number') {
+        continue;
+      }
+      const existing = index.get(tmdbId);
+      if (existing) {
+        existing.push(request);
+      } else {
+        index.set(tmdbId, [request]);
+      }
+    }
+
+    cacheManager
+      .getCache(SEERR_REQUESTS_CACHE_ID)
+      ?.data.set(SEERR_REQUESTS_CACHE_KEY, index);
+    this.logger.log(
+      `Seerr request prefetch complete: ${requests.length} requests across ${index.size} titles.`,
+    );
+    return index;
+  }
+
   public async deleteRequest(requestId: string) {
     try {
       const response: SeerrBasicApiResponse = await this.api.delete(
@@ -301,23 +546,55 @@ export class SeerrApiService {
     }
   }
 
-  public async removeSeasonRequest(tmdbid: string | number, season: number) {
+  /**
+   * Whether the season's requests were removed. `undefined` when that could not
+   * be established, the same contract as {@link hasRemainingSeasonRequests}, so
+   * a caller never reports a removal that did not happen. The writes rethrow
+   * rather than answering their body: a 204 carries an empty one, so success
+   * and failure are both falsy.
+   */
+  public async removeSeasonRequest(
+    tmdbid: string | number,
+    season: number,
+  ): Promise<boolean | undefined> {
     try {
       const media = await this.getShow(tmdbid);
 
-      if (media?.mediaInfo) {
-        const requests = (media.mediaInfo.requests ?? []).filter((el) =>
-          el.seasons.find((s) => s.seasonNumber === season),
-        );
-        if (requests.length > 0) {
-          for (const el of requests) {
-            await this.deleteRequest(el.id.toString());
-          }
-        } else {
-          // no requests? clear data and let Seerr refetch.
-          await this.api.delete(`/media/${media.id}`);
-        }
+      // getShow returns undefined only on communication failure or falsy id;
+      // the show being untracked still yields a response with mediaInfo == null.
+      if (!media) {
+        return undefined;
       }
+
+      if (!media.mediaInfo) {
+        return false;
+      }
+
+      const allRequests = media.mediaInfo.requests ?? [];
+      const requests = allRequests.filter((el) =>
+        el.seasons.find((s) => s.seasonNumber === season),
+      );
+      if (requests.length > 0) {
+        for (const el of requests) {
+          await this.api.delete(`/request/${el.id}`, undefined, {
+            rethrow: true,
+          });
+        }
+      } else if (allRequests.length > 0) {
+        // Other seasons are still requested. Deleting the media record cascades
+        // into their requests, so leave it alone and report nothing removed.
+        return false;
+      } else {
+        // Nothing requested at all? Clear the stale media record and let Seerr
+        // refetch. Keyed on Seerr's own media id, not `media.id`, which is the
+        // TMDB id: Seerr answers 204 for an id it does not hold, so the wrong
+        // one was a no-op that reported success.
+        await this.api.delete(`/media/${media.mediaInfo.id}`, undefined, {
+          rethrow: true,
+        });
+      }
+
+      return true;
     } catch (error) {
       this.logger.warn(
         'Seerr communication failed. Is the application running?',
@@ -393,30 +670,31 @@ export class SeerrApiService {
     }
   }
 
-  public async removeMediaByTmdbId(id: string | number, type: 'movie' | 'tv') {
+  /** Whether the media record was cleared, with the same contract as
+   * {@link removeSeasonRequest}. */
+  public async removeMediaByTmdbId(
+    id: string | number,
+    type: 'movie' | 'tv',
+  ): Promise<boolean | undefined> {
     try {
-      let media: SeerrMovieResponse | SeerrTVResponse;
-      if (type === 'movie') {
-        media = await this.getMovie(id);
-      } else {
-        media = await this.getShow(id);
-      }
+      const media: SeerrMovieResponse | SeerrTVResponse =
+        type === 'movie' ? await this.getMovie(id) : await this.getShow(id);
 
-      if (!media.mediaInfo?.id) {
+      // Reading through an undefined media used to throw, which the catch
+      // below then reported as a communication failure. Answer it directly.
+      if (!media) {
         return undefined;
       }
 
-      try {
-        await this.deleteMediaItem(media.mediaInfo.id.toString());
-      } catch (error) {
-        this.logger.log(
-          `Couldn't delete media by TMDB ID ${id}. Does it exist in Seerr?`,
-        );
-        this.logger.debug(
-          `Couldn't delete media by TMDB ID ${id}. Does it exist in Seerr?`,
-          error,
-        );
+      if (!media.mediaInfo?.id) {
+        return false;
       }
+
+      await this.api.delete(`/media/${media.mediaInfo.id}`, undefined, {
+        rethrow: true,
+      });
+
+      return true;
     } catch (error) {
       this.logger.warn(
         'Seerr communication failed. Is the application running?',
@@ -449,7 +727,7 @@ export class SeerrApiService {
       ? new SeerrApi(
           {
             apiKey: params.apiKey,
-            url: `${params.url?.endsWith('/') ? params.url.slice(0, -1) : params.url}/api/v1`,
+            url: `${stripTrailingSlashes(params.url)}/api/v1`,
           },
           this.loggerFactory.createLogger(),
         )

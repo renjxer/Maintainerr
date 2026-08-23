@@ -1,11 +1,16 @@
+// TTLs are in SECONDS - node-cache takes ttl in seconds, not milliseconds (see
+// api/lib/cache.ts, DEFAULT_TTL = 300). These were previously written in
+// milliseconds, so watch history lived ~83h instead of 5min and a season's
+// watched-state stayed stale for hours after a manual mark in Jellyfin (#3274).
 export const JELLYFIN_CACHE_TTL = {
-  WATCH_HISTORY: 300000,
-  USER_DATA: 300000,
-  PLAYED_THRESHOLD: 300000,
-  USERS: 1800000,
-  LIBRARIES: 1800000,
-  STATUS: 60000,
-  COLLECTIONS: 600,
+  WATCH_HISTORY: 300, // 5 min
+  USER_DATA: 300, // 5 min
+  METADATA: 300, // 5 min
+  PLAYED_THRESHOLD: 300, // 5 min
+  USERS: 1800, // 30 min
+  LIBRARIES: 1800, // 30 min
+  STATUS: 60, // 1 min
+  COLLECTIONS: 600, // 10 min
 } as const;
 
 export const JELLYFIN_BATCH_SIZE = {
@@ -18,7 +23,7 @@ export const JELLYFIN_BATCH_SIZE = {
 } as const;
 
 /**
- * Default query options for every library-scoped getItems() call — i.e.
+ * Default query options for every library-scoped getItems() call - i.e.
  * any call whose parentId is a library (or no parentId for a global recursive
  * search) and that expects to surface real media items.
  *
@@ -44,8 +49,29 @@ export const JELLYFIN_RETRYABLE_LIBRARY_ERROR_CODES = new Set([
 
 export const JELLYFIN_RETRYABLE_LIBRARY_STATUS_CODES = new Set([502, 503, 504]);
 
+// Key prefix in the 'jellyfinwatchhistory' cache for the per-library snapshots
+// built by prefetchWatchHistory(). TTL and flush behaviour live on the cache
+// definition in lib/cache.ts.
+//
+// Keyed per library so each rule group's library gets its own sweep. A single
+// shared key would let the first group's snapshot satisfy the cache check for
+// every later group, leaving their items to miss it and read live one by one.
+const JELLYFIN_WATCH_SNAPSHOT_KEY_PREFIX = 'watch-snapshot';
+export const jellyfinWatchSnapshotCacheKey = (libraryId: string): string =>
+  `${JELLYFIN_WATCH_SNAPSHOT_KEY_PREFIX}:${libraryId}`;
+
+// Ceiling on watch records held in one library's snapshot. The snapshot lives
+// for a whole run, and a (item x user) matrix grows with both; 500k records
+// measured ~60MB, which stays clear of the 512MB heap the key-count bound
+// protects (#3284). Above it the prefetch is abandoned and callers fall back to
+// the per-show sweep, which is bounded by one show at a time. Sweeping per
+// library rather than per server keeps large multi-library servers under it.
+export const JELLYFIN_WATCH_SNAPSHOT_MAX_RECORDS = 500_000;
+
 export const JELLYFIN_CACHE_KEYS = {
   WATCH_HISTORY: 'jellyfin:watch',
+  METADATA: 'jellyfin:metadata',
+  CHILDREN: 'jellyfin:children',
   FAVORITED_BY: 'jellyfin:favorited-by',
   TOTAL_PLAY_COUNT: 'jellyfin:total-play-count',
   PLAYED_THRESHOLD: 'jellyfin:played-threshold',
